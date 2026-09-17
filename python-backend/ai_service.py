@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -30,10 +31,14 @@ ANALYSIS_DIMENSIONS = [
 SYSTEM_PROMPT = """You are an elite forex/metal trading analyst.
 Analyze the given symbol across 7 dimensions: central bank policy, key economic
 data, politics & geopolitics, fiscal policy, commodity prices, market sentiment,
-and breaking news. Return STRICT JSON only with keys:
-signal (STRONG BUY|BUY|NEUTRAL|SELL|STRONG SELL), confidence (0-100),
-summary (string <= 240 chars), dimensions (list of {id,label,score 0-100,note}),
-riskScore (0-100). Do not include any text outside the JSON."""
+and breaking news. Return STRICT JSON only with these EXACT keys (camelCase):
+symbol (string), signal (STRONG BUY|BUY|NEUTRAL|SELL|STRONG SELL),
+confidence (integer 0-100), summary (string <= 240 chars),
+dimensions (array of 7 objects {id, label, score 0-100, note}),
+riskScore (integer 0-100), suggestedEntry (number), suggestedSL (number),
+suggestedTP (number), provider (string). Do not include any text outside JSON.
+The 7 dimension ids must be: central_bank, economic_data, politics, fiscal,
+commodities, sentiment, breaking_news."""
 
 
 def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str, Any]:
@@ -118,7 +123,8 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
 
 
 def _parse(content: str, symbol: str) -> dict:
-    """Parse possibly-fenced JSON from LLM output."""
+    """Parse possibly-fenced JSON from LLM output, then normalize to the
+    exact contract the frontend expects (11 camelCase fields)."""
     text = content.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
@@ -128,12 +134,55 @@ def _parse(content: str, symbol: str) -> dict:
         d = json.loads(text)
     except Exception:
         return _heuristic(symbol)
-    d.setdefault("provider", "ai")
-    return d
+    return _normalize(d, symbol)
+
+
+# snake_case keys commonly emitted by LLMs → camelCase the frontend expects
+_SNAKE_REMAP = {
+    "suggested_entry": "suggestedEntry",
+    "suggested_sl": "suggestedSL",
+    "suggested_tp": "suggestedTP",
+    "risk_score": "riskScore",
+    "generated_at": "generatedAt",
+}
+
+
+def _normalize(d: dict, symbol: str) -> dict:
+    """Guarantee all 11 AIAnalysisResult fields exist and are camelCase.
+    Coerces types where possible; backfills from heuristic for any missing
+    numeric field so the UI never receives undefined."""
+    out: dict[str, Any] = {}
+    # apply snake_case remap first
+    for k, v in d.items():
+        out[_SNAKE_REMAP.get(k, k)] = v
+    # inject / backfill required fields
+    out.setdefault("symbol", symbol)
+    out.setdefault("provider", "ai")
+    out.setdefault("generatedAt", datetime.now(timezone.utc).isoformat())
+    if "signal" not in out:
+        out["signal"] = "NEUTRAL"
+    if not isinstance(out.get("confidence"), (int, float)):
+        out["confidence"] = 50
+    if not isinstance(out.get("riskScore"), (int, float)):
+        out["riskScore"] = 50
+    if not isinstance(out.get("summary"), str):
+        out["summary"] = f"AI analysis for {symbol}."
+    if not isinstance(out.get("dimensions"), list) or len(out.get("dimensions", [])) == 0:
+        out["dimensions"] = [
+            {"id": i, "label": lab, "score": 50, "note": "n/a"}
+            for i, lab in ANALYSIS_DIMENSIONS
+        ]
+    # backfill entry/SL/TP from a heuristic base if the LLM omitted them
+    base = _heuristic(symbol)
+    for field in ("suggestedEntry", "suggestedSL", "suggestedTP"):
+        if not isinstance(out.get(field), (int, float)):
+            out[field] = base[field]
+    return out
 
 
 def _heuristic(symbol: str) -> dict:
-    """Deterministic fallback when no AI key configured."""
+    """Deterministic fallback when no AI key configured. Returns ALL 11
+    fields matching the frontend AIAnalysisResult contract."""
     h = int(hashlib.md5(symbol.encode()).hexdigest(), 16)
     signals = ["STRONG BUY", "BUY", "NEUTRAL", "SELL", "STRONG SELL"]
     sig = signals[h % 5]
@@ -142,8 +191,31 @@ def _heuristic(symbol: str) -> dict:
         {"id": i, "label": lab, "score": (h >> (k % 8)) % 100, "note": "heuristic"}
         for k, (i, lab) in enumerate(ANALYSIS_DIMENSIONS)
     ]
+    # base price + pip for entry/SL/TP generation
+    pip = 0.01 if ("JPY" in symbol or symbol.startswith("XAG")) else (
+        0.1 if symbol.startswith("XAU") else 0.0001
+    )
+    base = {
+        "EURUSD": 1.0865, "GBPUSD": 1.2710, "USDJPY": 151.42,
+        "USDCHF": 0.9012, "AUDUSD": 0.6584, "USDCAD": 1.3621,
+        "NZDUSD": 0.6012, "EURGBP": 0.8550, "EURJPY": 164.55,
+        "GBPJPY": 192.48, "AUDJPY": 99.66, "EURAUD": 1.6500,
+        "XAUUSD": 2338.5, "XAGUSD": 27.42,
+    }.get(symbol, 1.0)
+    direction = 1 if "BUY" in sig else (-1 if "SELL" in sig else 0)
+    entry = base + direction * pip * 2
+    sl = entry - direction * pip * 10
+    tp = entry + direction * pip * 15
     return {
-        "signal": sig, "confidence": conf, "riskScore": 100 - conf,
+        "symbol": symbol,
+        "signal": sig,
+        "confidence": conf,
+        "riskScore": 100 - conf,
         "summary": f"Heuristic {sig} bias on {symbol} (no AI key configured).",
-        "dimensions": dims, "provider": "heuristic",
+        "dimensions": dims,
+        "suggestedEntry": entry,
+        "suggestedSL": sl,
+        "suggestedTP": tp,
+        "provider": "heuristic",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
     }

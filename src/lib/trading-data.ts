@@ -404,7 +404,8 @@ export function genPositions(): Position[] {
   });
 }
 
-export function fmtPrice(v: number, digits: number): string {
+export function fmtPrice(v: number | undefined | null, digits: number): string {
+  if (v == null || Number.isNaN(v)) return "—";
   return v.toFixed(digits);
 }
 

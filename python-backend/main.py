@@ -176,7 +176,11 @@ async def api_news():
 
 @app.get("/api/trading/analysis")
 async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
-    result = ai_service.analyze(symbol, provider, {"timeframe": "M15"})
+    # analyze() does sync HTTP (httpx/openai/google/ollama) — run in a thread
+    # so the event loop isn't blocked (critical for parallel multi-pair requests).
+    result = await asyncio.to_thread(
+        ai_service.analyze, symbol, provider, {"timeframe": "M15"}
+    )
     # attach ML prediction if model is already trained (never trains here)
     try:
         rates = mt5_candles(symbol, "H1", 200)

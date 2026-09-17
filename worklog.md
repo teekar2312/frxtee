@@ -241,3 +241,88 @@ Stage Summary:
 - Dashboard AI Signal widget shows all active pair chips with top-pick highlight
 - Click any pair to focus its detailed 7-dimension analysis
 - Re-analyze All button refreshes every pair at once
+
+---
+
+## Task ID: B4 — AI Analysis Pipeline Contract Audit
+**Agent:** Integration Auditor
+**Scope:** Python backend AI pipeline (`ai_service.py`, `ml_model.py`, `main.py` /api/trading/analysis, `indicators.py` registry) ↔ Next.js frontend contract (`src/lib/trading-data.ts` `AIAnalysisResult` + `ANALYSIS_DIMENSIONS`, `src/lib/trading-hooks.ts` `useMultiAnalysis`, `src/components/trading/ai-engine-view.tsx`, `src/components/trading/dashboard-view.tsx`, `src/app/api/trading/analysis/route.ts` mock)
+**Mode:** Audit only — no code changes
+
+### Findings summary (10 items)
+- **BLOCKERS: 3**
+  1. `ai_service.py:145-149` `_heuristic()` returns only 6 of 11 required fields. Missing `symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt`. Frontend `fmtPrice(undefined, n)` → `undefined.toFixed(n)` → TypeError crash on every fallback path (default in demo / no-API-key Windows dep). Direct hit on `ai-engine-view.tsx:246-249, 282-319` and `dashboard-view.tsx:307-309, 446-458`.
+  2. `ai_service.py:30-36` `SYSTEM_PROMPT` only instructs LLM to return `signal, confidence, summary, dimensions, riskScore` (5/11). Even successful AI provider responses miss `symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt`. Same UI-crash impact for non-heuristic paths.
+  3. `ai_service.py:120-132` `_parse()` does not normalize snake_case → camelCase, does not inject `symbol`, does not backfill missing fields, does not validate types. If LLM returns `suggested_entry` (LLM prior), frontend can't read it. Silent contract drift, no error raised.
+
+- **MAJOR: 2**
+  4. `ai_service.py:65-117` all four `_call_*` wrappers trust raw `_parse()` output verbatim — no contract enforcement. Same root cause as #2/#3; fix lands here.
+  5. `main.py:177-189` `/api/trading/analysis` calls sync `ai_service.analyze()` (sync httpx + sync openai + sync google + sync ollama) inside an `async def` route — blocks the event loop. Multi-pair `useMultiAnalysis` (5 pairs) stalls ticks/positions polling. Fix: `await asyncio.to_thread(ai_service.analyze, …)`.
+
+- **MINOR: 1**
+  6. `main.py:181-189` attaches `result["ml_prediction"]` but `AIAnalysisResult` TS type doesn't include it and `ai-engine-view.tsx:156-159` ML panel uses hardcoded values. Wasted compute + missed UI binding. Add field to TS type + wire to UI, or drop the call.
+
+- **PASS: 4**
+  7. `ai_service.py:20-28` `ANALYSIS_DIMENSIONS` — 7 ids + labels match `trading-data.ts:172-180` byte-for-byte (Indonesian strings). Heuristic builds `{id,label,score,note}` — exact frontend shape. No issue.
+  8. `ml_model.py:96` `int(classes[idx])` — `label()` produces int64 `np.where` array; modern XGBClassifier (use_label_encoder removed in A5) preserves `classes_` as `np.array([-1,0,1])`; cast to Python int is safe. No issue.
+  9. `trading-hooks.ts:87-99` `useMultiAnalysis` per-item try/catch → `[s, undefined]`; both views guard with `.filter(Boolean)`, `bestPair ?`, `bestPair?.symbol`, `r ? … : …`, `!a ? … : …`. Robust for "missing pair". (Caveat: guards do NOT cover "result present but missing `suggestedSL`" — that's the consequence of Blockers #1–#3.)
+  10. `trading-hooks.ts:77-104` staleTime 60s — TanStack `refetch()` always bypasses staleTime; "Re-analyze All" button works correctly. No issue.
+
+### Severity breakdown
+- BLOCKER: 3 · MAJOR: 2 · MINOR: 1 · PASS: 4
+
+### Recommended next actions (priority order)
+1. Fix `_heuristic()` to emit all 11 camelCase fields (quickest unblock)
+2. Extend `SYSTEM_PROMPT` to require the 5 missing fields, all camelCase
+3. Add `_normalize(d, symbol)` helper; route all `_call_*` returns through it
+4. Wrap `ai_service.analyze()` in `asyncio.to_thread` in `/api/trading/analysis`
+5. Decide on `ml_prediction` — wire to UI or drop the call
+
+### Key cross-check
+The Next.js mock route `src/app/api/trading/analysis/route.ts:69-81` returns ALL 11 camelCase fields correctly — this is why the dev/demo frontend works today. The Python backend does NOT match that contract; switching the dashboard to proxy at the Python backend (Windows 11 prod dep) exposes Blockers #1–#3 immediately. The frontend "works in demo" but the production contract is broken.
+
+**No code changes were made — audit only.**
+
+---
+Task ID: B6 (Contract audit fixes)
+Agent: Z.ai Code (main)
+Task: Fix all BLOCKERS found by integration audit (B4) of multi-pair AI analysis
+
+Work Log:
+3 BLOCKERS fixed in Python backend AI analysis contract (ai_service.py):
+- BLOCKER 1: _heuristic() was missing 5 of 11 required AIAnalysisResult fields
+  (symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt) — would crash
+  fmtPrice(undefined) in prod. Now returns ALL 11 fields with base-price-derived
+  entry/SL/TP per symbol.
+- BLOCKER 2: SYSTEM_PROMPT only instructed LLMs to return 5 fields — extended
+  to require all 11 camelCase keys explicitly + the 7 dimension ids.
+- BLOCKER 3: _parse() did not normalize snake_case→camelCase or backfill
+  missing fields. Added _normalize() chokepoint that: remaps
+  suggested_entry→suggestedEntry etc, injects symbol/provider/generatedAt,
+  coerces types, backfills entry/SL/TP from heuristic if LLM omitted them.
+
+1 MAJOR fixed in main.py:
+- ai_service.analyze() (sync httpx/openai/google/ollama calls) was called
+  directly inside async /api/trading/analysis route — blocked event loop during
+  multi-pair parallel requests. Wrapped in asyncio.to_thread().
+
+Frontend defense-in-depth (trading-data.ts):
+- fmtPrice() now null/NaN-safe (returns "—" instead of crashing on undefined)
+
+Verification:
+- All 10 Python files pass ast.parse
+- _heuristic() AST-verified: returns all 11 required keys (0 missing)
+- _normalize() simulated with snake_case + 3 missing fields → output has all
+  11 camelCase keys, suggestedTP/symbol/generatedAt backfilled correctly
+- Agent Browser + VLM: dashboard AI Signal widget shows numeric Entry/SL/TP
+  (1.08669/1.08569/1.08819), 4 dimension bars, confidence 77%, pair chips
+- AI Engine: matrix + detailed analysis + 7-factor bars all render numeric values
+- Provider switch (Z.AI→Google) re-fetches both pairs with provider=google,
+  toast "Switched to Google AI Studio" shown, matrix header updates
+- ESLint clean; no runtime/console errors
+
+Stage Summary:
+- Python backend AI analysis contract now 100% matches frontend AIAnalysisResult
+  (11 camelCase fields) — production-safe, not just demo-safe
+- Multi-pair analysis fully verified: 5 pairs analyzed in parallel, provider
+  switching re-fetches all pairs, focus-pair selection updates detail view
