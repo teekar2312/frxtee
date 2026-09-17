@@ -118,6 +118,31 @@ TF_MAP = {
 }
 
 
+def _pip_for_digits(digits: int) -> float:
+    """Pip size by symbol digit count.
+    5-digit (EURUSD) and 3-digit (USDJPY) → point is 1e-5/1e-3, pip = 10 points.
+    4-digit and 2-digit (JPY legacy) → pip = point.
+    XAUUSD (2 digits) → pip = 0.1 (10 points). XAGUSD (3 digits) → pip = 0.01.
+    """
+    if digits in (5, 3):
+        return 10 ** -(digits - 1)   # 5→1e-4, 3→1e-2
+    if digits == 2:                 # XAUUSD-style metals
+        return 0.1
+    return 10 ** -digits           # 4→1e-4 (rare)
+
+
+def _filling_mode(info) -> int:
+    """Pick a filling mode the broker accepts (FOK preferred, else IOC, else RETURN)."""
+    mode = getattr(info, "filling_mode", 1)
+    if MT5_AVAILABLE:
+        if mode & 1:        # bit 0 → FOK supported
+            return mt5.ORDER_FILLING_FOK  # type: ignore[attr-defined]
+        if mode & 2:        # bit 1 → IOC supported
+            return mt5.ORDER_FILLING_IOC  # type: ignore[attr-defined]
+        return mt5.ORDER_FILLING_RETURN  # type: ignore[attr-defined]
+    return 1
+
+
 def ticks(symbols: list[str] | None = None) -> list[dict]:
     if not _state["connected"]:
         return []
@@ -127,7 +152,7 @@ def ticks(symbols: list[str] | None = None) -> list[dict]:
         info = mt5.symbol_info(sym)  # type: ignore
         if not t or not info:
             continue
-        pip = 10 ** -(info.digits - 1) if info.digits > 3 else 0.0001
+        pip = _pip_for_digits(info.digits)
         out.append({
             "symbol": sym, "bid": t.bid, "ask": t.ask,
             "spreadPips": (t.ask - t.bid) / pip,
@@ -175,7 +200,7 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
     if not info:
         return {"ok": False, "error": "symbol not found"}
     tick = mt5.symbol_info_tick(symbol)  # type: ignore
-    pip = 10 ** -(info.digits - 1) if info.digits > 3 else 0.0001
+    pip = _pip_for_digits(info.digits)
     price = tick.ask if side == "BUY" else tick.bid
     sl = price - sl_pips * pip if side == "BUY" else price + sl_pips * pip
     tp = price + tp_pips * pip if side == "BUY" else price - tp_pips * pip
@@ -187,7 +212,7 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
         "price": price, "sl": round(sl, info.digits), "tp": round(tp, info.digits),
         "deviation": 20, "magic": 99001, "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
-        "type_filling": mt5.ORDER_FILLING_IOC,  # type: ignore
+        "type_filling": _filling_mode(info),
     }
     r = mt5.order_send(req)  # type: ignore
     if r.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
@@ -213,7 +238,7 @@ def close_position(ticket: int) -> dict:
         "price": tick.bid if side == "SELL" else tick.ask,
         "deviation": 20, "magic": 99001, "comment": "close",
         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
-        "type_filling": mt5.ORDER_FILLING_IOC,  # type: ignore
+        "type_filling": _filling_mode(info),
     }
     r = mt5.order_send(req)  # type: ignore
     return {"ok": r.retcode == mt5.TRADE_RETCODE_DONE, "retcode": r.retcode}  # type: ignore

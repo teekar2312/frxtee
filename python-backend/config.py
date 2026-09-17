@@ -1,7 +1,6 @@
 """Configuration loaded from environment / .env"""
 from __future__ import annotations
 
-import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

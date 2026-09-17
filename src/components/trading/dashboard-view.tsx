@@ -57,6 +57,7 @@ export function DashboardView() {
   const equity = useTradingStore((s) => s.accountEquity);
   const balance = useTradingStore((s) => s.accountBalance);
   const autoTrade = useTradingStore((s) => s.autoTradeMode);
+  const trailingEnabled = useTradingStore((s) => s.trailingEnabled);
   const dailyTarget = useTradingStore((s) => s.dailyTarget);
   const dailyRisk = useTradingStore((s) => s.dailyRiskLimit);
 
@@ -233,8 +234,15 @@ export function DashboardView() {
           <Badge variant="secondary" className="text-[10px] gap-1">
             <ShieldCheck className="h-3 w-3" /> Risk OK
           </Badge>
-          <Badge variant="secondary" className="text-[10px] gap-1">
-            <Target className="h-3 w-3" /> Trailing ON
+          <Badge
+            variant="secondary"
+            className={
+              trailingEnabled
+                ? "text-[10px] gap-1 border-success/30 text-success"
+                : "text-[10px] gap-1"
+            }
+          >
+            <Target className="h-3 w-3" /> Trailing {trailingEnabled ? "ON" : "OFF"}
           </Badge>
           <Badge variant="secondary" className="text-[10px] gap-1">
             <Activity className="h-3 w-3" /> {symbols.length} pairs · {timeframes.length} TF

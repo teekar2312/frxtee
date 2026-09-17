@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from email.mime.text import MIMEText
 
 import aiosmtplib
@@ -12,6 +13,15 @@ from config import settings
 log = logging.getLogger("notify")
 
 PRICE_ALERTS: list[dict] = []
+# hold strong refs to fire-and-forget tasks so the GC doesn't kill them
+_pending_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    """Schedule a coroutine and track it until completion."""
+    task = asyncio.create_task(coro)
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
 
 
 async def send_email(subject: str, body: str) -> bool:
@@ -39,7 +49,7 @@ def add_price_alert(symbol: str, condition: str, price: float) -> dict:
     alert = {
         "id": f"pa-{len(PRICE_ALERTS)+1}", "symbol": symbol, "condition": condition,
         "price": price, "active": True, "triggered": False,
-        "createdAt": asyncio.get_event_loop().time(),
+        "createdAt": time.time(),
     }
     PRICE_ALERTS.append(alert)
     return alert
@@ -63,7 +73,7 @@ def check_alerts(ticks: list[dict]) -> list[dict]:
         if hit:
             a["triggered"] = True
             triggered.append(a)
-            asyncio.create_task(send_email(
+            _spawn(send_email(
                 f"Price alert: {a['symbol']} {a['condition']} {a['price']}",
                 f"<p>Alert triggered: <b>{a['symbol']}</b> {a['condition']} {a['price']}.</p><p>Current bid: {t['bid']}</p>",
             ))

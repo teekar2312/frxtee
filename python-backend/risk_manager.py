@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import date
 
 from config import settings
 
 log = logging.getLogger("risk")
+
+# FINEX min volume = 0.01 (defined before size_position uses it)
+MIN_VOLUME = 0.01
 
 
 @dataclass
@@ -21,8 +25,8 @@ class PositionSize:
 
 def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float = 10.0,
                   risk_pct: float | None = None, rr: float | None = None) -> PositionSize:
-    risk_pct = risk_pct or settings.risk_per_trade_pct
-    rr = rr or settings.rr_ratio
+    risk_pct = settings.risk_per_trade_pct if risk_pct is None else risk_pct
+    rr = settings.rr_ratio if rr is None else rr
     risk_amount = equity * risk_pct / 100
     # lot = risk / (sl_pips * value_per_pip)
     lot = max(MIN_VOLUME, risk_amount / (sl_pips * value_per_pip_per_lot))
@@ -34,18 +38,27 @@ def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float = 10
     )
 
 
-# FINEX min volume = 0.01
-MIN_VOLUME = 0.01
-
-
 class RiskGuard:
-    """Daily risk tracking — halts new entries when limit breached."""
+    """Daily risk tracking — halts new entries when limit breached.
+
+    Automatically resets loss/open counters on UTC date rollover.
+    """
 
     def __init__(self):
         self.daily_loss: float = 0.0
         self.open_count: int = 0
+        self._date: date = date.today()
+
+    def _maybe_reset(self):
+        today = date.today()
+        if today != self._date:
+            self._date = today
+            self.daily_loss = 0.0
+            self.open_count = 0
+            log.info("RiskGuard daily reset — new trading day %s", today)
 
     def can_open(self, equity: float) -> tuple[bool, str]:
+        self._maybe_reset()
         limit = equity * settings.daily_risk_limit_pct / 100
         if self.daily_loss >= limit:
             return False, f"Daily risk limit reached ({settings.daily_risk_limit_pct}%)"
@@ -54,13 +67,20 @@ class RiskGuard:
         return True, "ok"
 
     def register_loss(self, amount: float):
+        self._maybe_reset()
         self.daily_loss += abs(amount)
 
     def register_open(self):
+        self._maybe_reset()
         self.open_count += 1
 
     def register_close(self):
         self.open_count = max(0, self.open_count - 1)
+
+    def reset_daily(self):
+        """Force-reset (e.g. for testing or manual rollover)."""
+        self.daily_loss = 0.0
+        self.open_count = 0
 
 
 guard = RiskGuard()

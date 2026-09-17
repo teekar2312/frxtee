@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import pandas as pd
 
+from config import settings
 from indicators import ema, rsi, macd
-from mt5_service import candles
+from mt5_service import candles, _pip_for_digits
 from risk_manager import size_position
 
 
@@ -26,8 +27,9 @@ def run(symbol: str = "EURUSD", tf: str = "H1", trades: int = 120) -> dict:
     gross_win = gross_loss = 0.0
     out_trades = []
     curve = [{"i": 0, "equity": equity}]
-    pip = 0.01 if "JPY" in symbol else 0.0001
-    sl_pips = 10
+    # pip size: JPY pairs 3 digits, metals (XAU/XAG) 2/3 digits, else 5 digits
+    pip = 0.1 if symbol.startswith("XAU") else (0.01 if "JPY" in symbol or symbol.startswith("XAG") else 0.0001)
+    sl_pips = settings.stop_loss_pips
 
     for i in range(50, len(df) - 6, 6):
         row = df.iloc[i]

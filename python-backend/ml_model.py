@@ -6,20 +6,18 @@ Retrains nightly via APScheduler; supports incremental updates.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from indicators import INDICATOR_REGISTRY, atr, ema, rsi, macd
+from indicators import atr, ema, rsi, macd
 from mt5_service import candles
 
 log = logging.getLogger("ml")
 
 MODEL_PATH = Path("models/trade_classifier.joblib")
-MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 FEATURES = ["ema_20", "ema_50", "rsi_14", "atr_14", "macd", "macd_signal",
             "ret_1", "ret_3", "ret_5", "vol_5"]
@@ -44,11 +42,16 @@ def label(df: pd.DataFrame, horizon=5, threshold=0.0008) -> pd.Series:
     """Forward return label: 1 up, -1 down, 0 flat."""
     fwd = df["close"].shift(-horizon) / df["close"] - 1
     return pd.Series(np.where(fwd > threshold, 1, np.where(fwd < -threshold, -1, 0)),
-                    index=df.index)
+                     index=df.index)
 
 
 def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
-    """Train (or retrain) the classifier on `count` historical candles."""
+    """Train (or retrain) the classifier on `count` historical candles.
+
+    This is a CPU-bound synchronous call — callers running in an async
+    context should wrap it with ``asyncio.to_thread(ml_model.train, ...)``.
+    """
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     from xgboost import XGBClassifier
     rates = candles(symbol, tf, count)
     if not rates:
@@ -66,7 +69,7 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     clf = XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
-        use_label_encoder=False, n_jobs=-1,
+        n_jobs=-1,
     )
     clf.fit(X, y)
     joblib.dump({"model": clf, "features": FEATURES, "symbol": symbol}, MODEL_PATH)
@@ -75,9 +78,11 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
 
 
 def predict(df_recent: pd.DataFrame) -> dict:
-    """Predict direction probability for the latest bar."""
-    if not MODEL_PATH.exists():
-        train()
+    """Predict direction probability for the latest bar.
+
+    Does NOT trigger training — returns NEUTRAL if no model exists yet.
+    Training happens via the nightly scheduler or the explicit /ml/train endpoint.
+    """
     if not MODEL_PATH.exists():
         return {"direction": "NEUTRAL", "prob": 0.5}
     bundle = joblib.load(MODEL_PATH)
@@ -88,5 +93,5 @@ def predict(df_recent: pd.DataFrame) -> dict:
     proba = clf.predict_proba(feats)[0]
     classes = clf.classes_
     idx = int(np.argmax(proba))
-    direction = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}.get(classes[idx], "NEUTRAL")
+    direction = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}.get(int(classes[idx]), "NEUTRAL")
     return {"direction": direction, "prob": float(proba[idx])}

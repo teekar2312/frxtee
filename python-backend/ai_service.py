@@ -5,8 +5,10 @@ same `analyze()` interface returning a structured analysis dict.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -41,25 +43,25 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
                f"Market context: {json.dumps(context or {})[:800]}"
     try:
         if provider == "zai":
-            return _call_zai(user_msg)
+            return _call_zai(symbol, user_msg)
         if provider == "groq":
-            return _call_groq(user_msg)
+            return _call_groq(symbol, user_msg)
         if provider == "google":
-            return _call_google(user_msg)
+            return _call_google(symbol, user_msg)
         if provider == "local":
-            return _call_ollama(user_msg)
+            return _call_ollama(symbol, user_msg)
     except Exception as exc:
         log.error("AI provider %s failed: %s — using heuristic", provider, exc)
     return _heuristic(symbol)
 
 
 # ---------- Z.AI (z-ai-web-dev-sdk compatible HTTP) ----------
-def _call_zai(user_msg: str) -> dict:
-    # z-ai-web-dev-sdk exposes an OpenAI-compatible endpoint on the device.
+def _call_zai(symbol: str, user_msg: str) -> dict:
+    # z-ai-web-dev-sdk exposes an OpenAI-compatible endpoint.
     base = os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4")
     key = settings.zai_api_key
     if not key:
-        return _heuristic("EURUSD")
+        return _heuristic(symbol)
     r = httpx.post(
         f"{base}/chat/completions",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -70,13 +72,13 @@ def _call_zai(user_msg: str) -> dict:
         timeout=30,
     )
     r.raise_for_status()
-    return _parse(r.json()["choices"][0]["message"]["content"])
+    return _parse(r.json()["choices"][0]["message"]["content"], symbol)
 
 
 # ---------- Groq (OpenAI-compatible) ----------
-def _call_groq(user_msg: str) -> dict:
+def _call_groq(symbol: str, user_msg: str) -> dict:
     if not settings.groq_api_key:
-        return _heuristic("EURUSD")
+        return _heuristic(symbol)
     from openai import OpenAI
     client = OpenAI(api_key=settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
     resp = client.chat.completions.create(
@@ -87,22 +89,22 @@ def _call_groq(user_msg: str) -> dict:
         temperature=0.2,
         timeout=30,
     )
-    return _parse(resp.choices[0].message.content)
+    return _parse(resp.choices[0].message.content, symbol)
 
 
 # ---------- Google AI Studio ----------
-def _call_google(user_msg: str) -> dict:
+def _call_google(symbol: str, user_msg: str) -> dict:
     if not settings.google_api_key:
-        return _heuristic("EURUSD")
+        return _heuristic(symbol)
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
     model = genai.GenerativeModel("gemini-1.5-pro", system_instruction=SYSTEM_PROMPT)
     resp = model.generate_content(user_msg + "\nReturn JSON only.")
-    return _parse(resp.text)
+    return _parse(resp.text, symbol)
 
 
 # ---------- Local AI (Ollama) ----------
-def _call_ollama(user_msg: str) -> dict:
+def _call_ollama(symbol: str, user_msg: str) -> dict:
     import ollama
     client = ollama.Client(host=settings.ollama_url)
     resp = client.chat(
@@ -112,10 +114,10 @@ def _call_ollama(user_msg: str) -> dict:
         format="json",
         options={"temperature": 0.2},
     )
-    return _parse(resp["message"]["content"])
+    return _parse(resp["message"]["content"], symbol)
 
 
-def _parse(content: str) -> dict:
+def _parse(content: str, symbol: str) -> dict:
     """Parse possibly-fenced JSON from LLM output."""
     text = content.strip()
     if text.startswith("```"):
@@ -125,14 +127,13 @@ def _parse(content: str) -> dict:
     try:
         d = json.loads(text)
     except Exception:
-        return _heuristic("EURUSD")
+        return _heuristic(symbol)
     d.setdefault("provider", "ai")
     return d
 
 
 def _heuristic(symbol: str) -> dict:
     """Deterministic fallback when no AI key configured."""
-    import hashlib
     h = int(hashlib.md5(symbol.encode()).hexdigest(), 16)
     signals = ["STRONG BUY", "BUY", "NEUTRAL", "SELL", "STRONG SELL"]
     sig = signals[h % 5]
@@ -146,6 +147,3 @@ def _heuristic(symbol: str) -> dict:
         "summary": f"Heuristic {sig} bias on {symbol} (no AI key configured).",
         "dimensions": dims, "provider": "heuristic",
     }
-
-
-import os  # noqa: E402  (kept late to avoid top import noise)

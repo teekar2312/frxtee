@@ -10,17 +10,13 @@ import pandas as pd
 
 try:
     import ta  # type: ignore
-    from ta.trend import EMAIndicator, SMAIndicator, MACD, IchimokuIndicator
+    from ta.trend import MACD, IchimokuIndicator
     from ta.momentum import RSIIndicator, StochasticOscillator, CCIIndicator, WilliamsRIndicator
     from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel
     from ta.volume import OnBalanceVolumeIndicator, MFIIndicator, volume_weighted_average_price
     TA = True
 except Exception:  # pragma: no cover
     TA = False
-
-
-def _col(df: pd.DataFrame, name: str, series: pd.Series) -> None:
-    df[name] = series
 
 
 # ---------- Trend ----------
@@ -46,6 +42,8 @@ def supertrend(df, period=10, multiplier=3):
     st = pd.Series(np.nan, index=df.index)
     dir_ = pd.Series(1, index=df.index)
     for i in range(1, len(df)):
+        # carry previous direction when no crossover
+        dir_.iloc[i] = dir_.iloc[i - 1]
         if df["close"].iloc[i] > upper.iloc[i - 1]:
             dir_.iloc[i] = 1
         elif df["close"].iloc[i] < lower.iloc[i - 1]:
@@ -153,11 +151,12 @@ def momentum(df, period=10):
 
 
 def tsi(df, r=25, s=13):
+    # True Strength Index: double-smoothed momentum
     m = df["close"].diff()
     m1 = m.ewm(span=r, adjust=False).mean()
-    m2 = m1.ewm(span=r, adjust=False).mean()
+    m2 = m1.ewm(span=s, adjust=False).mean()          # second smoothing uses s
     m1a = abs(m).ewm(span=r, adjust=False).mean()
-    m2a = m1a.ewm(span=r, adjust=False).mean()
+    m2a = m1a.ewm(span=s, adjust=False).mean()        # second smoothing uses s
     return 100 * m2 / m2a.replace(0, np.nan)
 
 
@@ -180,16 +179,18 @@ def atr(df, period=14):
 
 
 def keltner(df, period=20, mult=2):
-    if TA:
-        return KeltnerChannel(df["high"], df["low"], df["close"], period, mult)
     mid = ema(df, period)
     a = atr(df, period)
+    if TA:
+        k = KeltnerChannel(df["high"], df["low"], df["close"], period, mult)
+        return k.keltner_channel_hband(), k.keltner_channel_mband(), k.keltner_channel_lband()
     return mid + mult * a, mid, mid - mult * a
 
 
 def donchian(df, period=20):
     if TA:
-        return DonchianChannel(df["high"], df["low"], df["close"], period)
+        d = DonchianChannel(df["high"], df["low"], df["close"], period)
+        return d.donchian_channel_hband(), d.donchian_channel_mband(), d.donchian_channel_lband()
     return df["high"].rolling(period).max(), df["close"].rolling(period).mean(), df["low"].rolling(period).min()
 
 
@@ -199,7 +200,6 @@ def stddev(df, period=20):
 
 def linreg(df, period=20):
     x = np.arange(period)
-    x_mean = x.mean()
     return df["close"].rolling(period).apply(
         lambda y: np.polyval(np.polyfit(x, y, 1), period - 1), raw=True
     )
@@ -234,14 +234,79 @@ def tick_volume(df):
     return df["volume"]
 
 
+# ---------- Additional Momentum / Volatility / Volume ----------
+def stc(df, fast=23, slow=50, length=10):
+    """Schaff Trend Cycle: MACD smoothed by TSI-style double EMA, then stochastic."""
+    macd_line = ema(df, fast) - ema(df, slow)
+    m1 = macd_line.ewm(span=length, adjust=False).mean()
+    m2 = m1.ewm(span=length, adjust=False).mean()
+    # stochastic of m2
+    ll = m2.rolling(length).min()
+    hh = m2.rolling(length).max()
+    stc_val = 100 * (m2 - ll) / (hh - ll).replace(0, np.nan)
+    return stc_val.fillna(50)
+
+
+def ultimate(df, p1=7, p2=14, p3=28):
+    """Ultimate Oscillator — weighted average of 3 buying-pressure periods."""
+    prev_close = df["close"].shift(1)
+    bp = df["close"] - np.minimum(df["low"], prev_close)
+    tr = np.maximum(df["high"], prev_close) - np.minimum(df["low"], prev_close)
+    avg1 = bp.rolling(p1).sum() / tr.rolling(p1).sum().replace(0, np.nan)
+    avg2 = bp.rolling(p2).sum() / tr.rolling(p2).sum().replace(0, np.nan)
+    avg3 = bp.rolling(p3).sum() / tr.rolling(p3).sum().replace(0, np.nan)
+    return 100 * (4 * avg1 + 2 * avg2 + avg3) / 7
+
+
+def chaikin_vol(df, ema_period=10, roc_period=10):
+    """Chaikin Volatility — rate-of-change of an EMA of (high-low)."""
+    hl = df["high"] - df["low"]
+    ema_hl = hl.ewm(span=ema_period, adjust=False).mean()
+    return (ema_hl / ema_hl.shift(roc_period) - 1) * 100
+
+
+def vol_ratio(df, period=14):
+    """Volatility Ratio — current True Range vs ATR (volatility expansion gauge)."""
+    prev_close = df["close"].shift(1)
+    tr = np.maximum.reduce([
+        (df["high"] - df["low"]).to_numpy(),
+        np.abs(df["high"].to_numpy() - prev_close.to_numpy()),
+        np.abs(df["low"].to_numpy() - prev_close.to_numpy()),
+    ])
+    tr = pd.Series(tr, index=df.index)
+    return tr / atr(df, period).replace(0, np.nan)
+
+
+def volume_profile(df, bins=20):
+    """Volume Profile — volume bucketed by price, returns a dict of {price: vol}.
+
+    Returns a pandas Series indexed by price-bin midpoint so `compute()` can
+    serialise it as a list.
+    """
+    lo, hi = df["low"].min(), df["high"].max()
+    if lo == hi:
+        return pd.Series([0.0], index=[float(lo)])
+    edges = np.linspace(lo, hi, bins + 1)
+    cents = (edges[:-1] + edges[1:]) / 2
+    # distribute bar volume across the price bins its range overlaps
+    vol = np.zeros(bins)
+    for _, row in df.iterrows():
+        mask = (edges[:-1] < row["high"]) & (edges[1:] > row["low"])
+        vol[mask] += row["volume"]
+    return pd.Series(vol, index=cents)
+
+
 INDICATOR_REGISTRY = {
     "ema": ema, "sma": sma, "vwap": vwap, "supertrend": supertrend,
     "psar": psar, "ichimoku": ichimoku, "hma": hma,
     "rsi": rsi, "stochastic": stochastic, "macd": macd, "cci": cci,
     "williamsr": williams_r, "roc": roc, "momentum": momentum, "tsi": tsi,
+    "stc": stc, "ultimate": ultimate,
     "bbands": bollinger, "atr": atr, "keltner": keltner, "donchian": donchian,
     "stddev": stddev, "linreg": linreg,
+    "chaikinvol": chaikin_vol, "volratio": vol_ratio,
     "obv": obv, "mfi": mfi, "accdist": accdist, "tickvol": tick_volume,
+    "volprofile": volume_profile,
 }
 
 
@@ -259,6 +324,6 @@ def compute(df: pd.DataFrame, indicators: list[str]) -> dict:
                     out[f"{ind}_{k}"] = s.dropna().round(5).tail(60).tolist()
             else:
                 out[ind] = res.dropna().round(5).tail(60).tolist()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             out[ind] = []
     return out
