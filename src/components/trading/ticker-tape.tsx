@@ -13,7 +13,7 @@ export function TickerTape() {
       <div className="flex items-center gap-0 overflow-x-auto scroll-thin">
         {TRADING_PAIRS.map((p) => {
           const t = ticks.find((x) => x.symbol === p.symbol);
-          return <TickerCell key={p.symbol} pair={p} tick={t} />;
+          return <MemoizedTickerCell key={p.symbol} pair={p} tick={t} />;
         })}
       </div>
     </div>
@@ -67,3 +67,7 @@ function TickerCell({
     </div>
   );
 }
+
+// Memoize so only cells whose tick changed re-render (not all 14 every 2.5s)
+const MemoizedTickerCell = React.memo(TickerCell);
+MemoizedTickerCell.displayName = "TickerCell";

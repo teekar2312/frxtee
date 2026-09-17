@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections import deque
 from pathlib import Path
 
 import joblib
@@ -25,6 +26,28 @@ log = logging.getLogger("ml")
 
 MODEL_PATH = Path("models/trade_classifier.joblib")
 BACKUP_DIR = Path("models/backups")
+
+# ---- in-memory model cache (avoid joblib.load on every predict) -----------
+_model_cache: dict | None = None
+_model_cache_mtime: float = 0.0
+
+
+def _load_model() -> dict | None:
+    """Load model from disk, cached in memory. Reloads if file changed."""
+    global _model_cache, _model_cache_mtime
+    if not MODEL_PATH.exists():
+        return None
+    mtime = MODEL_PATH.stat().st_mtime
+    if _model_cache and mtime == _model_cache_mtime:
+        return _model_cache
+    try:
+        _model_cache = joblib.load(MODEL_PATH)
+        _model_cache_mtime = mtime
+        log.debug("model loaded into cache (mtime=%s)", mtime)
+        return _model_cache
+    except Exception as exc:  # noqa: BLE001
+        log.warning("model load failed: %s", exc)
+        return None
 
 FEATURES = ["ema_20", "ema_50", "rsi_14", "atr_14", "macd", "macd_signal",
             "ret_1", "ret_3", "ret_5", "vol_5"]
@@ -124,14 +147,14 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
              symbol, tf, len(df), [round(a, 3) for a in fold_accs], avg_acc)
 
     # ---- guard: don't promote a worse model over an existing better one ----
-    if MODEL_PATH.exists():
-        old_bundle = joblib.load(MODEL_PATH)
+    old_bundle = _load_model()
+    if old_bundle:
         old_acc = old_bundle.get("test_acc", 0.0)
-        if old_symbol := old_bundle.get("symbol"):
-            if old_symbol == symbol and test_acc < old_acc - 0.02:
-                log.warning("new model test_acc %.3f < old %.3f — keeping old model",
-                            test_acc, old_acc)
-                return
+        old_symbol = old_bundle.get("symbol")
+        if old_symbol == symbol and test_acc < old_acc - 0.02:
+            log.warning("new model test_acc %.3f < old %.3f — keeping old model",
+                        test_acc, old_acc)
+            return
 
     # final train_acc on full set (for display)
     X_full = df[FEATURES].values
@@ -178,17 +201,20 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     except Exception:  # noqa: BLE001
         pass
 
+    # invalidate in-memory cache so next predict() reloads the new model
+    global _model_cache, _model_cache_mtime
+    _model_cache = None
+    _model_cache_mtime = 0.0
+
 
 # ---- drift detection -----------------------------------------------------
-_RECENT_PREDICTIONS: list[float] = []  # rolling buffer of recent max-probs
+_RECENT_PREDICTIONS: deque = deque(maxlen=50)  # O(1) append/pop, bounded
 _DRIFT_WINDOW = 50
 _DRIFT_THRESHOLD = 0.08  # 8% confidence drop triggers retrain
 
 
 def _track_prediction(prob: float) -> None:
-    _RECENT_PREDICTIONS.append(prob)
-    if len(_RECENT_PREDICTIONS) > _DRIFT_WINDOW:
-        _RECENT_PREDICTIONS.pop(0)
+    _RECENT_PREDICTIONS.append(prob)  # deque(maxlen=50) auto-trims
 
 
 def check_drift(symbol: str | None = None) -> float:
@@ -198,9 +224,9 @@ def check_drift(symbol: str | None = None) -> float:
     A drift > _DRIFT_THRESHOLD (0.08) indicates the model's recent predictions
     are much less confident than at training time → market regime has shifted.
     """
-    if not MODEL_PATH.exists() or len(_RECENT_PREDICTIONS) < 10:
+    bundle = _load_model()
+    if bundle is None or len(_RECENT_PREDICTIONS) < 10:
         return 0.0
-    bundle = joblib.load(MODEL_PATH)
     train_mean = bundle.get("train_conf_mean")
     if train_mean is None:
         return 0.0
@@ -230,7 +256,9 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     """
     if not MODEL_PATH.exists():
         return {"direction": "NEUTRAL", "prob": 0.5, "reason": "no model"}
-    bundle = joblib.load(MODEL_PATH)
+    bundle = _load_model()
+    if bundle is None:
+        return {"direction": "NEUTRAL", "prob": 0.5, "reason": "model load failed"}
     model_symbol = bundle.get("symbol")
     if symbol and model_symbol and symbol != model_symbol:
         log.warning("predict(%s) called with model trained on %s — refusing",
@@ -253,11 +281,11 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
 
 def model_info() -> dict:
     """Return model metadata for the UI (replaces hardcoded values)."""
-    if not MODEL_PATH.exists():
+    b = _load_model()
+    if b is None:
         return {"exists": False, "version": "—", "train_acc": None,
                 "test_acc": None, "symbol": None, "trained_at": None,
                 "n_samples": None, "drift": 0.0}
-    b = joblib.load(MODEL_PATH)
     drift = check_drift(b.get("symbol"))
     return {
         "exists": True,

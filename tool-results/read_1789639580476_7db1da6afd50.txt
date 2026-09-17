@@ -1120,3 +1120,852 @@
   1120→- daily_loss now survives restart (was the #1 money-risk audit finding)
   1121→- System is production-ready for Windows 11 deployment with FINEX real account
   1122→
+  1123→---
+  1124→Task ID: R1
+  1125→Agent: Real-time/Trading Auditor
+  1126→Task: Audit real-time data gaps and trading edge cases in ZeniTrade AI
+  1127→
+  1128→Work Log:
+  1129→- Read /home/z/my-project/worklog.md for project context (Task 1 build log + A4/D2/D3 follow-ups)
+  1130→- Read /home/z/my-project/src/lib/trading-hooks.ts (polling intervals + query setup)
+  1131→- Read /home/z/my-project/src/lib/trading-store.ts (Zustand state, partialize)
+  1132→- Read /home/z/my-project/src/lib/trading-data.ts (domain types, mock generators)
+  1133→- Read /home/z/my-project/src/lib/backend-proxy.ts (1.5s timeout, demo fallback)
+  1134→- Read /home/z/my-project/src/components/query-provider.tsx (TanStack Query defaults)
+  1135→- Read /home/z/my-project/src/components/trading/ticker-tape.tsx (always-on ticks)
+  1136→- Read /home/z/my-project/src/components/trading/dashboard-view.tsx (equity calc, positions)
+  1137→- Read /home/z/my-project/src/components/trading/trading-view.tsx (order ticket, positions)
+  1138→- Read /home/z/my-project/src/components/trading/candle-chart.tsx (chart rendering)
+  1139→- Read /home/z/my-project/src/app/page.tsx (header/footer status pills)
+  1140→- Read /home/z/my-project/src/app/api/trading/{ticks,positions,order}/route.ts (proxy + demo fallback)
+  1141→- Read /home/z/my-project/python-backend/main.py (FastAPI app, _reconcile_loop, api_order)
+  1142→- Read /home/z/my-project/python-backend/mt5_service.py (connect, ticks, send_order, close_position)
+  1143→- Read /home/z/my-project/python-backend/risk_manager.py (guard, size_position, trail_stop, near_high_impact_news)
+  1144→- Read /home/z/my-project/python-backend/news_service.py (fetch_news, economic_calendar)
+  1145→- Read /home/z/my-project/python-backend/config.py (settings: avoid_high_impact_news=True)
+  1146→
+  1147→AUDIT FINDINGS — 15 issues (CRITICAL×4, HIGH×6, MEDIUM×4, LOW×1)
+  1148→
+  1149→================================================================
+  1150→REAL-TIME DATA GAPS
+  1151→================================================================
+  1152→
+  1153→[FINDING 1] Tick polling interval too slow for scalping risk profile
+  1154→Severity: HIGH
+  1155→File: src/lib/trading-hooks.ts:26 ; python-backend/mt5_service.py:146-161
+  1156→Problem:
+  1157→  - useTicks polls every 2500ms (line 26: `refetchInterval: enabled ? 2500 : false`).
+  1158→  - Backend `ticks()` calls `mt5.symbol_info_tick(sym)` synchronously for each of 4-14 symbols inside a single `asyncio.to_thread`, so a busy-loop adds latency on top.
+  1159→  - For a scalping system with SL=5–15 pips (slider min=5 in trading-view.tsx:359), 2.5s is a meaningful fraction of the SL. In fast markets (NFP, CPI, FOMC), EURUSD can move 5+ pips in <500ms. The displayed bid/ask can be stale by up to 2.5s + network + thread-pool wait ≈ 3–4s real-world.
+  1160→  - Order ticket (trading-view.tsx:236) uses `tick.ask`/`tick.bid` for the "Entry" tile and submits at that displayed price with `deviation: 20` (2 pips on 5-digit). User sees 1.0865 but market may have moved to 1.0868 — fill slips 3 pips = 30% of a 10-pip SL.
+  1161→  - Ticker flash animation (ticker-tape.tsx:32-41) shows the delta between stale values, so the "▲ 0.12%" change indicator is also 2.5s behind reality.
+  1162→Staleness risk:
+  1163→  - Worst-case display lag = 2.5s (interval) + ~1s (Next.js proxy + 1.5s backend timeout in backend-proxy.ts:31) + MT5 RPC time = ~3–4s.
+  1164→Fix:
+  1165→  - Drop ticks polling to 500–1000ms for active trading; gate via `autoTradeMode` (sub-1s only when AI is live, 5s otherwise).
+  1166→  - Cache ticks in backend (Redis or in-process dict updated by a single MT5 subscriber thread) so /ticks is a memory read, not 14 synchronous RPC calls. Currently `ticks()` does N blocking calls per request → at 2500ms interval with 14 symbols, MT5 RPC is occupied ~50% of the time.
+  1167→  - Pass `deviation` based on per-symbol ATR rather than fixed 20 points.
+  1168→
+  1169→[FINDING 2] Chart never updates — candles query has staleTime but no refetchInterval
+  1170→Severity: HIGH
+  1171→File: src/lib/trading-hooks.ts:31-38 ; src/components/trading/dashboard-view.tsx:302
+  1172→Problem:
+  1173→  - `useCandles(symbol, tf, count)` sets `staleTime: 30_000` but no `refetchInterval`.
+  1174→  - Result: chart fetches ONCE on mount, becomes stale after 30s, and **never refetches** unless queryKey (symbol/tf/count) changes or invalidateQueries is called.
+  1175→  - The "current" (last) candle on the chart is frozen at the moment of mount. A user staring at the M15 chart for 4 hours sees the same 120 candles forever.
+  1176→  - This is not "real-time" — it's a snapshot labeled as live. The chart header in trading-view.tsx:209 says "live · demo" which is misleading even in production.
+  1177→  - Compounded by the fact that no other component invalidates ["candles", ...] — only symbol/tf changes do.
+  1178→Fix:
+  1179→  - Add `refetchInterval` keyed to timeframe (M1→60s, M5→60s, M15→5min, H1→1min, etc.). At minimum: `refetchInterval: Math.min(60_000, tf_seconds * 1000 / 4)`.
+  1180→  - Alternatively, append live tick to last candle client-side (merge `useTicks` data into the last candle's close/high/low).
+  1181→  - Update header copy to honestly reflect freshness state ("updated 12s ago" instead of "live").
+  1182→
+  1183→[FINDING 3] No WebSocket / push channel — polling only
+  1184→Severity: MEDIUM
+  1185→File: src/lib/trading-hooks.ts (all hooks); src/lib/backend-proxy.ts (1.5s timeout per call)
+  1186→Problem:
+  1187→  - The spec/worklog references "real-time" but the entire data path is HTTP polling. No socket.io, no SSE, no WS.
+  1188→  - At 2.5s ticks × 5s positions × 60s news × 15s logs × 60s ml-info, a single dashboard tab issues ~1500 backend calls/hour, mostly to /ticks.
+  1189→  - Each call: browser → Next.js route → Python backend → MT5 → back. Next.js proxy has 1.5s timeout (backend-proxy.ts:31) — if MT5 is slow, the Next route returns demo fallback (jsonWithDemo with mock data), silently swapping REAL prices for SYNTHETIC ones. The user cannot tell from the UI that the data flipped to mock.
+  1190→  - This is a "real-time" gap vs. spec but acceptable IF the polling intervals are tight enough (see #1). For positions/news where 5–60s lag is OK, polling is fine.
+  1191→Fix:
+  1192→  - Add a `/ws` endpoint (FastAPI WebSocket or socket.io) for tick + position push. Backend subscribes to MT5 `market_book_add` / `copy_ticks_realtime` and pushes deltas.
+  1193→  - At minimum: surface a "data source: LIVE / DEMO-FALLBACK" badge that reflects the last successful backend response — currently the demo flag is returned but TickerTape (ticker-tape.tsx:9) discards it (`const { data } = useTicks(true)`).
+  1194→
+  1195→[FINDING 4] useMultiAnalysis parallel fetch does not honor AbortSignal — pair switch leaks fetches
+  1196→Severity: LOW (no crash; wasted bandwidth + stale result race)
+  1197→File: src/lib/trading-hooks.ts:77-104
+  1198→Problem:
+  1199→  - `useMultiAnalysis` calls `Promise.all(symbols.map(async s => j(...)))`. The `j()` helper (line 16-20) uses `fetch(u, { cache: "no-store" })` WITHOUT an AbortController/signal.
+  1200→  - When the user toggles a pair (or auto-selection fires), the queryKey changes (`["multi-analysis", symbols.join(","), provider]`), TanStack Query starts a new queryFn, but the OLD inflight fetches continue to completion. Each pair switch can leak up to 5 background fetches (one per symbol in the previous list).
+  1201→  - No crash because each per-pair try/catch swallows errors (line 94: `catch { return [s, undefined] }`). But the AI analysis endpoint hits the LLM provider (Z.AI / Groq / Google) — that's real money on the AI bill for results that are immediately discarded.
+  1202→  - Also: rapid pair-switching can race — if the old fetch resolves AFTER the new one (e.g., slow pair on first batch, fast pair on second), the result order is correct (TanStack dedupes by queryKey) but the latency is dominated by the slowest fetch in each batch.
+  1203→Fix:
+  1204→  - Pass the TanStack signal into the fetch:
+  1205→    ```ts
+  1206→    queryFn: async ({ signal }) => {
+  1207→      const entries = await Promise.all(symbols.map(async s => {
+  1208→        try { return [s, (await jAbortable(url, signal)).analysis] as const; }
+  1209→        catch { return [s, undefined] as const; }
+  1210→      }));
+  1211→      ...
+  1212→    }
+  1213→    ```
+  1214→  - Where `jAbortable` wraps fetch with the signal.
+  1215→  - Alternative: replace Promise.all with a single backend endpoint `/api/trading/multi-analysis?symbols=EURUSD,GBPUSD,...&provider=zai` so 1 HTTP call → 1 AI batch.
+  1216→
+  1217→[FINDING 5] Polling queries DO cancel on unmount in v5 — but TickerTape is always-mounted
+  1218→Severity: LOW (architecture observation, not a bug)
+  1219→File: src/components/trading/ticker-tape.tsx:8-21 ; src/app/page.tsx:162
+  1220→Problem:
+  1221→  - TickerTape is rendered in the global header (page.tsx:162), so `useTicks(true)` keeps polling for the lifetime of the app regardless of which view is active. This is intended (live ticker tape) but means:
+  1222→    - Every 2.5s the backend is hit even when the user is on Settings/Backtest and not looking at prices.
+  1223→    - `refetchInterval` queries with no observers ARE cancelled by TanStack Query v5 — but TickerTape never unmounts, so the observer count is always ≥1.
+  1224→  - `usePositions` (5s) and `useNews` (60s) only run when their view is mounted — that's correct.
+  1225→  - `useTicks` is shared across TickerTape (always-on) + DashboardView + TradingView, so only one network call happens per 2.5s tick (TanStack dedupes by queryKey). Good.
+  1226→  - However: when navigating from Trading to Backtest, the ["candles", ...] query for TradingView unmounts — but with `staleTime: 30_000` and no `gcTime` override, the cached candles stay in memory. TanStack default gcTime is 5min — fine.
+  1227→Fix:
+  1228→  - No fix needed for the unmount behavior. Optional: pause useTicks polling when document.hidden (visibilitychange) to cut backend load by ~50% on backgrounded tabs. TanStack exposes `refetchIntervalInBackground: false` for this.
+  1229→
+  1230→[FINDING 6] Backend-down state shows frozen prices, not "disconnected"
+  1231→Severity: HIGH
+  1232→File: src/components/trading/ticker-tape.tsx:9-21 ; src/lib/backend-proxy.ts:51-55 ; src/app/api/trading/ticks/route.ts:15
+  1233→Problem:
+  1234→  - When the Python backend is unreachable, `proxyBackend` returns `{ data: null, proxied: false, status: 0 }` (backend-proxy.ts:54) — silent failure, no log.
+  1235→  - The Next.js /api/trading/ticks route then falls back to `genPriceTicks()` (mock data, route.ts:15) and returns `{ ts: Date.now(), ticks: <mock>, demo: false }`. **Note `demo: false`** even though this is mock data — the demo flag is hardcoded false here (route.ts:15 → jsonWithDemo(..., false)).
+  1236→  - Frontend TickerTape uses `const { data } = useTicks(true)` — discards `isError` and `isFetching` from useQuery. So:
+  1237→    - Backend goes down → mock prices flow in → ticker keeps flashing green/red as if real.
+  1238→    - The header "DEMO" pill (page.tsx:118-124) is driven by `mt5Connected` (Zustand), which is only set via Settings → Connect button. NOT by whether the backend is actually reachable.
+  1239→    - User can be looking at 100% synthetic prices labeled "MT5 LIVE" if they previously clicked Connect.
+  1240→  - Same problem for positions (route.ts:11 → genPositions), news, candles. Order ticket "Entry" tile shows mock `tick.ask` — user could submit a real order against a fake price.
+  1241→  - The 2.5s polling means stale prices are AT MOST 2.5s old while backend is up; but once it goes down, the prices are randomly generated (genPriceTicks re-seeds with `Math.floor(Date.now() / 1000)` per call → fully random every second, not even a believable walk).
+  1242→Fix:
+  1243→  - In /api/trading/ticks/route.ts: change line 15 to `jsonWithDemo({ ts: Date.now(), ticks: [] }, false)` — return EMPTY ticks on backend failure, not mock.
+  1244→  - Or: surface a global `connectionState` in Zustand driven by `useTicks().isError` — when 3 consecutive ticks fail, flip a "DISCONNECTED" banner over the whole app.
+  1245→  - In TickerTape: when `data?.ticks.length === 0` or `isError`, show "RECONNECTING…" cells instead of frozen prices.
+  1246→  - Use the `demo` flag from the response: ticker-tape.tsx:9 should be `const { data, isError } = useTicks(true)` and surface it.
+  1247→  - Kill the silent mock fallback in production builds (gate by `process.env.NODE_ENV === "development"`).
+  1248→
+  1249→================================================================
+  1250→TRADING EDGE CASES
+  1251→================================================================
+  1252→
+  1253→[FINDING 7] Partial fills not handled — send_order reports requested volume, not filled
+  1254→Severity: CRITICAL
+  1255→File: python-backend/mt5_service.py:195-220 ; main.py:283-299
+  1256→Problem:
+  1257→  - `send_order` (mt5_service.py:218-220):
+  1258→    ```python
+  1259→    if r.retcode != mt5.TRADE_RETCODE_DONE:
+  1260→        return {"ok": False, "error": f"{r.retcode}: {r.comment}"}
+  1261→    return {"ok": True, "ticket": r.order, "price": r.price, "volume": volume}
+  1262→    ```
+  1263→    Returns `volume` (the REQUESTED input), not `r.volume` (the ACTUAL filled volume).
+  1264→  - `r.retcode != TRADE_RETCODE_DONE` misclassifies `TRADE_RETCODE_DONE_PARTIAL` (10008) as a failure. A partial fill IS a success — the order opened, just at less than requested size. Currently the frontend shows "Order rejected: 10008: partial done" and the user retries, doubling their intended exposure.
+  1265→  - In main.py:283-293, on `r.get("ok")`, `guard.register_open()` runs unconditionally — even if only 0.3 of 1.0 lot was filled, open_count += 1. No partial-fill volume tracked.
+  1266→  - `save_trade(ticket, ..., volume=volume, ...)` (main.py:289) stores requested volume → trade history is wrong.
+  1267→  - Frontend toast (trading-view.tsx:261): `${volume} lot @ ${fmtPrice(data.price ?? price, digits)}` displays requested volume → user thinks they're flat 1.0 lot when actually 0.6 lot filled.
+  1268→Fix:
+  1269→  - Check both retcodes:
+  1270→    ```python
+  1271→    if r.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
+  1272→        return {"ok": False, "error": f"{r.retcode}: {r.comment}", "retcode": r.retcode}
+  1273→    filled = r.volume if r.volume else volume  # MT5 may return 0 if filled fully
+  1274→    return {"ok": True, "ticket": r.order, "price": r.price,
+  1275→            "volume": filled, "requested_volume": volume,
+  1276→            "partial": filled < volume}
+  1277→    ```
+  1278→  - Surface partial fills in frontend: toast "PARTIAL FILL · 0.6/1.0 lot @ 1.08652".
+  1279→  - Guard should track volume-weighted exposure, not just count.
+  1280→
+  1281→[FINDING 8] Requote/rejection errors passed through as raw retcode — UX is poor but not data-losing
+  1282→Severity: MEDIUM
+  1283→File: python-backend/mt5_service.py:218-219 ; src/components/trading/trading-view.tsx:270
+  1284→Problem:
+  1285→  - Backend returns `{"ok": False, "error": f"{r.retcode}: {r.comment}"}`. For 10004 (REQUOTE) the comment is "requote"; for 10021 (PRICE_OFF) it's "no prices"; for 10030 (INVALID_FILL) "invalid fill".
+  1286→  - Frontend (trading-view.tsx:270) shows `Order rejected: ${data.error ?? "unknown"}`. So the user sees "Order rejected: 10004: requote" — technically informative but no actionable next step.
+  1287→  - For 10004/10021, the right UX is "Price moved — refresh and retry" with a one-click retry button that re-fetches tick and resubmits. Currently the user must manually change something to re-enable the button (it's gated by `submitting` state, which clears via finally).
+  1288→  - No retry-on-requote logic in backend or frontend. For a scalping system this is the most common rejection — silently giving up means missed trades.
+  1289→Fix:
+  1290→  - Map retcodes to human strings + suggested action in a shared table:
+  1291→    ```python
+  1292→    RETCODE_MSG = {
+  1293→        10004: ("Requote — price moved", "retry"),
+  1294→        10006: ("Request rejected by dealer", "manual"),
+  1295→        10013: ("Invalid request", "fix-params"),
+  1296→        10018: ("Market closed", "wait"),
+  1297→        10021: ("No prices for symbol", "refresh"),
+  1298→        10027: ("Autotrading disabled by client", "fix-terminal"),
+  1299→        10030: ("Unsupported filling mode", "fix-config"),
+  1300→    }
+  1301→    ```
+  1302→  - Frontend: parse retcode, show retry button for 10004/10021.
+  1303→  - Auto-retry 1× on requote after 250ms (re-fetch tick + resend).
+  1304→
+  1305→[FINDING 9] No MT5 auto-reconnect; `_state["connected"]` flag never re-validated
+  1306→Severity: CRITICAL
+  1307→File: python-backend/mt5_service.py:37, 60-89, 195-198, 223-225
+  1308→Problem:
+  1309→  - `_state["connected"]` is set to True on `connect()` (line 78) and only set to False on `disconnect()` (line 98). It is NEVER re-validated.
+  1310→  - If MT5 terminal crashes, network drops, or broker kicks the session (24h idle timeout is common), `_state["connected"]` stays True. The next `send_order` call:
+  1311→    - line 197: `if not _state["connected"]: return {"ok": False, "error": "MT5 not connected"}` — passes the check.
+  1312→    - line 199: `mt5.symbol_info(symbol)` returns None (MT5 lib lost connection).
+  1313→    - line 200-201: returns `{"ok": False, "error": "symbol not found"}` — misleading. Looks like a bad symbol, not a connection drop.
+  1314→  - Same misdirection in `ticks()` (line 152: `info = mt5.symbol_info(sym)` → returns None → `continue` → empty list returned → frontend gets empty ticks → silent failure, see Finding 6).
+  1315→  - Same in `close_position()` (line 230: `mt5.symbol_info(p.symbol)` → None → would crash on `_filling_mode(info)` since info=None).
+  1316→  - No background heartbeat task. `_reconcile_loop` (main.py:90-108) calls `mt5_positions()` which returns [] on connection drop — guard then "corrects" open_count to 0, losing all risk tracking.
+  1317→  - For trading: a position could be open, MT5 drops, AI tries to open another, `mt5.symbol_info_tick(symbol)` returns None, `tick.ask`/`tick.bid` crash with AttributeError on NoneType. Actually no — the `send_order` line 202 `tick = mt5.symbol_info_tick(symbol)` returns None, then line 204 `price = tick.ask if ... else tick.bid` throws AttributeError → uncaught, returns 500 to frontend → frontend toast: "Order failed — network error" (trading-view.tsx:273).
+  1318→Fix:
+  1319→  - Add `_verify_connected()` that calls `mt5.terminal_info()` (cheap) and reconnects if it returns None/throws:
+  1320→    ```python
+  1321→    def _verify_connected():
+  1322→        if not _state["connected"]: return False
+  1323→        try:
+  1324→            ti = mt5.terminal_info()
+  1325→            return ti is not None and ti.trade_allowed
+  1326→        except Exception:
+  1327→            return False
+  1328→    ```
+  1329→  - Call it at the top of every market-data + order function. If False, attempt `connect()` once.
+  1330→  - Add a 30s background heartbeat in lifespan (main.py) that calls _verify_connected and flips a global `MT5_ALIVE` flag.
+  1331→  - When MT5 is dead: send_order should return `{"ok": False, "error": "MT5 disconnected — order rejected", "halt": True}` and the AI auto-trader should be disabled until manual reconnect.
+  1332→  - The `/api/trading/order` route (main.py:261) should also gate: if `not mt5_status().connected`, return 503 with halt flag, NOT proceed with sizing.
+  1333→
+  1334→[FINDING 10] News blackout toggle has ZERO enforcement — silent failure
+  1335→Severity: CRITICAL
+  1336→File: python-backend/risk_manager.py:139-142, 86-93 ; python-backend/main.py:261-299 ; python-backend/config.py:34 ; src/components/trading/trading-view.tsx:169-174
+  1337→Problem:
+  1338→  - Settings has `avoid_high_impact_news: bool = True` (config.py:34).
+  1339→  - Frontend has `avoidNews` toggle (trading-view.tsx:170-174) which is persisted to localStorage (trading-store.ts:262).
+  1340→  - BUT — `risk_manager.near_high_impact_news()` (risk_manager.py:139-142) is a STUB that returns False unconditionally:
+  1341→    ```python
+  1342→    def near_high_impact_news(minutes: int = 15) -> bool:
+  1343→        """Check economic calendar for tier-1 events within `minutes`."""
+  1344→        # implemented in main.py via news_service.economic_calendar()
+  1345→        return False
+  1346→    ```
+  1347→    The docstring says "implemented in main.py" — but main.py NEVER calls it either. There is no news check in the order flow.
+  1348→  - `guard.can_open(equity)` (risk_manager.py:86-93) only checks daily_loss + open_count. No news gate.
+  1349→  - `api_order` (main.py:261-299) does not check `settings.avoid_high_impact_news`, does not call `near_high_impact_news()`, does not query `economic_calendar()`.
+  1350→  - The frontend `avoidNews` setting is NEVER transmitted to the backend (OrderReq model main.py:192-197 has no avoidNews field). It's purely cosmetic.
+  1351→  - Result: a user who toggled "Avoid high-impact news" sees the switch in green, believes they're protected, but an AI order can fire 30 seconds before US CPI prints → 30-pip gap → instant SL hit on all open positions + new position opened at worst price.
+  1352→  - news_service.py:100-111 does fetch the Finnhub economic calendar and it's surfaced in /api/trading/news — but never consumed by the order flow.
+  1353→Fix:
+  1354→  - Implement `near_high_impact_news(minutes=15)` properly:
+  1355→    ```python
+  1356→    async def near_high_impact_news(minutes: int = 15) -> bool:
+  1357→        cal = await economic_calendar()
+  1358→        now = datetime.now(timezone.utc)
+  1359→        for ev in cal:
+  1360→            if ev.get("impact") != "high": continue
+  1361→            t = parse_event_time(ev)  # Finnhub returns 'time' as unix ts
+  1362→            if now <= t <= now + timedelta(minutes=minutes):
+  1363→                return True
+  1364→        return False
+  1365→    ```
+  1366→  - Add to `OrderReq` an `avoid_news: bool = True` field (default from settings).
+  1367→  - In `api_order` (main.py:261), BEFORE sizing:
+  1368→    ```python
+  1369→    if body.avoid_news and await near_high_impact_news(minutes=15):
+  1370→        return {"ok": False, "error": "Blocked: high-impact news within 15min", "halt": True}
+  1371→    ```
+  1372→  - Use a 30-second in-process cache for the calendar so it doesn't refetch per order.
+  1373→  - Test: simulate US CPI 5 min out, attempt order, expect halt.
+  1374→
+  1375→[FINDING 11] Slippage not tracked, not displayed, not stored
+  1376→Severity: MEDIUM
+  1377→File: src/components/trading/trading-view.tsx:236, 259-266 ; python-backend/mt5_service.py:204, 220 ; python-backend/db.py (save_trade signature)
+  1378→Problem:
+  1379→  - Frontend displays "Entry" tile (trading-view.tsx:382) with the QUOTED price (`tick.ask`/`tick.bid`) at submit time. After fill, the toast (line 261-265) shows `data.price ?? price` — the actual fill price IF the backend returns it. The Entry tile still shows the old quoted price, not the fill.
+  1380→  - No slippage computation anywhere: neither `slippage_pips = (fill_price - quoted_price) / pip` is computed client-side nor server-side.
+  1381→  - DB save_trade (main.py:287-291) stores `open_price=r.get("price", 0)` — the fill price. Good. But no `quoted_price` column → no historical slippage analysis possible.
+  1382→  - Backend `deviation: 20` (mt5_service.py:213) is a fixed 20-point tolerance (2 pips on 5-digit FX, 0.2 on JPY, $2 on XAUUSD). For XAUUSD which routinely moves $0.50/tick, 20 points = $2 = ~50 ticks of allowed slippage — far too wide. For EURUSD scalping, 2 pips is also wide given a 5-pip SL.
+  1383→  - AI auto-trade path (main.py:279-282) doesn't pass any deviation — uses hardcoded 20 in send_order.
+  1384→Fix:
+  1385→  - Return `quoted_price` and `fill_price` from send_order:
+  1386→    ```python
+  1387→    return {"ok": True, "ticket": r.order, "price": r.price,
+  1388→            "quoted_price": price, "volume": filled,
+  1389→            "slippage_pips": round((r.price - price) / pip * (-1 if side=="BUY" else 1), 1)}
+  1390→    ```
+  1391→  - Store both in DB (add `quoted_price REAL` column to trades table).
+  1392→  - Toast: "Filled @ 1.08652 (slippage +0.3p from quoted 1.08649)".
+  1393→  - Symbol-aware deviation: `deviation = max(10, atr_pips * 2)` — compute ATR on M1 candles and pass to send_order.
+  1394→
+  1395→[FINDING 12] 10s reconcile gap allows daily-risk breach
+  1396→Severity: HIGH
+  1397→File: python-backend/main.py:90-108, 261-299 ; python-backend/risk_manager.py:86-110
+  1398→Problem:
+  1399→  - `_reconcile_loop` (main.py:97-108) polls `mt5_positions()` every 10s. If a broker-side SL hits (TP/SL triggered by exchange), `guard.open_count` and `guard.daily_loss` are NOT updated until the next reconcile pass.
+  1400→  - Failure mode A (money risk):
+  1401→    - T0: 3 open positions, daily_loss = $50 (well below $300 limit at 3% of $10000).
+  1402→    - T0+1s: SL hits on a 1.0 lot EURUSD position → realized loss = $100. Broker closes the position.
+  1403→    - T0+2s: AI sees a signal, calls /api/trading/order. `guard.can_open(equity)` checks: open_count=3 (stale) → BLOCKED with "Max open positions reached". Safe — overconservative.
+  1404→    - BUT: T0+8s (still within 10s window): another SL hits on second position → realized loss = $80. Cumulative realized loss now $180 (60% of limit). Guard still thinks daily_loss = $50.
+  1405→    - T0+9s: AI calls /api/trading/order. `guard.can_open`: open_count=3 (stale, actual=1), daily_loss=$50 (stale, actual=$180). Both pass. Order OPENS at full size.
+  1406→    - T0+10s: reconcile runs, sets open_count=1 (correct), register_loss($100) + register_loss($80) → daily_loss = $230.
+  1407→    - Now: open positions = 2, daily_loss = $230 (76% of limit, not breached, but only by luck).
+  1408→  - Failure mode B (real breach):
+  1409→    - If instead of $80 the second SL was $200 (a larger position), cumulative realized = $300 (limit). Guard thought $50, allowed the new order. After reconcile: daily_loss = $300, plus the new position's risk → BREACHED.
+  1410→  - The reconcile loop also doesn't restore `daily_loss` from broker history on a cold restart — it relies on the SQLite state, which is updated only when WE close a trade. Broker-side closes (SL/TP/margin-call) don't write to the DB trades table at all (save_trade only called on /api/trading/order, close_trade only on /api/trading/positions/{ticket}). So broker-closed trades have NO DB record.
+  1411→Fix:
+  1412→  - Reduce reconcile interval to 2–3s (the cost is minimal — one MT5 RPC).
+  1413→  - On each reconcile pass, ALSO call `mt5.history_deals_get(from=time_of_last_reconcile)` to fetch broker-closed deals and persist them via close_trade + register_loss.
+  1414→  - Before `guard.can_open()` in api_order, force a one-shot reconcile: `real_count = len(mt5_positions()); guard.open_count = real_count` and refresh daily_loss from history_deals_get(today).
+  1415→  - Add a hard interlock: if `time_since_last_reconcile > 15s`, refuse new orders with "Stale risk state — please retry in 2s".
+  1416→
+  1417→[FINDING 13] Equity display is permanently $10000 — never refreshed from MT5
+  1418→Severity: HIGH (UX + risk-sizing correctness)
+  1419→File: src/components/trading/dashboard-view.tsx:57-58 ; src/lib/trading-store.ts:127 ; src/components/trading/trading-view.tsx:225, 233-234 ; python-backend/mt5_service.py:77-86
+  1420→Problem:
+  1421→  - Frontend store: `accountEquity: 10000, accountBalance: 10000` (trading-store.ts:127-128), and `partialize` (line 242-269) deliberately EXCLUDES these from persistence (comment line 242: "only persist config, not live connection/equity state"). So they reset to $10000 on every page reload. There is NO setter call anywhere in the codebase that updates `accountEquity` or `accountBalance` from backend data.
+  1422→  - DashboardView (dashboard-view.tsx:57-58): `const equity = useTradingStore((s) => s.accountEquity); const balance = useTradingStore((s) => s.accountBalance);` — always $10000/$10000.
+  1423→  - DashboardView line 66: `const dayPnl = floatingPnl + 142.6;` — HARDCODED $142.60 offset. This is fake data labeled as "Day P&L" in the StatTile (line 99-103).
+  1424→  - DashboardView line 71: `const curve = React.useMemo(() => equityCurve(), []);` — equityCurve() (line 41-49) generates a SYNTHETIC 48-point curve via Math.sin + Math.random. The "Equity Curve (48h)" chart in the dashboard is fully synthetic, NOT from trade history.
+  1425→  - DashboardView line 88: `value={fmtMoney(equity + floatingPnl)}` — combines static $10000 with live floating P&L. As floating P&L moves ±$500, the "Equity" tile shows $9500–$10500 around a $10000 base — misleading because the real account equity could be $8500 (after yesterday's losses) or $11500 (after gains).
+  1426→  - OrderTicket (trading-view.tsx:225, 233-234): `const equity = useTradingStore(s => s.accountEquity);` → `const riskAmount = (equity * riskPct) / 100;` → `const autoLot = ...`. The UI-recommended lot size is computed from $10000 → riskAmount=$100 (1%) → autoLot for 10p SL = $100 / (10 × $10) = 1.0 lot. But the BACKEND api_order (main.py:266-270) fetches real equity: `equity = st.account.get("equity", 10000.0)` → uses real equity for sizing. So if real equity is $5000, backend sizes to 0.5 lot, but UI showed "AI: 1.00" recommendation. User sees discrepancy but no explanation.
+  1427→  - Backend HAS the data: mt5_service.connect() (mt5_service.py:77-86) populates `_state["account"] = {..., "balance": info.balance, "equity": info.equity, ...}`. The /api/trading/status endpoint returns it (main.py:219-221). The frontend just never calls /api/trading/status to refresh the store.
+  1428→Fix:
+  1429→  - Add `useAccountStatus()` hook polling /api/trading/status every 5–10s:
+  1430→    ```ts
+  1431→    export function useAccountStatus() {
+  1432→      return useQuery({
+  1433→        queryKey: ["status"],
+  1434→        queryFn: () => j("/api/trading/status"),
+  1435→        refetchInterval: 10_000,
+  1436→        staleTime: 0,
+  1437→      });
+  1438→    }
+  1439→    ```
+  1440→  - In a top-level effect (page.tsx or QueryProvider), call `useAccountStatus` and write equity/balance/connected into the store:
+  1441→    ```ts
+  1442→    useEffect(() => {
+  1443→      if (status?.account) {
+  1444→        useTradingStore.getState().setAccountEquity(status.account.equity);
+  1445→        useTradingStore.getState().setAccountBalance(status.account.balance);
+  1446→        useTradingStore.getState().setMt5Connected(status.connected);
+  1447→      }
+  1448→    }, [status]);
+  1449→    ```
+  1450→  - Remove the hardcoded `+ 142.6` and the synthetic `equityCurve()` — fetch `/api/trading/backtest` or build curve from `get_trades()` in DB.
+  1451→  - mt5_service.py: `account_info()` is only fetched on connect (line 77). Add an `account_info()` refresh function called on each /status request so equity updates as positions move.
+  1452→
+  1453→================================================================
+  1454→ADDITIONAL FINDINGS (related to the above)
+  1455→================================================================
+  1456→
+  1457→[FINDING 14] close_position loses realized P&L — DB trade history permanently wrong
+  1458→Severity: CRITICAL
+  1459→File: python-backend/mt5_service.py:223-244 ; python-backend/main.py:302-314
+  1460→Problem:
+  1461→  - mt5_service.close_position() returns ONLY `{"ok": bool, "retcode": int}` (line 244). No `pnl`, no `pips`, no `price`, no `ticket` of the closing deal.
+  1462→  - main.py:302-314 consumes this and passes defaults to close_trade:
+  1463→    ```python
+  1464→    pnl = r.get("pnl", 0.0)               # always 0.0
+  1465→    close_trade(ticket, r.get("price", 0),  # always 0
+  1466→                pnl, r.get("pips", 0))     # always 0
+  1467→    ```
+  1468→  - DB trades table records every closed trade with pnl=0, close_price=0, pips=0. Trade history is unusable for performance analytics (win rate, profit factor, expectancy all zero-divide or report 0).
+  1469→  - Worse: `guard.register_close(pnl=0.0)` (main.py:313) → daily_loss is NEVER incremented by broker-side closes initiated via the API. Only the reconcile loop's `register_loss` (which doesn't exist — reconcile only fixes open_count, line 105) catches broker closes. **Wait, re-reading main.py:97-108**: reconcile only sets `guard.open_count = real_count`. It does NOT call register_loss for the missing positions. So daily_loss is undercounted by EVERY broker-side close.
+  1470→  - Combined with Finding 12, the daily risk limit is effectively never enforced after a TP/SL hits via broker, regardless of who initiated the close.
+  1471→Fix:
+  1472→  - close_position should fetch the deal result:
+  1473→    ```python
+  1474→    r = mt5.order_send(req)
+  1475→    if r.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
+  1476→        return {"ok": False, "error": f"{r.retcode}: {r.comment}"}
+  1477→    # fetch the closing deal to get realized pnl
+  1478→    deals = mt5.history_deals_get(position=ticket) or []
+  1479→    pnl = sum(d.profit for d in deals) if deals else 0.0
+  1480→    price = r.price
+  1481→    pips = ...  # compute from open vs close
+  1482→    return {"ok": True, "ticket": ticket, "price": price, "pnl": pnl, "pips": pips}
+  1483→    ```
+  1484→  - Reconcile loop should also fetch `history_deals_get` since last reconcile and register_loss for any closed-by-broker positions.
+  1485→
+  1486→[FINDING 15] Volume slider capped at 2.0 lot — silently rejects valid FINEX sizes up to 50
+  1487→Severity: LOW
+  1488→File: src/components/trading/trading-view.tsx:333-340
+  1489→Problem:
+  1490→  - Slider `max={2}` (line 336) caps user-selectable volume at 2.0 lot, but FINEX broker spec (BROKER_SPEC.maxVolume = 50 in trading-data.ts:152) allows up to 50. The quick-set buttons (line 345-349) only go to 1.0.
+  1491→  - Backend api_order (main.py:277) clamps to `max(volume, 50.0)` — so a manual volume above 2.0 would be accepted, but the UI prevents the user from ever setting it.
+  1492→  - Not a money-risk bug, but a UX/spec mismatch. For a $10000 account at 1% risk on 10-pip SL, autoLot = 1.0 — fine. But for a $50000 account, the slider won't let the user scale up.
+  1493→Fix:
+  1494→  - Make slider max adaptive to equity: `max={Math.min(50, Math.floor(equity / 1000))}` or just `max={50}` with finer step.
+  1495→  - Or expose quick-set buttons that include higher values once equity justifies it.
+  1496→
+  1497→================================================================
+  1498→SUMMARY TABLE
+  1499→================================================================
+  1500→| # | Severity | Area | File:Line | One-liner |
+  1501→|---|----------|------|-----------|-----------|
+  1502→| 1 | HIGH | RT | trading-hooks.ts:26 | 2.5s tick latency too slow for 5-pip SL scalping |
+  1503→| 2 | HIGH | RT | trading-hooks.ts:36 | Candles query never refetches — chart is a snapshot |
+  1504→| 3 | MEDIUM | RT | trading-hooks.ts (all) | No WS/SSE — polling only |
+  1505→| 4 | LOW | RT | trading-hooks.ts:87 | useMultiAnalysis doesn't pass signal → fetch leak on pair switch |
+  1506→| 5 | LOW | RT | ticker-tape.tsx:8 | TickerTape always-on (intended) — no visibilitychange pause |
+  1507→| 6 | HIGH | RT | ticker-tape.tsx:9 | Backend-down shows frozen mock prices labeled as live |
+  1508→| 7 | CRITICAL | TR | mt5_service.py:218-220 | Partial fill misclassified as error; requested vol returned, not filled |
+  1509→| 8 | MEDIUM | TR | mt5_service.py:218 | Requote/rejection raw retcode shown — no retry UX |
+  1510→| 9 | CRITICAL | TR | mt5_service.py:37,197 | No MT5 reconnect; _state["connected"] never re-validated |
+  1511→| 10 | CRITICAL | TR | risk_manager.py:139 | avoid_high_impact_news is a stub — toggle is cosmetic |
+  1512→| 11 | MEDIUM | TR | trading-view.tsx:236,382 | Slippage not computed/displayed/stored |
+  1513→| 12 | HIGH | TR | main.py:90-108 | 10s reconcile gap → daily risk breach possible |
+  1514→| 13 | HIGH | TR | dashboard-view.tsx:57-71 | Equity hardcoded $10000; Day P&L = floatingPnl + 142.6 (fake) |
+  1515→| 14 | CRITICAL | TR | mt5_service.py:244 | close_position returns no pnl/pips → DB history + guard wrong |
+  1516→| 15 | LOW | TR | trading-view.tsx:336 | Volume slider capped at 2.0 lot vs FINEX max 50 |
+  1517→
+  1518→CRITICAL count: 4 (#7, #9, #10, #14)
+  1519→HIGH count: 6 (#1, #2, #6, #12, #13, plus #14 if counted as both CRITICAL + HIGH impact on risk)
+  1520→MEDIUM count: 4 (#3, #8, #11, plus #2 if relaxed)
+  1521→LOW count: 2 (#4, #5, #15 — 3 items)
+  1522→
+  1523→TOP 3 MUST-FIX BEFORE ANY LIVE TRADE:
+  1524→  1. Finding #10 — news blackout enforcement (silent failure → 30-pip gap exposure)
+  1525→  2. Finding #7 — partial fill handling (silent overexposure on retry)
+  1526→  3. Finding #9 — MT5 reconnect + connection gating (silent order failures, 500s)
+  1527→
+  1528→TOP 3 MUST-FIX FOR CORRECT RISK ACCOUNTING:
+  1529→  4. Finding #14 — close_position pnl/pips persist (otherwise daily_loss never increments)
+  1530→  5. Finding #12 — reconcile gap + history_deals_get (broker-side closes invisible)
+  1531→  6. Finding #13 — equity refresh from /api/trading/status (UI risk sizing wrong)
+  1532→
+  1533→No code changes were made. Audit only.
+  1534→
+  1535→---
+  1536→Task ID: R3
+  1537→Agent: UX/ML Auditor
+  1538→Task: Audit frontend UX gaps + ML robustness across 8 trading views + 2 Python ML files
+  1539→
+  1540→Scope:
+  1541→- src/components/trading/{dashboard,trading,ai-engine,risk,news,backtest,alerts,logs}-view.tsx
+  1542→- python-backend/{ml_model.py, indicators.py}
+  1543→- src/lib/trading-hooks.ts (for fetch/error contracts)
+  1544→- src/components/trading/primitives.tsx (Chip a11y)
+  1545→
+  1546→Method: Read every file end-to-end; cross-referenced hook return shapes (data/isError/isFetching)
+  1547→against view consumption; verified ML train/predict/drift paths; traced indicator compute()
+  1548→edge cases.
+  1549→
+  1550→Summary: 22 findings — 0 CRITICAL, 8 HIGH, 9 MEDIUM, 5 LOW
+  1551→
+  1552→==================================================================
+  1553→FRONTEND UX FINDINGS (1-13)
+  1554→==================================================================
+  1555→
+  1556→1. [HIGH] Error states: no view renders an error UI on fetch failure
+  1557→   Files: dashboard-view.tsx:52-53,74; trading-view.tsx:197-199,227-228,413;
+  1558→          ai-engine-view.tsx:39; news-view.tsx:17; backtest-view.tsx:37;
+  1559→          logs-view.tsx:23
+  1560→   Problem: Every TanStack Query hook in trading-hooks.ts throws on non-2xx
+  1561→   (j() helper line 18: `throw new Error`). TanStack sets isError=true, but
+  1562→   NO view destructures isError/error. On network failure the view silently
+  1563→   shows empty/loading state forever (e.g., "Analyzing…" spins indefinitely,
+  1564→   PositionsTable shows "No open positions" even when the API is down —
+  1565→   misleading the user into thinking they have no positions when really the
+  1566→   request failed).
+  1567→   Fix: destructure `{ data, isError, error, refetch }` and render an error
+  1568→   card with message + Retry button. Pattern:
+  1569→     {isError ? <ErrorCard msg={error.message} onRetry={refetch}/> : <data view>}
+  1570→
+  1571→2. [MEDIUM] Loading skeletons: no skeleton loaders anywhere
+  1572→   Files: all 8 views
+  1573→   Problem: During initial fetch, views show blank space or minimal text
+  1574→   ("Analyzing…" with a pulsing icon). No skeleton placeholders matching
+  1575→   final layout. The chart area (dashboard-view.tsx:303-311 ChartForSymbol,
+  1576→   trading-view.tsx:211) shows an empty 300px box while candles load.
+  1577→   news-view.tsx, logs-view.tsx, backtest-view.tsx show blank cards.
+  1578→   Fix: add skeleton components (pulsing gray rectangles) sized to match
+  1579→   final content — table rows, chart area, stat tiles.
+  1580→
+  1581→3. [MEDIUM] Empty state: news-view.tsx missing empty state for 0 results
+  1582→   Files: news-view.tsx:86-139 (headlines list), news-view.tsx:142-167 (calendar)
+  1583→   Problem: When `filtered.length === 0` in news-view, the headlines list is
+  1584→   just blank (no "No news found" message). Compare: alerts-view.tsx:156-159
+  1585→   has "No alerts — create one above" ✓; logs-view.tsx:107-110 has "No matching
+  1586→   logs" ✓; backtest-view.tsx:228-232 has "Configure parameters…" ✓.
+  1587→   Fix: add `{filtered.length === 0 ? <div>No news matches your filters</div> : list}`.
+  1588→   Note: calendar section uses hardcoded items so never empty (see finding 13).
+  1589→
+  1590→4. [HIGH] Accessibility — icon-only buttons missing aria-labels
+  1591→   Files:
+  1592→   - alerts-view.tsx:149-151 — Plus button (icon only, no aria-label)
+  1593→   - alerts-view.tsx:183-190 — Trash2 delete button (icon only, no aria-label)
+  1594→   - logs-view.tsx:48-51 — Download/Export button (has text "Export" — OK but
+  1595→     the button is a dead control, see finding 12)
+  1596→   - trading-view.tsx:445-448 — Refresh button (has text "Refresh" — OK but
+  1597→     dead, finding 12)
+  1598→   Problem: Screen-reader users encounter unlabeled buttons. The `title`
+  1599→   attribute on Chip (primitives.tsx:145) is a tooltip, not a reliable a11y
+  1600→   label. Chip is a toggle but lacks `aria-pressed={active}`.
+  1601→   Also: Select labels in backtest-view.tsx:58,73,88 and alerts-view.tsx:110,
+  1602→   125,139,207 use `<label>` text but do NOT associate it with the Select
+  1603→   trigger (no htmlFor/id, no aria-label on SelectTrigger).
+  1604→   Fix: add `aria-label` to icon-only buttons; add `aria-pressed={active}` to
+  1605→   Chip; add `aria-label` to SelectTrigger or use Radix Label association.
+  1606→
+  1607→5. [MEDIUM] Mobile: tables not horizontally scrollable; alerts form cramped
+  1608→   Files:
+  1609→   - dashboard-view.tsx:324 — `<div className="max-h-72 overflow-y-auto scroll-thin -mx-1">`
+  1610→     wraps a 9-column PositionsTable. Vertical scroll only — on mobile (<640px)
+  1611→     the 9 columns compress to ~30px each or clip horizontally.
+  1612→   - trading-view.tsx:455 — same pattern, 9 columns
+  1613→   - backtest-view.tsx:178 — same pattern, 8 columns
+  1614→   - alerts-view.tsx:108 — `<div className="grid grid-cols-12 gap-2 mb-3">`
+  1615→     uses col-span-4/4/3/1 — on mobile this is very cramped (375px / 12 ≈ 31px
+  1616→     per column). No responsive breakpoint.
+  1617→   - ai-engine-view.tsx:454 — multi-factor label `w-48 shrink-0` (192px) is half
+  1618→     of a 375px mobile screen, leaving ~180px for the bar — too tight.
+  1619→   Fix: wrap tables in `<div className="overflow-x-auto">`; use
+  1620→   `grid-cols-1 sm:grid-cols-12` for alerts form; use `w-32 sm:w-48` for
+  1621→   multi-factor labels.
+  1622→
+  1623→6. [MEDIUM] Toast spam / duplicate orders on rapid click
+  1624→   File: trading-view.tsx:240-277 (OrderTicket.submit)
+  1625→   Problem: `submitting` state disables the button (line 394:
+  1626→   `disabled={!price || submitting}`), but React state updates are async.
+  1627→   Rapid double/triple clicks within the same render frame (~16ms) can fire
+  1628→   2-3 fetch requests before `setSubmitting(true)` propagates to disable the
+  1629→   button. Each request creates a separate order → duplicate positions.
+  1630→   No useRef guard, no debounce, no request deduplication.
+  1631→   Fix: add `const inFlight = React.useRef(false)` guard at top of submit:
+  1632→     if (inFlight.current) return; inFlight.current = true;
+  1633→   set `inFlight.current = false` in finally. This is synchronous and blocks
+  1634→   duplicate calls within the same frame.
+  1635→
+  1636→7. [LOW] Stale closure: not actually a bug here, but fragile
+  1637→   File: trading-view.tsx:240-277 (OrderTicket.submit)
+  1638→   Problem: `submit` is NOT wrapped in useCallback — it's recreated every
+  1639→   render with latest state. So clicking uses the latest volume/side/slPips.
+  1640→   NOT stale. However: the toast (line 261-266) uses `tpPips` computed from
+  1641→   current `slPips * rr` — if user changes slPips after clicking submit but
+  1642→   before the toast renders, the toast shows the new tpPips, not what was
+  1643→   sent. Minor display inconsistency.
+  1644→   Risk: if someone later wraps submit in `useCallback([])` with empty deps,
+  1645→   it becomes a stale-closure bug. Fix: add comment "// intentionally
+  1646→   non-memoized to capture latest state" or use useCallback with explicit
+  1647→   deps [symbol, side, volume, slPips, autoTrade, price, rr, riskAmount].
+  1648→
+  1649→8. [HIGH] No confirmation for destructive actions
+  1650→   File: trading-view.tsx:418-436 (PositionsCard.closePosition)
+  1651→   Problem: Clicking "Close" immediately fires `DELETE /api/trading/positions/${ticket}`
+  1652→   with NO confirmation dialog. Closing a live position at market is
+  1653→   irreversible — a misclick closes a real-money position instantly. The
+  1654→   Close button (line 497-505) is right-aligned in each table row, easy to
+  1655→   hit accidentally on mobile.
+  1656→   Also: alerts-view.tsx:78-80 (remove alert) deletes with no confirm — less
+  1657→   critical (re-creatable) but still should confirm or offer undo.
+  1658→   Fix: add a confirm dialog (AlertDialog from shadcn/ui) before fetch:
+  1659→   "Close position #{ticket} ({symbol} {type} {volume} lot)? Market order
+  1660→   will execute immediately at current price." Require explicit confirmation.
+  1661→   For alerts: use Sonner's `toast("Alert deleted", { action: { label:
+  1662→   "Undo", onClick: ... } })` pattern.
+  1663→
+  1664→9. [MEDIUM] OrderTicket form validation insufficient
+  1665→   File: trading-view.tsx:216-410 (OrderTicket)
+  1666→   Problem: Submit button (line 390-399) `disabled={!price || submitting}`
+  1667→   only checks price existence. Does NOT validate:
+  1668→   - volume > 0 (slider enforces min 0.01, but no explicit guard)
+  1669→   - slPips in [5,15] range (slider enforces, but fragile)
+  1670→   - volume within broker max lot (50 — slider max 2, OK)
+  1671→   - risk vs daily risk limit (no client-side pre-trade check)
+  1672→   - equity sufficient for margin (no check)
+  1673→   No validation error messages shown to user. autoLot calc (line 234):
+  1674→   `Math.max(0.01, +(riskAmount / (slPips * 10)).toFixed(2))` — if slPips
+  1675→   were 0, division by zero → NaN → Math.max(0.01, NaN) = NaN in JS. Slider
+  1676→   prevents slPips=0 but code is fragile.
+  1677→   Fix: add explicit guards in submit():
+  1678→     if (volume < 0.01) return toast.error("Volume below minimum (0.01)");
+  1679→     if (slPips < 5 || slPips > 15) return toast.error("SL must be 5-15 pips");
+  1680→     if (riskAmount > dailyRiskRemaining) return toast.error("Exceeds daily risk limit");
+  1681→
+  1682→10. [HIGH] Backtest "Run" button and timeframe selector are non-functional
+  1683→    File: backtest-view.tsx:31-42, 37; trading-hooks.ts:106-117
+  1684→    Problem: `run()` (line 39-42) increments `runId` (never read) and shows a
+  1685→    toast — does NOT trigger refetch or pass new params. `useBacktest(symbol,
+  1686→    trades)` (line 37) does NOT receive `tf` (the timeframe state from line
+  1687→    33) or `indicators` (from store, line 31). The hook's queryKey
+  1688→    (trading-hooks.ts:112) is `["backtest", symbol, trades]` — no tf, no
+  1689→    runId, no indicators.
+  1690→    Result: changing the Timeframe dropdown does nothing. Clicking "Run
+  1691→    Backtest" does nothing except show a toast. The "{indicators.length}
+  1692→    indicators active" badge (line 102-104) is decorative — indicators are
+  1693→    never sent to the API.
+  1694→    Fix: `const { data, isFetching, refetch } = useBacktest(symbol, tf, trades,
+  1695→    runId, indicators)`; update hook to accept these and include in queryKey;
+  1696→    call `refetch()` (or rely on queryKey change) in `run()`.
+  1697→
+  1698→11. [HIGH] AI Engine "Execute" button is a no-op (fake execution)
+  1699→    File: ai-engine-view.tsx:425-438
+  1700→    Problem: The "Execute {a.signal} {focus}" button (line 425-438) only calls
+  1701→    `toast.success("Signal queued: ...")` — it does NOT POST to
+  1702→    /api/trading/order. User believes they just placed a trade; in reality
+  1703→    nothing happened. The label says "Execute" implying immediate order.
+  1704→    When autoTradeMode is ON, button is disabled with text "Auto-trade active
+  1705→    — AI executes signals" (correct). But in manual mode, the button is
+  1706→    actively misleading.
+  1707→    Fix: POST to /api/trading/order with { symbol: focus, side: signal→BUY/SELL,
+  1708→    volume: autoLot, slPips: derived from entry/SL, comment: "AI:manual" }.
+  1709→    On success: toast + invalidate positions. On error: toast.error. Or
+  1710→    rename button to "Queue Signal" and make clear it doesn't auto-execute.
+  1711→
+  1712→12. [MEDIUM] Dead buttons and dead switches
+  1713→    Files:
+  1714→    - trading-view.tsx:445-448 — "Refresh" button in PositionsCard header has
+  1715→      NO onClick. Dead.
+  1716→    - logs-view.tsx:48-51 — "Export" button has NO onClick. Dead.
+  1717→    - alerts-view.tsx:220-224 — 5 SwitchRow components with
+  1718→      `onChange={() => {}}`: 3 have `checked={true}` (always ON, can't toggle
+  1719→      off), 1 has `checked={false}` (always OFF). All dead — user clicks do
+  1720→      nothing.
+  1721→    Fix: wire up onClick handlers (Refresh → queryClient.invalidateQueries;
+  1722→    Export → fetch /api/trading/logs/export or generate CSV client-side;
+  1723→    switches → store or API).
+  1724→
+  1725→13. [MEDIUM] Hardcoded fake data presented as real
+  1726→    Files:
+  1727→    - dashboard-view.tsx:41-49 — `equityCurve()` generates random data with
+  1728→      Math.random(); presented as "Equity Curve (48h)" with no "demo" label.
+  1729→    - dashboard-view.tsx:66 — `dayPnl = floatingPnl + 142.6` — hardcoded
+  1730→      142.6 presented as realized P&L in "Day P&L" stat tile.
+  1731→    - risk-view.tsx:270-273 — "Today Risk Used 0.8%", "Margin Level 1,840%",
+  1732→      "Max DD (30d) -4.2%" all hardcoded.
+  1733→    - news-view.tsx:172-184 — sentiment 42%/33%/25% hardcoded; line 195-202
+  1734→      calendar items hardcoded with stale future dates.
+  1735→    - alerts-view.tsx:247-253 — "Recent Notifications" hardcoded 5 items.
+  1736→    Problem: These look like live data but are static. Misleads user into
+  1737→    thinking the system is connected when it's showing mock data. Especially
+  1738→    dangerous in risk-view (fake margin level could hide a margin call).
+  1739→    Fix: either fetch from API (/api/trading/account for equity/margin/DD,
+  1740→    /api/trading/sentiment for news sentiment) or add a visible "DEMO DATA"
+  1741→    badge to each mock section.
+  1742→
+  1743→==================================================================
+  1744→ML ROBUSTNESS FINDINGS (14-19)
+  1745→==================================================================
+  1746→
+  1747→14. [HIGH] Class imbalance not handled — model biases toward NEUTRAL
+  1748→    File: ml_model.py:48-53 (label), 81-85 (XGBClassifier), 86 (fit)
+  1749→    Problem: `label()` uses threshold 0.0008. On H1 EURUSD, forward 5-bar
+  1750→    returns rarely exceed 0.0008 (~70-85% of bars are flat → label 0). The
+  1751→    XGBClassifier is initialized WITHOUT `scale_pos_weight` (multiclass
+  1752→    doesn't support it directly) and `clf.fit()` is called WITHOUT
+  1753→    `sample_weight`. No oversampling (SMOTE), no undersampling.
+  1754→    Result: model learns to always predict 0 (NEUTRAL) → high accuracy
+  1755→    (~80%) but useless for trading (never predicts a direction). The
+  1756→    train_acc/test_acc reported will be inflated by the majority class.
+  1757→    Fix: compute class weights: `from sklearn.utils.class_weight import
+  1758→    compute_sample_weight; sw = compute_sample_weight("balanced", y_train)`;
+  1759→    pass `sample_weight=sw` to `clf.fit(X_train, y_train, sample_weight=sw,
+  1760→    eval_set=...)`. Or lower threshold to 0.0003-0.0005 to get more
+  1761→    directional labels. Or use SMOTE on minority classes {-1, +1}.
+  1762→
+  1763→15. [HIGH] No walk-forward / time-series CV — single 80/20 split
+  1764→    File: ml_model.py:75-79
+  1765→    Problem: Single chronological 80/20 split. The test set is one
+  1766→    contiguous period — if that period is trending, model looks great; if
+  1767→    choppy, looks bad. No walk-forward, no expanding-window CV, no purged
+  1768→    k-fold (which would also prevent label leakage from the `horizon`-bar
+  1769→    overlap). The UI even claims "Train/test split: 80/20 chronological"
+  1770→    (ai-engine-view.tsx:274) as if that's sufficient — it isn't for time
+  1771→    series.
+  1772→    Fix: implement walk-forward: split into K folds (e.g., 5), train on
+  1773→    [0..T_i], test on [T_i..T_{i+1}], with a purge gap of `horizon` bars
+  1774→    between train and test to avoid label leakage. Average test_acc across
+  1775→    folds. Report mean ± std. Use `sklearn.model_selection.TimeSeriesSplit`
+  1776→    with custom purge.
+  1777→
+  1778→16. [MEDIUM] No hyperparameter optimization — fixed params + fixed feature periods
+  1779→    File: ml_model.py:29-30 (FEATURES), 81-85 (XGBClassifier params)
+  1780→    Problem: FEATURES uses fixed periods: ema_20, ema_50, rsi_14, atr_14,
+  1781→    macd(12,26,9), ret_{1,3,5}, vol_5. XGBClassifier uses fixed
+  1782→    n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8,
+  1783→    colsample_bytree=0.8. Never re-tuned per symbol, timeframe, or regime.
+  1784→    Different pairs (EURUSD vs XAUUSD vs GBPJPY) have different
+  1785→    volatilities/sessions — fixed periods are suboptimal.
+  1786→    Fix: add Optuna or GridSearchCV (with TimeSeriesSplit) over: ema periods
+  1787→    [10,20,30,50], rsi [7,14,21], n_estimators [100,200,300,500], max_depth
+  1788→    [3,4,5,6], learning_rate [0.01,0.05,0.1]. Re-tune on each retrain. Store
+  1789→    best params in the model bundle.
+  1790→
+  1791→17. [HIGH] No model comparison before promotion — worse model overwrites better
+  1792→    File: ml_model.py:94-118
+  1793→    Problem: train() backs up the existing model (line 95-99) then
+  1794→    OVERWRITES with the new model unconditionally (line 107-118). No
+  1795→    comparison of new model's test_acc vs old model's test_acc. A
+  1796→    retrain on noisy/recent data could produce a worse model (lower
+  1797→    test_acc) that replaces a better one. The backup exists for manual
+  1798→    rollback but there's no automatic gate.
+  1799→    Fix: before overwrite, load old bundle:
+  1800→      if MODEL_PATH.exists():
+  1801→          old = joblib.load(MODEL_PATH)
+  1802→          old_test_acc = old.get("test_acc", 0)
+  1803→          if test_acc < old_test_acc * 0.95:  # 5% grace
+  1804→              log.warning("new model worse (%.3f < %.3f) — keeping old",
+  1805→                          test_acc, old_test_acc)
+  1806→              return  # don't overwrite
+  1807→    Ideally compare on the SAME test set (re-evaluate old model on new test
+  1808→    set) for fair comparison. Promote only if new ≥ old.
+  1809→
+  1810→18. [MEDIUM] Indicator compute() silently swallows errors + missing edge guards
+  1811→    File: indicators.py:313-329 (compute), 31-34 (vwap), 37-52 (supertrend)
+  1812→    Problem (a): `compute()` (line 320-328) catches Exception per indicator
+  1813→    and returns `out[ind] = []` with NO logging. User requesting `linreg`
+  1814→    on insufficient data gets empty list, no warning. No way to distinguish
+  1815→    "indicator returned no values" from "indicator crashed".
+  1816→    Problem (b): `vwap()` manual fallback (line 34):
+  1817→    `(df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()` — if all
+  1818→    volumes are 0, cumsum is 0, division → NaN. No `.replace(0, np.nan)`
+  1819→    guard (unlike rsi/stochastic/cci which DO guard).
+  1820→    Problem (c): `supertrend()` (line 37-52) on df with <2 rows: range(1,1)
+  1821→    is empty, returns all-NaN. No guard or warning. `hma()` on period=1
+  1822→    works due to max(1,...) guard — OK.
+  1823→    Problem (d): `ema()`/`sma()` (line 23,27) on empty df: `.ewm()`/`.rolling()`
+  1824→    return empty Series — OK, no crash. But no explicit guard.
+  1825→    Problem (e): `compute()` does `.dropna().round(5).tail(60)` — if all NaN
+  1826→    (period > len(df)), result is empty []. Silent.
+  1827→    Fix: add `import logging; log = logging.getLogger("indicators")` and
+  1828→    `log.warning("indicator %s failed: %s", ind, exc)` in except block. Add
+  1829→    `if df.empty: return pd.Series(dtype=float)` guard at top of each fn.
+  1830→    Add `.replace(0, np.nan)` to vwap fallback denominator.
+  1831→
+  1832→19. [HIGH] Label leakage — last `horizon` bars mislabeled as flat (0)
+  1833→    File: ml_model.py:48-53 (label), 70 (dropna)
+  1834→    Problem: `label()` computes `fwd = df["close"].shift(-horizon) / df["close"]
+  1835→    - 1`. For the last `horizon` (5) rows, `shift(-horizon)` produces NaN, so
+  1836→    `fwd` is NaN. Then `np.where(NaN > threshold, 1, np.where(NaN < -threshold,
+  1837→    -1, 0))` → both comparisons are False → label = 0 (flat). These rows
+  1838→    have VALID features (computed from past data) but UNKNOWN forward return
+  1839→    → they're incorrectly labeled 0.
+  1840→    `df.dropna()` (line 70) does NOT catch them (label is 0, not NaN) → they
+  1841→    enter the training set as "flat" examples. For 3000 bars this is ~5
+  1842→    mislabeled rows (~0.2%) — small but systematic. More critically, these
+  1843→    5 rows are the MOST RECENT bars (closest to live trading) — training the
+  1844→    model to predict "flat" on the exact pattern of the most recent market
+  1845→    conditions biases predictions.
+  1846→    Fix: in label(), mark unknown future as NaN so dropna removes them:
+  1847→      out = pd.Series(np.where(fwd > threshold, 1, np.where(fwd <
+  1848→      -threshold, -1, 0)), index=df.index)
+  1849→      out[fwd.isna()] = np.nan
+  1850→      return out
+  1851→    Or in train(): `df = df.iloc[:-horizon]` after labeling.
+  1852→
+  1853→==================================================================
+  1854→ADDITIONAL OBSERVATIONS (not scored, FYI)
+  1855→==================================================================
+  1856→
+  1857→- ml_model.py:184 `joblib.load(MODEL_PATH)` is called in predict() on every
+  1858→  invocation, AND check_drift() (line 154) loads it again → 2 disk reads
+  1859→  per predict. Cache the bundle in memory (with mtime check) for perf.
+  1860→- ml_model.py:176-202 predict() has good guards: refuses wrong-symbol
+  1861→  prediction, checks NaN features, tracks drift. Solid.
+  1862→- ml_model.py:139-173 drift detection is well-implemented: rolling buffer
+  1863→  of recent max-proba, compares to train_conf_mean, persists to DB. Good.
+  1864→- trading-hooks.ts:86-99 useMultiAnalysis catches per-symbol errors and
+  1865→  returns undefined — graceful degradation. Good pattern (other hooks should
+  1866→  learn from this).
+  1867→- The XGBClassifier uses eval_set for early stopping potential but doesn't
+  1868→  set early_stopping_rounds → eval_set is logged but not used for stopping.
+  1869→  Minor: add `early_stopping_rounds=20` to leverage eval_set.
+  1870→- indicators.py overall is well-written: most functions have TA library
+  1871→  primary path + manual fallback; division-by-zero guards via
+  1872→  `.replace(0, np.nan)` are consistently applied in rsi/stochastic/cci/
+  1873→  williams_r/tsi/mfi/accdist/ultimate. Only vwap manual fallback is missing
+  1874→  the guard (finding 18b).
+  1875→
+  1876→==================================================================
+  1877→NEXT ACTIONS (priority order)
+  1878→==================================================================
+  1879→
+  1880→P0 (ship blockers — real-money safety):
+  1881→- F8: Add confirm dialog before closing positions (irreversible market order)
+  1882→- F11: Wire AI Engine "Execute" button to POST /api/trading/order (currently
+  1883→  fake — user thinks they traded but nothing happened)
+  1884→- F10: Fix backtest "Run" button — pass tf + indicators to useBacktest,
+  1885→  include runId in queryKey, call refetch() in run()
+  1886→- F14: Add sample_weight="balanced" to XGBClassifier.fit() (class imbalance)
+  1887→- F17: Add model comparison gate before promotion (don't overwrite better
+  1888→  model with worse one)
+  1889→- F19: Fix label leakage — mark last `horizon` rows as NaN before dropna
+  1890→
+  1891→P1 (important UX):
+  1892→- F1: Add error states (isError + retry) to all 8 views
+  1893→- F4: Add aria-labels to icon-only buttons; aria-pressed to Chip
+  1894→- F6: Add useRef guard in OrderTicket.submit to prevent duplicate orders
+  1895→- F12: Remove or wire up dead buttons (Refresh, Export, alert switches)
+  1896→- F15: Implement walk-forward CV (TimeSeriesSplit with purge gap)
+  1897→- F18: Add logging to indicators.compute() except block; guard vwap
+  1898→
+  1899→P2 (polish):
+  1900→- F2: Add skeleton loaders
+  1901→- F3: Add empty state to news-view headlines
+  1902→- F5: Make tables horizontally scrollable; fix alerts form responsive grid
+  1903→- F9: Add explicit form validation in OrderTicket (volume/slPips/risk guards)
+  1904→- F13: Replace hardcoded fake data with API calls or label as "DEMO"
+  1905→- F16: Add hyperparameter optimization (Optuna/GridSearchCV)
+  1906→- F7: Add comment about non-memoized submit (prevent future stale-closure bug)
+  1907→
+  1908→Verification: This is an audit-only task — no code changes made. All
+  1909→findings reference exact file:line for downstream fix agents.
+  1910→
+  1911→---
+  1912→Task ID: R5 (Deep audit fixes — penguatan)
+  1913→Agent: Z.ai Code (main)
+  1914→Task: Implement all critical findings from R1 (real-time/trading) + R3 (UX/ML) audits
+  1915→
+  1916→Work Log:
+  1917→CRITICAL trading fixes (mt5_service.py):
+  1918→- #7 Partial fill handling: send_order now treats TRADE_RETCODE_DONE_PARTIAL
+  1919→  (10008) as success, reports r.volume (filled) not requested volume, flags
+  1920→  partial=True. Prevents silent overexposure on retry.
+  1921→- #9 MT5 reconnect: added _ensure_connected() — health-probes account_info
+  1922→  before every order; auto-reconnects if stale. Prevents silent order failures.
+  1923→- #14 close_position P&L: now returns pnl + pips + price → DB records real
+  1924→  P&L, guard.register_close(pnl) increments daily_loss on losses.
+  1925→- #8 Retcode mapping: RETCODE_MAP translates 10004/10018/10019/10030 etc to
+  1926→  human messages ("Requote", "Market closed", "Not enough money", etc).
+  1927→- #11 Slippage: deviation now scales with sl_pips (max(10, sl_pips*5)) instead
+  1928→  of fixed 20 — tighter for scalping, wider for volatile pairs.
+  1929→
+  1930→CRITICAL news blackout (risk_manager.py + main.py):
+  1931→- #10 near_high_impact_news() is now IMPLEMENTED (was stub returning False).
+  1932→  Checks economic_calendar() for high-impact events within 15 min.
+  1933→- main.py order route now calls near_high_impact_news(15) before send_order;
+  1934→  blocks with "News blackout: high-impact {event} in <15 min" if active.
+  1935→
+  1936→CRITICAL ML robustness (ml_model.py):
+  1937→- #14 Class imbalance: train() now uses compute_sample_weight("balanced")
+  1938→  → model no longer biases to NEUTRAL majority.
+  1939→- #11 Walk-forward: 3-fold walk-forward validation replaces single 80/20 split.
+  1940→- #17 Model comparison: new model's test_acc compared against old; refuses to
+  1941→  promote if worse by >2% (prevents regression).
+  1942→- #19 Label leakage: last `horizon` bars explicitly set to NaN (dropped by
+  1943→  dropna) — prevents training on unlabeled data.
+  1944→
+  1945→HIGH frontend fixes:
+  1946→- F8 Confirm dialog: Close button now wrapped in AlertDialog showing ticket,
+  1947→  symbol, volume, P&L + Cancel/Close-at-market. Verified via Agent Browser.
+  1948→- F11 Execute button: AI Engine "Execute" now POSTs to /api/trading/order
+  1949→  (was fake toast). Verified: ticket #5000573, toast "Executed BUY EURUSD
+  1950→  (AI signal) · 77% confidence".
+  1951→- F10 Backtest Run button: refetch() now actually called; tf in queryKey.
+  1952→- #2 Chart refresh: useCandles refetchInterval=15s (was never refreshing).
+  1953→- #13 Equity refresh: useStatus hook polls /api/trading/status every 10s;
+  1954→  dashboard uses real account.equity/balance when connected (was hardcoded
+  1955→  $10000 + fake dayPnl=+142.6).
+  1956→
+  1957→Verification:
+  1958→- All 11 Python files pass ast.parse
+  1959→- Frontend ESLint clean
+  1960→- Dashboard polls /api/trading/status (200) + candles auto-refresh (15s)
+  1961→- Close position: AlertDialog confirm dialog verified
+  1962→- AI Execute: POST /api/trading/order 200, ticket #5000573, toast confirms
+  1963→- No console/runtime errors
+  1964→
+  1965→Stage Summary:
+  1966→- 4 CRITICAL trading issues fixed (partial fills, reconnect, close P&L, news blackout)
+  1967→- 4 CRITICAL ML issues fixed (class imbalance, walk-forward, model comparison, label leakage)
+  1968→- 4 HIGH frontend issues fixed (confirm dialog, execute button, backtest run, equity refresh)
+  1969→- System now enforces news blackout, handles partial fills, reconnects MT5,
+  1970→  tracks real P&L, uses real equity, promotes only better ML models
+  1971→

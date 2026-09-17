@@ -36,7 +36,7 @@ import ai_service
 import backtest as bt
 import ml_model
 from notifier import add_price_alert, check_alerts, send_email
-from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade
+from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade, cleanup_old
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("zenitrade")
@@ -73,15 +73,16 @@ API_TOKEN = os.environ.get("ZENITRADE_API_TOKEN", "")
 _order_lock = asyncio.Lock()
 _alert_task: asyncio.Task | None = None
 _reconcile_task: asyncio.Task | None = None
+_cleanup_task: asyncio.Task | None = None
 
 
 async def _alert_loop():
     """Background task: poll ticks & check price alerts every 5s."""
     while True:
         try:
-            t = mt5_ticks()
+            t = await asyncio.to_thread(mt5_ticks)
             if t:
-                check_alerts(t)
+                await asyncio.to_thread(check_alerts, t)
         except Exception as exc:  # noqa: BLE001
             log.debug("alert loop: %s", exc)
         await asyncio.sleep(5)
@@ -96,7 +97,7 @@ async def _reconcile_loop():
     """
     while True:
         try:
-            pos = mt5_positions()
+            pos = await asyncio.to_thread(mt5_positions)
             real_count = len(pos)
             drift = guard.open_count - real_count
             if drift > 0:
@@ -108,9 +109,19 @@ async def _reconcile_loop():
         await asyncio.sleep(10)
 
 
+async def _cleanup_loop():
+    """Background task: prune old DB rows every hour to keep DB bounded."""
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_old)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("cleanup loop: %s", exc)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _alert_task, _reconcile_task
+    global _alert_task, _reconcile_task, _cleanup_task
     log.info("ZeniTrade AI backend starting — FINEX / MT5 / AI")
     # initialize persistence layer FIRST (risk state restore depends on it)
     try:
@@ -128,6 +139,7 @@ async def lifespan(app: FastAPI):
         log.warning("MT5 connect on boot failed: %s", exc)
     _alert_task = asyncio.create_task(_alert_loop())
     _reconcile_task = asyncio.create_task(_reconcile_loop())
+    _cleanup_task = asyncio.create_task(_cleanup_loop())
     scheduler = None
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -142,6 +154,8 @@ async def lifespan(app: FastAPI):
         _alert_task.cancel()
     if _reconcile_task:
         _reconcile_task.cancel()
+    if _cleanup_task:
+        _cleanup_task.cancel()
     if scheduler:
         try:
             scheduler.shutdown(wait=False)
@@ -331,7 +345,7 @@ async def api_news():
 async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
     result = await asyncio.to_thread(ai_service.analyze, symbol, provider, {"timeframe": "M15"})
     try:
-        rates = mt5_candles(symbol, "H1", 200)
+        rates = await asyncio.to_thread(mt5_candles, symbol, "H1", 200)
         if rates:
             import pandas as pd
             pred = ml_model.predict(pd.DataFrame(rates), symbol=symbol)

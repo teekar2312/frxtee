@@ -110,6 +110,17 @@ def init_db() -> None:
     log.info("database ready at %s", _db_path())
 
 
+def cleanup_old(max_logs: int = 5000, max_trades: int = 10000,
+                max_alerts: int = 500) -> None:
+    """Delete old rows to keep DB bounded. Run periodically."""
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY ts DESC LIMIT ?)", (max_logs,))
+        c.execute("DELETE FROM trades WHERE id NOT IN (SELECT id FROM trades ORDER BY open_time DESC LIMIT ?)", (max_trades,))
+        c.execute("DELETE FROM alerts WHERE id NOT IN (SELECT id FROM alerts ORDER BY created_at DESC LIMIT ?)", (max_alerts,))
+        c.execute("DELETE FROM ml_models WHERE active=0 AND id NOT IN (SELECT id FROM ml_models ORDER BY id DESC LIMIT 20)")
+    log.debug("cleanup: kept max %d logs, %d trades, %d alerts", max_logs, max_trades, max_alerts)
+
+
 # ---------- trades ----------
 def save_trade(ticket: int, symbol: str, side: str, volume: float,
                open_price: float, comment: str, source: str = "manual") -> None:

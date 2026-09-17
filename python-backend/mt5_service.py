@@ -34,6 +34,22 @@ class MT5Status:
     message: str
 
 
+# ---- symbol_info cache (static data — no need to refetch every tick) -------
+_symbol_info_cache: dict[str, any] = {}
+
+
+def _get_symbol_info(symbol: str):
+    """Cached symbol_info — digits/filling_mode/etc are static per session."""
+    if symbol in _symbol_info_cache:
+        return _symbol_info_cache[symbol]
+    if not MT5_AVAILABLE:
+        return None
+    info = mt5.symbol_info(symbol)  # type: ignore
+    if info:
+        _symbol_info_cache[symbol] = info
+    return info
+
+
 _state: dict[str, Any] = {"connected": False, "account": None, "terminal": None}
 
 
@@ -149,7 +165,7 @@ def ticks(symbols: list[str] | None = None) -> list[dict]:
     out = []
     for sym in (symbols or ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]):
         t = mt5.symbol_info_tick(sym)  # type: ignore
-        info = mt5.symbol_info(sym)  # type: ignore
+        info = _get_symbol_info(sym)  # cached — avoids 14 RPCs per tick cycle
         if not t or not info:
             continue
         pip = _pip_for_digits(info.digits)
@@ -197,7 +213,8 @@ def _ensure_connected() -> bool:
 
     Broker-side disconnects (network drop, terminal restart) leave
     _state["connected"]=True but subsequent MT5 calls fail with vague errors.
-    This re-checks and reconnects once before giving up.
+    This re-checks and reconnects once before giving up. Shuts down the old
+    terminal handle first to prevent leaks.
     """
     if not MT5_AVAILABLE:
         return False
@@ -208,7 +225,12 @@ def _ensure_connected() -> bool:
                 return True
         except Exception:  # noqa: BLE001
             pass
-        log.warning("MT5 connection stale — attempting reconnect")
+        log.warning("MT5 connection stale — shutting down + reconnecting")
+        try:
+            mt5.shutdown()  # type: ignore — release stale terminal handle
+        except Exception:  # noqa: BLE001
+            pass
+        _symbol_info_cache.clear()  # stale cache after reconnect
     ok = connect()
     return ok.connected
 
@@ -241,7 +263,7 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
                tp_pips: float, comment: str = "AI:auto") -> dict:
     if not _ensure_connected():
         return {"ok": False, "error": "MT5 not connected"}
-    info = mt5.symbol_info(symbol)  # type: ignore
+    info = _get_symbol_info(symbol)  # cached
     if not info:
         return {"ok": False, "error": f"symbol {symbol} not found"}
     tick = mt5.symbol_info_tick(symbol)  # type: ignore
@@ -286,7 +308,7 @@ def close_position(ticket: int) -> dict:
     if not pos:
         return {"ok": False, "error": "position not found"}
     p = pos[0]
-    info = mt5.symbol_info(p.symbol)  # type: ignore
+    info = _get_symbol_info(p.symbol)  # cached
     tick = mt5.symbol_info_tick(p.symbol)  # type: ignore
     side = "SELL" if p.type == 0 else "BUY"
     close_price = tick.bid if side == "SELL" else tick.ask

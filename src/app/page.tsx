@@ -35,18 +35,34 @@ import {
   Zap,
 } from "lucide-react";
 import { useTradingStore, type Density } from "@/lib/trading-store";
+import dynamic from "next/dynamic";
 import { TickerTape } from "@/components/trading/ticker-tape";
 import { SessionClock } from "@/components/trading/session-clock";
-import { DashboardView } from "@/components/trading/dashboard-view";
-import { TradingView } from "@/components/trading/trading-view";
-import { AIEngineView } from "@/components/trading/ai-engine-view";
-import { IndicatorsView } from "@/components/trading/indicators-view";
-import { RiskView } from "@/components/trading/risk-view";
-import { NewsView } from "@/components/trading/news-view";
-import { BacktestView } from "@/components/trading/backtest-view";
-import { AlertsView } from "@/components/trading/alerts-view";
-import { LogsView } from "@/components/trading/logs-view";
-import { SettingsView } from "@/components/trading/settings-view";
+
+// Code-split heavy views — only loaded when navigated to (smaller initial bundle)
+const DashboardView = dynamic(() => import("@/components/trading/dashboard-view").then(m => ({ default: m.DashboardView })), { loading: () => <ViewSkeleton /> });
+const TradingView = dynamic(() => import("@/components/trading/trading-view").then(m => ({ default: m.TradingView })), { loading: () => <ViewSkeleton /> });
+const AIEngineView = dynamic(() => import("@/components/trading/ai-engine-view").then(m => ({ default: m.AIEngineView })), { loading: () => <ViewSkeleton /> });
+const IndicatorsView = dynamic(() => import("@/components/trading/indicators-view").then(m => ({ default: m.IndicatorsView })), { loading: () => <ViewSkeleton /> });
+const RiskView = dynamic(() => import("@/components/trading/risk-view").then(m => ({ default: m.RiskView })), { loading: () => <ViewSkeleton /> });
+const NewsView = dynamic(() => import("@/components/trading/news-view").then(m => ({ default: m.NewsView })), { loading: () => <ViewSkeleton /> });
+const BacktestView = dynamic(() => import("@/components/trading/backtest-view").then(m => ({ default: m.BacktestView })), { loading: () => <ViewSkeleton /> });
+const AlertsView = dynamic(() => import("@/components/trading/alerts-view").then(m => ({ default: m.AlertsView })), { loading: () => <ViewSkeleton /> });
+const LogsView = dynamic(() => import("@/components/trading/logs-view").then(m => ({ default: m.LogsView })), { loading: () => <ViewSkeleton /> });
+const SettingsView = dynamic(() => import("@/components/trading/settings-view").then(m => ({ default: m.SettingsView })), { loading: () => <ViewSkeleton /> });
+
+function ViewSkeleton() {
+  return (
+    <div className="space-y-3">
+      <div className="h-16 w-full rounded-md bg-muted animate-pulse" />
+      <div className="grid grid-cols-3 gap-3">
+        <div className="h-40 rounded-md bg-muted animate-pulse" />
+        <div className="h-40 rounded-md bg-muted animate-pulse" />
+        <div className="h-40 rounded-md bg-muted animate-pulse" />
+      </div>
+    </div>
+  );
+}
 
 type ViewId =
   | "dashboard"
