@@ -178,3 +178,32 @@ Stage Summary:
 - 5 missing indicators implemented (stc, ultimate, chaikinvol, volratio, volprofile)
 - All 30 technical indicators now computed by the Python backend
 - Frontend↔API↔Python backend contract fully consistent
+
+---
+Task ID: D (Display density modes)
+Agent: Z.ai Code (main)
+Task: Add 3 display density modes — Compact (balanced), Dense (max data), Minimal (spacious & easy to read)
+
+Work Log:
+- Added `Density` type + `density`/`setDensity` to Zustand store with SSR-safe lazy init from localStorage (loadDensity() returns "compact" on server)
+- Added density-scoped CSS in globals.css (unlayered so it beats Tailwind utilities):
+  - Root font-size scaling: dense 13.5px, compact 15px, minimal 17px (scales all rem-based spacing/text proportionally)
+  - --radius adjustment per density (0.375/0.5/0.75rem)
+  - Dense: tighter card padding (p-3→0.5rem), gaps (gap-3→0.5rem), table cells, scrollbars, line-height 1.35
+  - Minimal: looser card padding (p-3→1rem), gaps, roomier table cells (0.75rem), bigger touch targets (buttons h-7→2rem), line-height 1.6, larger section margins
+- Added DensityMenu dropdown component (Rows3 icon + active label) in header next to theme toggle, with mounted guard to prevent hydration mismatch
+- Added single useEffect in page.tsx applying data-density to <html> + persisting to localStorage
+- Fixed persistence race condition (initially had separate restore+apply effects that overwrote saved value with default on boot) — moved restore into store lazy initializer
+
+Verification (Agent Browser + VLM):
+- Dense mode: confirmed tightly packed tables, smaller fonts, more data visible — VLM says "professional pro-trader interface"
+- Minimal mode: confirmed generous padding, taller rows, bigger fonts, more breathing room — VLM rates spaciousness 8/10
+- Compact mode: confirmed balanced middle ground — VLM says "excellent middle ground"
+- Side-by-side comparison (dense vs minimal): VLM confirmed clearly different densities with visible differences in spacing, row heights, and font sizes
+- Density persists across page reload (localStorage) — verified dense survives reload
+- No hydration errors, no console errors, ESLint clean
+
+Stage Summary:
+- 3 density modes fully functional and persisted
+- Single header dropdown toggles all three; scales fonts, paddings, gaps, table rows, scrollbars, radii, line-heights, and touch targets
+- Hydration-safe (SSR returns "compact", client restores saved value post-mount)

@@ -12,6 +12,21 @@ import {
 } from "@/lib/trading-data";
 
 export type Mode = "auto" | "manual";
+export type Density = "compact" | "dense" | "minimal";
+
+const DENSITY_VALUES: Density[] = ["compact", "dense", "minimal"];
+
+/** Read saved density from localStorage; safe for SSR (returns "compact"). */
+function loadDensity(): Density {
+  if (typeof window === "undefined") return "compact";
+  try {
+    const saved = window.localStorage.getItem("zenitrade-density");
+    if (saved && DENSITY_VALUES.includes(saved as Density)) return saved as Density;
+  } catch {
+    /* ignore */
+  }
+  return "compact";
+}
 
 interface TradingState {
   // connection
@@ -21,6 +36,10 @@ interface TradingState {
   accountBalance: number;
   setMt5Connected: (v: boolean) => void;
   toggleDemo: () => void;
+
+  // display density
+  density: Density;
+  setDensity: (d: Density) => void;
 
   // trading config
   symbols: string[];
@@ -106,6 +125,9 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   accountBalance: 10000,
   setMt5Connected: (v) => set({ mt5Connected: v }),
   toggleDemo: () => set((s) => ({ demoMode: !s.demoMode })),
+
+  density: loadDensity(),
+  setDensity: (d) => set({ density: d }),
 
   symbols: ["EURUSD", "GBPUSD"],
   setSymbols: (s) => set({ symbols: s }),

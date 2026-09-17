@@ -3,6 +3,14 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
@@ -12,19 +20,21 @@ import {
   Bot,
   Brain,
   CandlestickChart,
+  Check,
   FlaskConical,
   Gauge,
   LayoutDashboard,
   Moon,
   Newspaper,
   Plug,
+  Rows3,
   ScrollText,
   Settings,
   Sun,
   TrendingUp,
   Zap,
 } from "lucide-react";
-import { useTradingStore } from "@/lib/trading-store";
+import { useTradingStore, type Density } from "@/lib/trading-store";
 import { TickerTape } from "@/components/trading/ticker-tape";
 import { SessionClock } from "@/components/trading/session-clock";
 import { DashboardView } from "@/components/trading/dashboard-view";
@@ -70,9 +80,23 @@ export default function Page() {
   const demoMode = useTradingStore((s) => s.demoMode);
   const autoTrade = useTradingStore((s) => s.autoTradeMode);
   const aiProvider = useTradingStore((s) => s.aiProvider);
+  const density = useTradingStore((s) => s.density);
+  const setDensity = useTradingStore((s) => s.setDensity);
   const [mounted, setMounted] = React.useState(false);
 
   React.useEffect(() => setMounted(true), []);
+
+  // Apply density to <html> + persist. The store already initialises from
+  // localStorage (safe for SSR), so this effect just keeps the DOM & storage
+  // in sync when density changes.
+  React.useEffect(() => {
+    document.documentElement.dataset.density = density;
+    try {
+      localStorage.setItem("zenitrade-density", density);
+    } catch {
+      /* ignore */
+    }
+  }, [density]);
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -110,6 +134,7 @@ export default function Page() {
 
           <div className="ml-auto flex items-center gap-2">
             <SessionClock />
+            <DensityMenu density={density} onChange={setDensity} mounted={mounted} />
             <Button
               variant="ghost"
               size="icon"
@@ -228,6 +253,71 @@ function StatusPill({
       <Icon className="h-3 w-3" />
       {ok ? okLabel : offLabel}
     </span>
+  );
+}
+
+const DENSITY_OPTIONS: {
+  id: Density;
+  label: string;
+  desc: string;
+}[] = [
+  { id: "dense", label: "Dense", desc: "Maksimal data di layar" },
+  { id: "compact", label: "Compact", desc: "Seimbang" },
+  { id: "minimal", label: "Minimal", desc: "Legah & mudah dibaca" },
+];
+
+function DensityMenu({
+  density,
+  onChange,
+  mounted,
+}: {
+  density: Density;
+  onChange: (d: Density) => void;
+  mounted: boolean;
+}) {
+  const active = DENSITY_OPTIONS.find((o) => o.id === density);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 gap-1.5 px-2 text-xs"
+          title="Display density"
+        >
+          <Rows3 className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">
+            {mounted ? (active?.label ?? "Compact") : "Compact"}
+          </span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-56">
+        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+          Display density
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {DENSITY_OPTIONS.map((o) => (
+          <DropdownMenuItem
+            key={o.id}
+            onClick={() => onChange(o.id)}
+            className="flex items-start gap-2 py-1.5"
+          >
+            <Check
+              className={cn(
+                "h-3.5 w-3.5 mt-0.5 shrink-0",
+                density === o.id ? "opacity-100" : "opacity-0"
+              )}
+            />
+            <div className="min-w-0">
+              <div className="text-xs font-medium leading-tight">{o.label}</div>
+              <div className="text-[10px] text-muted-foreground leading-tight">
+                {o.desc}
+              </div>
+            </div>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
