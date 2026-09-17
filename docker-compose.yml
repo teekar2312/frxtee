@@ -1,0 +1,56 @@
+# ZeniTrade AI — full-stack deployment
+#
+# Usage:
+#   docker compose up --build
+#
+# Then open http://localhost:3000
+#
+# The Python backend runs in DEMO mode inside the container (MetaTrader5 is
+# Windows-only). For real trading, run the backend natively on Windows 11
+# and set TRADING_BACKEND_URL in the dashboard env.
+#
+# Security: set ZENITRADE_API_TOKEN before deploying to anything reachable.
+
+services:
+  backend:
+    build: ./python-backend
+    container_name: zenitrade-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ZENITRADE_API_TOKEN=${ZENITRADE_API_TOKEN:-}
+      - DB_PATH=/app/data/zenitrade.db
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
+      - MARKETAUX_API_KEY=${MARKETAUX_API_KEY:-}
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+    volumes:
+      - backend-data:/app/data
+      - backend-models:/app/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zenitrade-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - TRADING_BACKEND_URL=http://backend:8000
+      - NODE_ENV=production
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  backend-models:

@@ -124,6 +124,8 @@ export interface MLModelInfo {
   symbol: string | null;
   trained_at: string | null;
   n_samples: number | null;
+  drift?: number;
+  drift_threshold?: number;
   demo?: boolean;
 }
 

@@ -41,9 +41,13 @@ class Settings(BaseSettings):
     email_to: str = ""
 
     # Server
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    # Persistence + monitoring
+    db_path: str = "zenitrade.db"
+    sentry_dsn: str = ""  # empty = disabled
 
     @property
     def cors_list(self) -> list[str]:

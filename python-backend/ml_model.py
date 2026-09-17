@@ -98,6 +98,12 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         shutil.copy2(MODEL_PATH, backup)
         log.info("backed up previous model → %s", backup.name)
 
+    # compute training-time prediction confidence distribution (for drift detection)
+    train_proba = clf.predict_proba(X_train)
+    train_max_proba = np.max(train_proba, axis=1)
+    train_conf_mean = float(train_max_proba.mean())
+    train_conf_std = float(train_max_proba.std())
+
     joblib.dump({
         "model": clf,
         "features": FEATURES,
@@ -107,14 +113,71 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         "test_acc": float(test_acc),
         "trained_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
         "n_samples": len(df),
+        "train_conf_mean": train_conf_mean,
+        "train_conf_std": train_conf_std,
     }, MODEL_PATH)
+
+    # register in DB
+    try:
+        from db import register_ml_model
+        register_ml_model(
+            version="v1.0", symbol=symbol, train_acc=float(train_acc),
+            test_acc=float(test_acc),
+            trained_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            n_samples=len(df), path=str(MODEL_PATH), drift_score=0.0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---- drift detection -----------------------------------------------------
+_RECENT_PREDICTIONS: list[float] = []  # rolling buffer of recent max-probs
+_DRIFT_WINDOW = 50
+_DRIFT_THRESHOLD = 0.08  # 8% confidence drop triggers retrain
+
+
+def _track_prediction(prob: float) -> None:
+    _RECENT_PREDICTIONS.append(prob)
+    if len(_RECENT_PREDICTIONS) > _DRIFT_WINDOW:
+        _RECENT_PREDICTIONS.pop(0)
+
+
+def check_drift(symbol: str | None = None) -> float:
+    """Compute drift score = how far recent prediction confidence has dropped
+    below the training confidence mean. Returns 0.0 if insufficient data.
+
+    A drift > _DRIFT_THRESHOLD (0.08) indicates the model's recent predictions
+    are much less confident than at training time → market regime has shifted.
+    """
+    if not MODEL_PATH.exists() or len(_RECENT_PREDICTIONS) < 10:
+        return 0.0
+    bundle = joblib.load(MODEL_PATH)
+    train_mean = bundle.get("train_conf_mean")
+    if train_mean is None:
+        return 0.0
+    if symbol and bundle.get("symbol") != symbol:
+        return 0.0
+    recent_mean = float(np.mean(_RECENT_PREDICTIONS))
+    drift = max(0.0, train_mean - recent_mean)
+    # persist to DB
+    try:
+        from db import get_active_ml_model, update_drift_score
+        m = get_active_ml_model(bundle.get("symbol"))
+        if m and m.get("id"):
+            update_drift_score(m["id"], drift)
+    except Exception:  # noqa: BLE001
+        pass
+    if drift > _DRIFT_THRESHOLD:
+        log.warning("⚠ drift detected on %s: %.3f > %.3f — retrain recommended",
+                    bundle.get("symbol"), drift, _DRIFT_THRESHOLD)
+    return drift
 
 
 def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     """Predict direction probability for the latest bar.
 
     Refuses to predict if no model exists OR if the model was trained on a
-    different symbol (would be silently wrong).
+    different symbol (would be silently wrong). Tracks predictions for drift.
     """
     if not MODEL_PATH.exists():
         return {"direction": "NEUTRAL", "prob": 0.5, "reason": "no model"}
@@ -133,15 +196,20 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     classes = clf.classes_
     idx = int(np.argmax(proba))
     direction = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}.get(int(classes[idx]), "NEUTRAL")
-    return {"direction": direction, "prob": float(proba[idx])}
+    max_prob = float(proba[idx])
+    _track_prediction(max_prob)  # feed drift detector
+    drift = check_drift(model_symbol)
+    return {"direction": direction, "prob": max_prob, "drift": drift}
 
 
 def model_info() -> dict:
     """Return model metadata for the UI (replaces hardcoded values)."""
     if not MODEL_PATH.exists():
         return {"exists": False, "version": "—", "train_acc": None,
-                "test_acc": None, "symbol": None, "trained_at": None, "n_samples": None}
+                "test_acc": None, "symbol": None, "trained_at": None,
+                "n_samples": None, "drift": 0.0}
     b = joblib.load(MODEL_PATH)
+    drift = check_drift(b.get("symbol"))
     return {
         "exists": True,
         "version": "v1.0",
@@ -150,4 +218,6 @@ def model_info() -> dict:
         "symbol": b.get("symbol"),
         "trained_at": b.get("trained_at"),
         "n_samples": b.get("n_samples"),
+        "drift": round(drift, 3),
+        "drift_threshold": _DRIFT_THRESHOLD,
     }

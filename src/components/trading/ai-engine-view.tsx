@@ -225,10 +225,53 @@ export function AIEngineView() {
               tone="warn"
             />
           </div>
+          {/* Drift indicator */}
+          {ml.data?.exists ? (
+            <div className="mt-2 rounded-md border p-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-muted-foreground">
+                  Prediction Drift
+                </span>
+                <span
+                  className={cn(
+                    "text-xs font-semibold tnum",
+                    (ml.data.drift ?? 0) > (ml.data.drift_threshold ?? 0.08)
+                      ? "text-danger"
+                      : (ml.data.drift ?? 0) > (ml.data.drift_threshold ?? 0.08) * 0.7
+                      ? "text-warning"
+                      : "text-success"
+                  )}
+                >
+                  {((ml.data.drift ?? 0) * 100).toFixed(1)}%
+                </span>
+              </div>
+              <div className="h-1.5 rounded-full bg-muted overflow-hidden mt-1">
+                <div
+                  className="h-full rounded-full transition-all"
+                  style={{
+                    width: `${Math.min(100, ((ml.data.drift ?? 0) / (ml.data.drift_threshold ?? 0.08)) * 100)}%`,
+                    background:
+                      (ml.data.drift ?? 0) > (ml.data.drift_threshold ?? 0.08)
+                        ? "var(--danger)"
+                        : (ml.data.drift ?? 0) > (ml.data.drift_threshold ?? 0.08) * 0.7
+                        ? "var(--warning)"
+                        : "var(--success)",
+                  }}
+                />
+              </div>
+              <div className="text-[9px] text-muted-foreground mt-1">
+                threshold {(ml.data.drift_threshold ?? 0.08) * 100}% —
+                {(ml.data.drift ?? 0) > (ml.data.drift_threshold ?? 0.08)
+                  ? " retrain recommended"
+                  : " healthy"}
+              </div>
+            </div>
+          ) : null}
           <Separator className="my-2" />
           <div className="text-[11px] text-muted-foreground">
-            Model retrains nightly at 02:00 (auto-scheduled) or on demand
-            via Retrain. Train/test split: 80/20 chronological. The model is
+            Model retrains nightly at 02:00 (auto-scheduled) or on demand via
+            Retrain. Prediction drift &gt; threshold auto-triggers a retrain
+            recommendation. Train/test split: 80/20 chronological. The model is
             symbol-specific — retrain for each pair you trade.
           </div>
         </Card>

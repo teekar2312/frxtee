@@ -36,9 +36,36 @@ import ai_service
 import backtest as bt
 import ml_model
 from notifier import add_price_alert, check_alerts, send_email
+from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("zenitrade")
+
+# ---- Sentry error monitoring (optional via SENTRY_DSN) -------------------
+if settings.sentry_dsn:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=settings.sentry_dsn,
+            traces_sample_rate=0.1,
+            environment="production",
+        )
+        log.info("Sentry error monitoring enabled")
+    except ImportError:
+        log.warning("sentry-sdk not installed — SENTRY_DSN set but package missing")
+
+# ---- DB-backed log handler ------------------------------------------------
+class DBLogHandler(logging.Handler):
+    """Write WARNING+ log records to the SQLite logs table."""
+    def emit(self, record):
+        try:
+            add_log(record.levelname, record.name, record.getMessage())
+        except Exception:  # noqa: BLE001
+            pass  # never let logging crash the app
+
+# attach DB handler to root logger (WARNING+ only to avoid spam)
+_db_handler = DBLogHandler(level=logging.WARNING)
+logging.getLogger().addHandler(_db_handler)
 
 # ---- security: API token auth -------------------------------------------
 API_TOKEN = os.environ.get("ZENITRADE_API_TOKEN", "")
@@ -85,6 +112,11 @@ async def _reconcile_loop():
 async def lifespan(app: FastAPI):
     global _alert_task, _reconcile_task
     log.info("ZeniTrade AI backend starting — FINEX / MT5 / AI")
+    # initialize persistence layer FIRST (risk state restore depends on it)
+    try:
+        init_db()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DB init failed: %s — persistence disabled", exc)
     # security warning if no token set
     if not API_TOKEN:
         log.warning("⚠ ZENITRADE_API_TOKEN not set — API is unauthenticated! "
@@ -250,6 +282,15 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
         )
         if r.get("ok"):
             guard.register_open()
+            # persist trade to DB
+            try:
+                save_trade(
+                    ticket=r.get("ticket", 0), symbol=body.symbol, side=body.side,
+                    volume=volume, open_price=r.get("price", 0),
+                    comment=body.comment, source="ai" if "AI" in body.comment else "manual",
+                )
+            except Exception:  # noqa: BLE001
+                pass
             await send_email(
                 f"Trade opened: {body.side} {body.symbol}",
                 f"<p>{body.side} {body.symbol} {volume} lot @ {r.get('price')}</p>"
@@ -263,7 +304,13 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
 async def api_close(ticket: int, request: Request, _auth=Depends(require_token)):
     r = await asyncio.to_thread(close_position, ticket)
     if r.get("ok"):
-        guard.register_close()
+        # persist closed trade + register realized P&L for daily risk
+        pnl = r.get("pnl", 0.0)
+        try:
+            close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+        except Exception:  # noqa: BLE001
+            pass
+        guard.register_close(pnl)
     return r
 
 
@@ -301,8 +348,13 @@ async def api_backtest(symbol: str = "EURUSD", trades: int = 120):
 
 
 @app.get("/api/trading/logs")
-async def api_logs():
-    return {"logs": [], "demo": True}
+async def api_logs(level: str = "ALL", q: str | None = None):
+    """Return logs from DB (persisted across restarts). Falls back to demo."""
+    try:
+        logs = get_logs(limit=200, level=level, q=q)
+        return {"logs": logs, "demo": False}
+    except Exception:  # noqa: BLE001
+        return {"logs": [], "demo": True}
 
 
 @app.post("/api/trading/alerts")

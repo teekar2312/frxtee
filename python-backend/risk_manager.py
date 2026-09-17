@@ -41,21 +41,47 @@ def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float = 10
 class RiskGuard:
     """Daily risk tracking — halts new entries when limit breached.
 
-    Automatically resets loss/open counters on UTC date rollover.
+    Automatically resets loss/open counters on date rollover.
+    State persists to SQLite so it survives backend restarts (critical:
+    without persistence, daily_loss resets to 0 on restart = money risk).
     """
 
     def __init__(self):
         self.daily_loss: float = 0.0
         self.open_count: int = 0
-        self._date: date = date.today()
+        self._date: str = ""
+        self._restore()
+
+    def _restore(self):
+        """Load today's state from DB. If no row for today, start fresh."""
+        try:
+            from db import load_risk_state
+            today, loss, count = load_risk_state()
+            self._date = today
+            self.daily_loss = loss
+            self.open_count = count
+            if loss > 0 or count > 0:
+                log.info("RiskGuard restored: date=%s loss=%.2f open=%d",
+                         today, loss, count)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("RiskGuard restore failed (db not ready?): %s", exc)
+            self._date = date.today().isoformat()
+
+    def _persist(self):
+        try:
+            from db import save_risk_state
+            save_risk_state(self.daily_loss, self.open_count)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("RiskGuard persist failed: %s", exc)
 
     def _maybe_reset(self):
-        today = date.today()
+        today = date.today().isoformat()
         if today != self._date:
             self._date = today
             self.daily_loss = 0.0
             self.open_count = 0
             log.info("RiskGuard daily reset — new trading day %s", today)
+        self._persist()
 
     def can_open(self, equity: float) -> tuple[bool, str]:
         self._maybe_reset()
@@ -69,13 +95,19 @@ class RiskGuard:
     def register_loss(self, amount: float):
         self._maybe_reset()
         self.daily_loss += abs(amount)
+        self._persist()
 
     def register_open(self):
         self._maybe_reset()
         self.open_count += 1
+        self._persist()
 
-    def register_close(self):
+    def register_close(self, pnl: float | None = None):
         self.open_count = max(0, self.open_count - 1)
+        if pnl is not None and pnl < 0:
+            self.register_loss(pnl)
+        else:
+            self._persist()
 
     def reset_daily(self):
         """Force-reset (e.g. for testing or manual rollover)."""
