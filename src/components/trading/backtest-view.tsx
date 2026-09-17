@@ -34,10 +34,11 @@ export function BacktestView() {
   const [trades, setTrades] = React.useState(120);
   const [runId, setRunId] = React.useState(0);
 
-  const { data, isFetching } = useBacktest(symbol, trades);
+  const { data, isFetching, refetch } = useBacktest(symbol, trades, tf);
 
   function run() {
     setRunId((x) => x + 1);
+    refetch();
     toast.success(`Backtest started · ${symbol} ${tf} · ${trades} trades · ${indicators.length} indicators`);
   }
 

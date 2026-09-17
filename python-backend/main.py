@@ -31,7 +31,7 @@ from mt5_service import candles as mt5_candles
 from mt5_service import close_position, connect, disconnect, positions as mt5_positions
 from mt5_service import send_order, status as mt5_status, ticks as mt5_ticks
 from news_service import economic_calendar, fetch_news
-from risk_manager import guard, size_position
+from risk_manager import guard, size_position, near_high_impact_news
 import ai_service
 import backtest as bt
 import ml_model
@@ -270,6 +270,12 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
         ok, msg = guard.can_open(equity)
         if not ok:
             return {"ok": False, "error": msg}
+
+        # news blackout: refuse new entries near high-impact events
+        blackout, reason = await asyncio.to_thread(near_high_impact_news, 15)
+        if blackout:
+            log.warning("order blocked — news blackout: %s", reason)
+            return {"ok": False, "error": f"News blackout: {reason}"}
 
         # position-size via risk (or honor client volume, clamped to FINEX range)
         ps = size_position(equity, body.slPips)

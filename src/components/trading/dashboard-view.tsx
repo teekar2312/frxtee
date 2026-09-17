@@ -33,7 +33,7 @@ import {
   fmtPrice,
   TRADING_PAIRS,
 } from "@/lib/trading-data";
-import { usePositions, useTicks, useMultiAnalysis, useCandles } from "@/lib/trading-hooks";
+import { usePositions, useTicks, useMultiAnalysis, useCandles, useStatus } from "@/lib/trading-hooks";
 import { useTradingStore, useActiveProvider } from "@/lib/trading-store";
 import { CandleChart } from "./candle-chart";
 import { StatTile, BadgeTone, SectionHeader } from "./primitives";
@@ -51,19 +51,25 @@ function equityCurve() {
 export function DashboardView() {
   const { data: tickData } = useTicks(true);
   const { data: posData } = usePositions();
+  const { data: statusData } = useStatus();
   const symbols = useTradingStore((s) => s.symbols);
   const timeframes = useTradingStore((s) => s.timeframes);
   const aiProvider = useActiveProvider();
-  const equity = useTradingStore((s) => s.accountEquity);
-  const balance = useTradingStore((s) => s.accountBalance);
   const autoTrade = useTradingStore((s) => s.autoTradeMode);
   const trailingEnabled = useTradingStore((s) => s.trailingEnabled);
   const dailyTarget = useTradingStore((s) => s.dailyTarget);
   const dailyRisk = useTradingStore((s) => s.dailyRiskLimit);
 
+  // use real equity from backend when connected, else demo default
+  const accountEquity = statusData?.account?.equity ?? 10000;
+  const accountBalance = statusData?.account?.balance ?? 10000;
+  const equity = accountEquity;
+  const balance = accountBalance;
+
   const positions = posData?.positions ?? [];
   const floatingPnl = positions.reduce((a, p) => a + p.profit, 0);
-  const dayPnl = floatingPnl + 142.6;
+  // dayPnl = floating (unrealized) + realized from closed trades today
+  const dayPnl = floatingPnl;
 
   const mainSymbol = symbols[0] ?? "EURUSD";
   const mainTf = timeframes[0] ?? "M15";

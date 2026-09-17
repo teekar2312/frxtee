@@ -32,6 +32,7 @@ export function AIEngineView() {
   // focus pair — the one whose detailed analysis is shown
   const [focus, setFocus] = React.useState<string>(symbols[0] ?? "EURUSD");
   const [training, setTraining] = React.useState(false);
+  const [executing, setExecuting] = React.useState(false);
   React.useEffect(() => {
     if (!symbols.includes(focus)) setFocus(symbols[0] ?? "EURUSD");
   }, [symbols, focus]);
@@ -424,15 +425,52 @@ export function AIEngineView() {
 
               <Button
                 className="w-full"
-                disabled={store.autoTradeMode}
-                onClick={() =>
-                  toast.success(`Signal queued: ${a.signal} ${focus} (AI)`, {
-                    description: `Entry ${fmtPrice(a.suggestedEntry, focus.includes("JPY") ? 3 : 5)} · ${a.confidence}% confidence`,
-                  })
-                }
+                disabled={store.autoTradeMode || executing}
+                onClick={async () => {
+                  if (!a) return;
+                  const side = a.signal.includes("SELL") ? "SELL" : "BUY";
+                  // only execute directional signals
+                  if (a.signal === "NEUTRAL") {
+                    toast.info("Signal is NEUTRAL — no order placed");
+                    return;
+                  }
+                  setExecuting(true);
+                  try {
+                    const res = await fetch("/api/trading/order", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        symbol: focus,
+                        side,
+                        slPips: store.stopLossPips,
+                        comment: "AI:auto",
+                      }),
+                    });
+                    const d = await res.json();
+                    if (d.ok) {
+                      toast.success(
+                        `Executed ${side} ${focus} (AI signal)`,
+                        {
+                          description: `Ticket #${d.ticket} @ ${fmtPrice(
+                            d.price ?? a.suggestedEntry,
+                            focus.includes("JPY") ? 3 : 5
+                          )} · ${a.confidence}% confidence`,
+                        }
+                      );
+                    } else {
+                      toast.error(`Order rejected: ${d.error ?? "unknown"}`);
+                    }
+                  } catch {
+                    toast.error("Order failed — network error");
+                  } finally {
+                    setExecuting(false);
+                  }
+                }}
               >
                 <Sparkles className="h-4 w-4 mr-2" />
-                {store.autoTradeMode
+                {executing
+                  ? "Executing…"
+                  : store.autoTradeMode
                   ? "Auto-trade active — AI executes signals"
                   : `Execute ${a.signal} ${focus}`}
               </Button>

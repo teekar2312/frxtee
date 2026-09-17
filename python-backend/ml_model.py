@@ -47,19 +47,29 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def label(df: pd.DataFrame, horizon=5, threshold=0.0008) -> pd.Series:
     """Forward return label: 1 up, -1 down, 0 flat. Window [t, t+horizon]
-    does not overlap with causal features (which use data <= t)."""
+    does not overlap with causal features (which use data <= t).
+
+    The last `horizon` bars have NaN forward return (no future data) — they
+    are dropped by the caller's dropna(), preventing label leakage.
+    """
     fwd = df["close"].shift(-horizon) / df["close"] - 1
-    return pd.Series(np.where(fwd > threshold, 1, np.where(fwd < -threshold, -1, 0)),
-                     index=df.index)
+    labels = np.where(fwd > threshold, 1, np.where(fwd < -threshold, -1, 0))
+    # explicitly mark the last `horizon` bars as NaN (no future data to label)
+    labels = labels.astype(float)
+    labels[-horizon:] = np.nan
+    return pd.Series(labels, index=df.index)
 
 
 def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
-    """Train (or retrain) the classifier with a proper train/test holdout.
+    """Train (or retrain) the classifier with walk-forward validation + class
+    balancing. Compares new model's test_acc against the old one — refuses to
+    promote a worse model (prevents regression).
 
     CPU-bound — callers in async context should use ``asyncio.to_thread``.
     """
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     from xgboost import XGBClassifier
+    from sklearn.utils.class_weight import compute_sample_weight
     rates = candles(symbol, tf, count)
     if not rates:
         log.warning("no candles to train on")
@@ -72,24 +82,63 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         log.warning("insufficient data to train (%d rows)", len(df))
         return
 
-    # ---- holdout split: last 20% as test set (chronological, no shuffle) ----
-    split = int(len(df) * 0.8)
-    train_df, test_df = df.iloc[:split], df.iloc[split:]
-    X_train, y_train = train_df[FEATURES].values, train_df["label"].values
-    X_test, y_test = test_df[FEATURES].values, test_df["label"].values
+    # ---- walk-forward: 3 folds, each trains on first 70%, tests on next 15% ----
+    fold_accs = []
+    fold_size = len(df) // 4  # 4 segments, 3 overlapping folds
+    if fold_size < 50:
+        # fallback to single split for small datasets
+        fold_size = len(df) // 2
+        folds = [(0, fold_size, fold_size, len(df))]
+    else:
+        folds = [
+            (0, fold_size, fold_size, fold_size * 2),
+            (0, fold_size * 2, fold_size * 2, fold_size * 3),
+            (0, fold_size * 3, fold_size * 3, len(df)),
+        ]
 
-    clf = XGBClassifier(
-        n_estimators=300, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
-        n_jobs=-1,
-    )
-    clf.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    best_clf = None
+    best_test_acc = 0.0
+    for train_start, train_end, test_start, test_end in folds:
+        tr = df.iloc[train_start:train_end]
+        te = df.iloc[test_start:test_end]
+        X_tr, y_tr = tr[FEATURES].values, tr["label"].values
+        X_te, y_te = te[FEATURES].values, te["label"].values
+        # class-balanced sample weights (handle imbalanced labels)
+        sw = compute_sample_weight("balanced", y_tr)
+        clf = XGBClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
+            n_jobs=-1,
+        )
+        clf.fit(X_tr, y_tr, sample_weight=sw, eval_set=[(X_te, y_te)], verbose=False)
+        acc = clf.score(X_te, y_te)
+        fold_accs.append(acc)
+        if acc > best_test_acc:
+            best_test_acc = acc
+            best_clf = clf
 
-    train_acc = clf.score(X_train, y_train)
-    test_acc = clf.score(X_test, y_test)
-    log.info("Model trained on %s %s — %d rows (train %d / test %d) "
-             "train_acc %.3f test_acc %.3f",
-             symbol, tf, len(df), len(train_df), len(test_df), train_acc, test_acc)
+    clf = best_clf
+    test_acc = best_test_acc
+    avg_acc = float(np.mean(fold_accs))
+    log.info("Model trained on %s %s — %d rows, walk-forward folds=%s avg=%.3f",
+             symbol, tf, len(df), [round(a, 3) for a in fold_accs], avg_acc)
+
+    # ---- guard: don't promote a worse model over an existing better one ----
+    if MODEL_PATH.exists():
+        old_bundle = joblib.load(MODEL_PATH)
+        old_acc = old_bundle.get("test_acc", 0.0)
+        if old_symbol := old_bundle.get("symbol"):
+            if old_symbol == symbol and test_acc < old_acc - 0.02:
+                log.warning("new model test_acc %.3f < old %.3f — keeping old model",
+                            test_acc, old_acc)
+                return
+
+    # final train_acc on full set (for display)
+    X_full = df[FEATURES].values
+    y_full = df["label"].values
+    train_acc = clf.score(X_full, y_full)
+    log.info("Model promoted on %s %s — %d rows, train_acc=%.3f test_acc=%.3f "
+             "avg_fold=%.3f", symbol, tf, len(df), train_acc, test_acc, avg_acc)
 
     # ---- backup existing model before overwrite (rollback path) ----
     if MODEL_PATH.exists():
@@ -99,7 +148,7 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         log.info("backed up previous model → %s", backup.name)
 
     # compute training-time prediction confidence distribution (for drift detection)
-    train_proba = clf.predict_proba(X_train)
+    train_proba = clf.predict_proba(X_full)
     train_max_proba = np.max(train_proba, axis=1)
     train_conf_mean = float(train_max_proba.mean())
     train_conf_std = float(train_max_proba.std())

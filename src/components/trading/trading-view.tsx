@@ -8,6 +8,17 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import {
   ArrowDownRight,
@@ -494,15 +505,40 @@ function PositionsCard() {
                     {fmtMoney(p.profit)}
                   </td>
                   <td className="px-2 py-1.5">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 text-[10px] text-danger hover:text-danger"
-                      disabled={closing === p.ticket}
-                      onClick={() => closePosition(p.ticket)}
-                    >
-                      {closing === p.ticket ? "…" : "Close"}
-                    </Button>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 text-[10px] text-danger hover:text-danger"
+                          disabled={closing === p.ticket}
+                        >
+                          {closing === p.ticket ? "…" : "Close"}
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Close position #{p.ticket}?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            This will close your {p.type} {p.symbol} {p.volume.toFixed(2)} lot
+                            position at market price. Current P&L:{" "}
+                            <span className={p.profit >= 0 ? "text-success font-semibold" : "text-danger font-semibold"}>
+                              {fmtMoney(p.profit)}
+                            </span>
+                            . This action cannot be undone.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>Cancel</AlertDialogCancel>
+                          <AlertDialogAction
+                            onClick={() => closePosition(p.ticket)}
+                            className="bg-danger text-danger-foreground hover:bg-danger/90"
+                          >
+                            Close at market
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                   </td>
                 </tr>
               ))}

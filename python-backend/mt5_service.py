@@ -192,36 +192,95 @@ def positions() -> list[dict]:
     return out
 
 
+def _ensure_connected() -> bool:
+    """Re-validate MT5 connection; attempt one reconnect if stale.
+
+    Broker-side disconnects (network drop, terminal restart) leave
+    _state["connected"]=True but subsequent MT5 calls fail with vague errors.
+    This re-checks and reconnects once before giving up.
+    """
+    if not MT5_AVAILABLE:
+        return False
+    if _state["connected"]:
+        # cheap health probe: can we fetch account info?
+        try:
+            if mt5.account_info() is not None:  # type: ignore
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("MT5 connection stale — attempting reconnect")
+    ok = connect()
+    return ok.connected
+
+
+# human-readable MT5 retcode mapping (common ones)
+RETCODE_MAP = {
+    10004: "Requote — price moved, retry",
+    10006: "Request rejected by broker",
+    10007: "Cancelled by client",
+    10008: "Partial fill — order partially executed",
+    10009: "Order placed",
+    10010: "Only part of request executed",
+    10013: "Invalid stops (SL/TP too close)",
+    10014: "Invalid volume",
+    10015: "Invalid price",
+    10016: "Off-quote — no price for SL/TP",
+    10018: "Market closed",
+    10019: "Not enough money",
+    10021: "Price expired — no fresh quote",
+    10027: "Autotrading disabled by client",
+    10030: "Unsupported filling mode",
+}
+
+
+def _retcode_msg(retcode: int) -> str:
+    return RETCODE_MAP.get(retcode, f"retcode {retcode}")
+
+
 def send_order(symbol: str, side: str, volume: float, sl_pips: float,
                tp_pips: float, comment: str = "AI:auto") -> dict:
-    if not _state["connected"]:
+    if not _ensure_connected():
         return {"ok": False, "error": "MT5 not connected"}
     info = mt5.symbol_info(symbol)  # type: ignore
     if not info:
-        return {"ok": False, "error": "symbol not found"}
+        return {"ok": False, "error": f"symbol {symbol} not found"}
     tick = mt5.symbol_info_tick(symbol)  # type: ignore
     pip = _pip_for_digits(info.digits)
     price = tick.ask if side == "BUY" else tick.bid
     sl = price - sl_pips * pip if side == "BUY" else price + sl_pips * pip
     tp = price + tp_pips * pip if side == "BUY" else price - tp_pips * pip
+    # deviation scales with instrument volatility (pips → points)
+    deviation = int(max(10, sl_pips * 5))
     req = {
         "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
         "symbol": symbol, "volume": volume, "type": (
             mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL  # type: ignore
         ),
         "price": price, "sl": round(sl, info.digits), "tp": round(tp, info.digits),
-        "deviation": 20, "magic": 99001, "comment": comment,
+        "deviation": deviation, "magic": 99001, "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
         "type_filling": _filling_mode(info),
     }
     r = mt5.order_send(req)  # type: ignore
-    if r.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
-        return {"ok": False, "error": f"{r.retcode}: {r.comment}"}
-    return {"ok": True, "ticket": r.order, "price": r.price, "volume": volume}
+    if r is None:
+        return {"ok": False, "error": "order_send returned None (check MT5 logs)"}
+    # treat DONE + DONE_PARTIAL as success; report filled volume
+    success = r.retcode in (
+        mt5.TRADE_RETCODE_DONE,  # type: ignore
+        getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10008),
+    )
+    if not success:
+        return {"ok": False, "error": _retcode_msg(r.retcode), "retcode": r.retcode}
+    filled = getattr(r, "volume_order", volume) or volume
+    return {
+        "ok": True, "ticket": r.order, "price": r.price,
+        "volume": filled, "requested_volume": volume,
+        "partial": filled < volume,
+    }
 
 
 def close_position(ticket: int) -> dict:
-    if not _state["connected"]:
+    if not _ensure_connected():
         return {"ok": False, "error": "MT5 not connected"}
     pos = mt5.positions_get(ticket=ticket)  # type: ignore
     if not pos:
@@ -230,15 +289,28 @@ def close_position(ticket: int) -> dict:
     info = mt5.symbol_info(p.symbol)  # type: ignore
     tick = mt5.symbol_info_tick(p.symbol)  # type: ignore
     side = "SELL" if p.type == 0 else "BUY"
+    close_price = tick.bid if side == "SELL" else tick.ask
     req = {
         "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
         "symbol": p.symbol, "volume": p.volume,
         "type": mt5.ORDER_TYPE_SELL if side == "SELL" else mt5.ORDER_TYPE_BUY,  # type: ignore
         "position": ticket,
-        "price": tick.bid if side == "SELL" else tick.ask,
+        "price": close_price,
         "deviation": 20, "magic": 99001, "comment": "close",
         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
         "type_filling": _filling_mode(info),
     }
     r = mt5.order_send(req)  # type: ignore
-    return {"ok": r.retcode == mt5.TRADE_RETCODE_DONE, "retcode": r.retcode}  # type: ignore
+    if r is None:
+        return {"ok": False, "error": "order_send returned None"}
+    if r.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
+        return {"ok": False, "error": _retcode_msg(r.retcode), "retcode": r.retcode}
+    # compute realized P&L + pips for risk tracking + trade history
+    pip = _pip_for_digits(info.digits)
+    pips = ((close_price - p.price_open) / pip if side == "SELL"
+            else (p.price_open - close_price) / pip)
+    pnl = getattr(p, "profit", 0.0) or 0.0
+    return {
+        "ok": True, "retcode": r.retcode, "price": close_price,
+        "pnl": float(pnl), "pips": float(pips), "volume": p.volume,
+    }

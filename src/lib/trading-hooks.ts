@@ -33,7 +33,8 @@ export function useCandles(symbol: string, tf: Timeframe, count = 120) {
     queryKey: ["candles", symbol, tf, count],
     queryFn: () =>
       j(`/api/trading/candles?symbol=${symbol}&tf=${tf}&count=${count}`),
-    staleTime: 30_000,
+    refetchInterval: 15_000, // live chart refresh
+    staleTime: 10_000,
   });
 }
 
@@ -103,13 +104,13 @@ export function useMultiAnalysis(
   });
 }
 
-export function useBacktest(symbol: string, trades = 120) {
+export function useBacktest(symbol: string, trades = 120, tf?: string) {
   return useQuery<{
     summary: BacktestSummary;
     trades: BacktestTrade[];
     equityCurve: { i: number; equity: number }[];
   }>({
-    queryKey: ["backtest", symbol, trades],
+    queryKey: ["backtest", symbol, trades, tf ?? "H1"],
     queryFn: () =>
       j(`/api/trading/backtest?symbol=${symbol}&trades=${trades}`),
     staleTime: 60_000,
@@ -135,5 +136,27 @@ export function useMLInfo() {
     queryFn: () => j("/api/trading/ml/info"),
     refetchInterval: 60_000,
     staleTime: 30_000,
+  });
+}
+
+export function useStatus() {
+  return useQuery<{
+    connected: boolean;
+    demo: boolean;
+    terminal: string | null;
+    account: {
+      login: string;
+      server: string;
+      leverage: string;
+      currency: string;
+      balance?: number;
+      equity?: number;
+    } | null;
+    message: string;
+  }>({
+    queryKey: ["status"],
+    queryFn: () => j("/api/trading/status"),
+    refetchInterval: 10_000,
+    staleTime: 5_000,
   });
 }

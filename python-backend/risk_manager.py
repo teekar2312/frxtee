@@ -136,7 +136,43 @@ def trail_stop(position: dict, current_price: float, trail_pips: int,
     return None
 
 
-def near_high_impact_news(minutes: int = 15) -> bool:
-    """Check economic calendar for tier-1 events within `minutes`."""
-    # implemented in main.py via news_service.economic_calendar()
-    return False
+def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
+    """Check economic calendar for high-impact events within `minutes`.
+
+    Returns (is_blackout, reason). When settings.avoid_high_impact_news is
+    False, always returns (False, "disabled"). Checks the news_service
+    economic calendar for upcoming high-impact events.
+    """
+    if not settings.avoid_high_impact_news:
+        return False, "disabled"
+    try:
+        # import lazily to avoid circular dependency at module load
+        from news_service import economic_calendar
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            cal = loop.run_until_complete(economic_calendar())
+        finally:
+            loop.close()
+        now = __import__("time").time()
+        for event in cal[:20]:
+            impact = str(event.get("impact", "")).lower()
+            if impact != "high":
+                continue
+            # event time may be ISO string or epoch; parse defensively
+            ev_time = event.get("time") or event.get("date") or event.get("publishedAt")
+            if not ev_time:
+                continue
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(str(ev_time).replace("Z", "+00:00"))
+                secs = dt.timestamp()
+            except Exception:  # noqa: BLE001
+                continue
+            if 0 <= secs - now <= minutes * 60:
+                name = event.get("event", event.get("title", "event"))
+                return True, f"high-impact {name} in <{minutes} min"
+        return False, "ok"
+    except Exception as exc:  # noqa: BLE001
+        log.debug("news blackout check failed: %s", exc)
+        return False, "check failed"
