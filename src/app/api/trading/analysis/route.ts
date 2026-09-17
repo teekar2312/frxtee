@@ -5,6 +5,7 @@ import {
   pipFor,
   type AIAnalysisResult,
 } from "@/lib/trading-data";
+import { proxyBackend, passthroughQuery } from "@/lib/backend-proxy";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +28,19 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const symbol = searchParams.get("symbol") ?? "EURUSD";
   const provider = searchParams.get("provider") ?? "zai";
+
+  // Try the Python backend first (real AI + ML prediction)
+  const qs = passthroughQuery(req);
+  const r = await proxyBackend<{ analysis: AIAnalysisResult }>(
+    `/api/trading/analysis?${qs}`,
+    {},
+    5000 // AI inference may take a few seconds
+  );
+  if (r.data) {
+    return NextResponse.json({ analysis: r.data.analysis, demo: false });
+  }
+
+  // Fallback: deterministic mock analysis
   const rnd = seeded(symbol + provider);
 
   const base = basePriceFor(symbol);

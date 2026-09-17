@@ -31,6 +31,7 @@ export function AIEngineView() {
 
   // focus pair — the one whose detailed analysis is shown
   const [focus, setFocus] = React.useState<string>(symbols[0] ?? "EURUSD");
+  const [training, setTraining] = React.useState(false);
   React.useEffect(() => {
     if (!symbols.includes(focus)) setFocus(symbols[0] ?? "EURUSD");
   }, [symbols, focus]);
@@ -151,7 +152,45 @@ export function AIEngineView() {
         </Card>
 
         <Card className="p-3">
-          <SectionHeader title="ML Self-Learning" icon={LineChart} />
+          <SectionHeader
+            title="ML Self-Learning"
+            icon={LineChart}
+            right={
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={training}
+                onClick={async () => {
+                  setTraining(true);
+                  toast.info(`Retraining model on ${focus}…`);
+                  try {
+                    const res = await fetch(
+                      `/api/trading/ml/train?symbol=${focus}`,
+                      { method: "POST" }
+                    );
+                    const d = await res.json();
+                    if (d.ok) {
+                      toast.success(
+                        d.message ?? `Model retrained on ${focus}`
+                      );
+                    } else {
+                      toast.error("Retrain failed");
+                    }
+                  } catch {
+                    toast.error("Retrain failed — network error");
+                  } finally {
+                    setTraining(false);
+                  }
+                }}
+              >
+                <RefreshCw
+                  className={cn("h-3 w-3 mr-1", training && "animate-spin")}
+                />
+                Retrain
+              </Button>
+            }
+          />
           <div className="grid grid-cols-2 gap-2">
             <StatTile label="Model Version" value="v2.4.1" sub="online" />
             <StatTile label="Training Trades" value="12,480" sub="last 90d" />
@@ -161,7 +200,8 @@ export function AIEngineView() {
           <Separator className="my-2" />
           <div className="text-[11px] text-muted-foreground">
             The model retrains nightly on closed-trade outcomes and recent market
-            regimes. Prediction drift &gt; 8% triggers an early retrain.
+            regimes. Prediction drift &gt; 8% triggers an early retrain. Click
+            Retrain to manually retrain on the focused pair.
           </div>
         </Card>
       </div>

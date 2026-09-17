@@ -1,6 +1,7 @@
 "use client";
 
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 import {
   AI_PROVIDERS,
   MONEY_MGMT_DEFAULTS,
@@ -118,7 +119,9 @@ interface TradingState {
   setEmailTo: (v: string) => void;
 }
 
-export const useTradingStore = create<TradingState>((set, get) => ({
+export const useTradingStore = create<TradingState>()(
+  persist(
+    (set, get) => ({
   mt5Connected: false,
   demoMode: true,
   accountEquity: 10000,
@@ -233,7 +236,40 @@ export const useTradingStore = create<TradingState>((set, get) => ({
   emailTo: "",
   setEmailEnabled: (v) => set({ emailEnabled: v }),
   setEmailTo: (v) => set({ emailTo: v }),
-}));
+    }),
+    {
+      name: "zenitrade-store",
+      // only persist config, not live connection/equity state
+      partialize: (s) => ({
+        symbols: s.symbols,
+        timeframes: s.timeframes,
+        sessions: s.sessions,
+        indicators: s.indicators,
+        aiProvider: s.aiProvider,
+        autoTradeMode: s.autoTradeMode,
+        autoIndicators: s.autoIndicators,
+        autoTrailing: s.autoTrailing,
+        autoRisk: s.autoRisk,
+        autoPair: s.autoPair,
+        autoTimeframe: s.autoTimeframe,
+        autoSession: s.autoSession,
+        riskPerTrade: s.riskPerTrade,
+        stopLossPips: s.stopLossPips,
+        rrRatio: s.rrRatio,
+        maxOpenPositions: s.maxOpenPositions,
+        dailyRiskLimit: s.dailyRiskLimit,
+        dailyTarget: s.dailyTarget,
+        avoidNews: s.avoidNews,
+        trailingEnabled: s.trailingEnabled,
+        trailingPips: s.trailingPips,
+        keys: s.keys,
+        emailEnabled: s.emailEnabled,
+        emailTo: s.emailTo,
+        density: s.density,
+      }),
+    }
+  )
+);
 
 export function useActiveProvider() {
   const id = useTradingStore((s) => s.aiProvider);

@@ -41,26 +41,35 @@ export function AlertsView() {
   const [condition, setCondition] = React.useState<PriceAlert["condition"]>("above");
   const [price, setPrice] = React.useState("");
 
-  function add() {
+  async function add() {
     const p = parseFloat(price);
     if (!p || !symbol) {
       toast.error("Enter symbol and price");
       return;
     }
-    setAlerts((a) => [
-      {
-        id: `a${Date.now()}`,
-        symbol,
-        condition,
-        price: p,
-        active: true,
-        createdAt: new Date().toISOString(),
-        triggered: false,
-      },
-      ...a,
-    ]);
-    toast.success(`Alert set: ${symbol} ${condition} ${p}`);
-    setPrice("");
+    try {
+      const res = await fetch("/api/trading/alerts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, condition, price: p }),
+      });
+      const data = await res.json();
+      const alert: PriceAlert =
+        data.alert ?? {
+          id: `a${Date.now()}`,
+          symbol,
+          condition,
+          price: p,
+          active: true,
+          createdAt: new Date().toISOString(),
+          triggered: false,
+        };
+      setAlerts((a) => [alert, ...a]);
+      toast.success(`Alert set: ${symbol} ${condition} ${p}`);
+      setPrice("");
+    } catch {
+      toast.error("Failed to create alert — network error");
+    }
   }
 
   function toggle(id: string) {
@@ -70,8 +79,22 @@ export function AlertsView() {
     setAlerts((a) => a.filter((x) => x.id !== id));
   }
 
-  function sendTestEmail() {
-    toast.success(`Test email sent to ${emailTo || "(not configured)"}`);
+  async function sendTestEmail() {
+    if (!emailTo) {
+      toast.error("Enter a recipient email first");
+      return;
+    }
+    try {
+      const res = await fetch("/api/trading/email/test", { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        toast.success(`Test email sent to ${emailTo}`);
+      } else {
+        toast.error("Email failed — check SMTP config");
+      }
+    } catch {
+      toast.error("Email failed — network error");
+    }
   }
 
   return (

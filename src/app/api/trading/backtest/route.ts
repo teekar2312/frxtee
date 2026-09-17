@@ -5,6 +5,7 @@ import {
   type BacktestSummary,
   type BacktestTrade,
 } from "@/lib/trading-data";
+import { proxyBackend, passthroughQuery } from "@/lib/backend-proxy";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +28,19 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const symbol = searchParams.get("symbol") ?? "EURUSD";
   const trades = parseInt(searchParams.get("trades") ?? "120");
+
+  // Try Python backend (real historical replay) first
+  const qs = passthroughQuery(req);
+  const r = await proxyBackend<{
+    summary: BacktestSummary;
+    trades: BacktestTrade[];
+    equityCurve: { i: number; equity: number }[];
+  }>(`/api/trading/backtest?${qs}`, {}, 5000);
+  if (r.data) {
+    return NextResponse.json({ ...r.data, demo: false });
+  }
+
+  // Fallback: deterministic mock backtest
   const rnd = seeded(symbol + trades);
   const base = basePriceFor(symbol);
   const pip = pipFor(symbol);

@@ -30,6 +30,7 @@ import {
   TRADING_SESSIONS,
   type Timeframe,
 } from "@/lib/trading-data";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTicks, usePositions, useCandles } from "@/lib/trading-hooks";
 import { useTradingStore } from "@/lib/trading-store";
 import { CandleChart } from "./candle-chart";
@@ -214,6 +215,7 @@ function ChartPanel() {
 
 function OrderTicket() {
   const symbols = useTradingStore((s) => s.symbols);
+  const queryClient = useQueryClient();
   const [symbol, setSymbol] = React.useState(symbols[0] ?? "EURUSD");
   const [side, setSide] = React.useState<"BUY" | "SELL">("BUY");
   const [volume, setVolume] = React.useState(0.1);
@@ -233,18 +235,45 @@ function OrderTicket() {
   const tpPips = slPips * rr;
   const price = side === "BUY" ? tick?.ask : tick?.bid;
 
-  function submit() {
+  const [submitting, setSubmitting] = React.useState(false);
+
+  async function submit() {
     if (!price) {
       toast.error("No live price for symbol");
       return;
     }
-    toast.success(
-      `${autoTrade ? "[AI] " : ""}${side} ${symbol} ${volume} lot @ ${fmtPrice(
-        price,
-        digits
-      )} | SL ${slPips}p TP ${tpPips.toFixed(1)}p`,
-      { description: `Risk ${fmtMoney(riskAmount)} · RR 1:${rr}` }
-    );
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/trading/order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol,
+          side,
+          volume,
+          slPips,
+          comment: autoTrade ? "AI:auto" : "manual",
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        toast.success(
+          `${autoTrade ? "[AI] " : ""}${side} ${symbol} ${volume} lot @ ${fmtPrice(
+            data.price ?? price,
+            digits
+          )} | SL ${slPips}p TP ${tpPips.toFixed(1)}p`,
+          { description: `Ticket #${data.ticket} · Risk ${fmtMoney(riskAmount)} · RR 1:${rr}` }
+        );
+        // refresh positions list
+        queryClient.invalidateQueries({ queryKey: ["positions"] });
+      } else {
+        toast.error(`Order rejected: ${data.error ?? "unknown"}`);
+      }
+    } catch {
+      toast.error("Order failed — network error");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -358,8 +387,15 @@ function OrderTicket() {
           </div>
         </div>
 
-        <Button className="w-full h-10" size="sm" onClick={submit} disabled={!price}>
-          {side} {symbol} · {volume.toFixed(2)} lot
+        <Button
+          className="w-full h-10"
+          size="sm"
+          onClick={submit}
+          disabled={!price || submitting}
+        >
+          {submitting
+            ? "Sending order…"
+            : `${side} ${symbol} · ${volume.toFixed(2)} lot`}
         </Button>
         {autoTrade ? (
           <div className="text-center">
@@ -375,7 +411,30 @@ function OrderTicket() {
 
 function PositionsCard() {
   const { data } = usePositions();
+  const queryClient = useQueryClient();
   const positions = data?.positions ?? [];
+
+  const [closing, setClosing] = React.useState<number | null>(null);
+  async function closePosition(ticket: number) {
+    setClosing(ticket);
+    try {
+      const res = await fetch(`/api/trading/positions/${ticket}`, {
+        method: "DELETE",
+      });
+      const d = await res.json();
+      if (d.ok) {
+        toast.success(`Closed #${ticket} @ market`);
+        queryClient.invalidateQueries({ queryKey: ["positions"] });
+      } else {
+        toast.error(`Close failed: ${d.error ?? "unknown"}`);
+      }
+    } catch {
+      toast.error("Close failed — network error");
+    } finally {
+      setClosing(null);
+    }
+  }
+
   return (
     <Card className="p-3">
       <SectionHeader
@@ -439,9 +498,10 @@ function PositionsCard() {
                       variant="ghost"
                       size="sm"
                       className="h-6 text-[10px] text-danger hover:text-danger"
-                      onClick={() => toast.success(`Closed #${p.ticket} @ market`)}
+                      disabled={closing === p.ticket}
+                      onClick={() => closePosition(p.ticket)}
                     >
-                      Close
+                      {closing === p.ticket ? "…" : "Close"}
                     </Button>
                   </td>
                 </tr>

@@ -326,3 +326,72 @@ Stage Summary:
   (11 camelCase fields) — production-safe, not just demo-safe
 - Multi-pair analysis fully verified: 5 pairs analyzed in parallel, provider
   switching re-fetches all pairs, focus-pair selection updates detail view
+
+---
+Task ID: I (Full implementation)
+Agent: Z.ai Code (main)
+Task: Implement everything into the codebase — real API proxying + wired buttons + persistence
+
+Work Log:
+1. Backend proxy helper (src/lib/backend-proxy.ts):
+   - proxyBackend<T>(path, init, timeoutMs) — fetches Python backend at
+     TRADING_BACKEND_URL (default http://127.0.0.1:8000), aborts on timeout,
+     returns {data, proxied, status}. On connection refused → data=null
+     so route falls back to demo data.
+   - jsonWithDemo() helper tags responses with demo flag.
+
+2. Refactored all 8 GET API routes to proxy-first with demo fallback:
+   - ticks, candles, positions, analysis, news, logs, backtest, status
+   - Each tries backend first (analysis/backtest get 5s timeout for AI/ML),
+     falls back to deterministic mock generator on failure.
+   - Extracted DEMO_NEWS + DEMO_LOGS into lib/ modules.
+
+3. Added 5 new POST/DELETE API routes:
+   - POST /api/trading/order — place market order
+   - DELETE /api/trading/positions/[ticket] — close position
+   - POST /api/trading/alerts — create price alert
+   - POST /api/trading/email/test — send test email
+   - POST /api/trading/ml/train?symbol= — trigger ML retrain
+   All proxy to backend with demo fallback.
+
+4. Refactored connect route (POST/DELETE) to proxy to backend with 15s
+   timeout (MT5 auto-launch) + demo fallback.
+
+5. Wired frontend buttons to real APIs:
+   - Order ticket BUY/SELL → POST /api/trading/order (loading state,
+     invalidates positions query on success, shows ticket # in toast)
+   - Close position → DELETE /api/trading/positions/[ticket] (loading
+     state per-row, invalidates positions query)
+   - Create price alert → POST /api/trading/alerts
+   - Send test email → POST /api/trading/email/test (validates email first)
+   - ML Retrain button → POST /api/trading/ml/train (new button in AI
+     Engine ML Self-Learning card, loading spinner)
+
+6. Zustand persist middleware:
+   - Wrapped store with persist({ name: "zenitrade-store", partialize })
+   - Persists: symbols, timeframes, sessions, indicators, aiProvider,
+     all auto/manual toggles, money mgmt params, trailing, keys, email,
+     density. Does NOT persist mt5Connected/equity (live state).
+
+Verification (Agent Browser end-to-end):
+- POST /api/trading/order 200 → toast "BUY EURUSD 0.1 lot @ 1.08650 |
+  SL 10p TP 15.0p Ticket #5001225 · Risk $100.00 · RR 1:1.5"
+- DELETE /api/trading/positions/5000001 200 → toast "Closed #5000001
+  @ market" + positions list refreshed
+- POST /api/trading/alerts 200 → toast "Alert set: EURUSD above 1.09"
+- POST /api/trading/email/test 200 → toast "Test email sent to
+  trader@example.com"
+- POST /api/trading/ml/train?symbol=EURUSD 200 → toast "Training queued
+  for EURUSD (demo — backend not connected)"
+- Settings persist: localStorage zenitrade-store holds symbols, timeframes,
+  sessions, indicators, aiProvider, money mgmt, email (trader@example.com
+  survived reload), density — all restored after page reload
+- No console/runtime errors; ESLint clean
+
+Stage Summary:
+- All API routes now proxy to Python backend (port 8000) with demo fallback
+- All frontend buttons wired to real API calls (order, close, alert, email,
+  ML retrain) with loading states + toast feedback + query invalidation
+- Trading config persists to localStorage across reloads via Zustand persist
+- Demo mode works seamlessly when backend unavailable; production mode
+  activates automatically when Python backend is detected
