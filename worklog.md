@@ -207,3 +207,37 @@ Stage Summary:
 - 3 density modes fully functional and persisted
 - Single header dropdown toggles all three; scales fonts, paddings, gaps, table rows, scrollbars, radii, line-heights, and touch targets
 - Hydration-safe (SSR returns "compact", client restores saved value post-mount)
+
+---
+Task ID: M (Multi-pair AI analysis)
+Agent: Z.ai Code (main)
+Task: Configure AI to analyze ALL active pairs (not just one)
+
+Work Log:
+- Created `useMultiAnalysis(symbols, provider, enabled)` hook in trading-hooks.ts — fetches analysis for every active pair in parallel via Promise.all, returns a Record<symbol, AIAnalysisResult>
+- Rewrote AI Engine view:
+  - Added "Multi-Pair Signal Matrix" card at top with aggregate stats (Pairs Analyzed N/N, Buy/Sell/Neutral counts, Avg Confidence), top-pick highlight, and a clickable grid of pair cards each showing signal + confidence + SL/TP
+  - Focus-pair state: clicking any pair card updates the detailed analysis + multi-factor bars below
+  - "Re-analyze All" button triggers refetch of all pairs + toast confirmation
+  - Moved ML Self-Learning card to left column
+- Updated Dashboard view:
+  - Switched from useAnalysis (single) to useMultiAnalysis (all active pairs)
+  - AI Signal widget now shows chips for ALL active pairs with their signals + confidence, top pick highlighted with primary border
+  - Header shows "N pairs analyzed" instead of single model name
+
+Verification (Agent Browser + VLM):
+- Dashboard: confirmed 2 pairs (EURUSD, GBPUSD) show signal chips, EURUSD highlighted as top pick
+- AI Engine with 5 active pairs (EURUSD, GBPUSD, USDJPY, XAUUSD, AUDUSD):
+  - All 5 analysis API calls return 200 in parallel
+  - Matrix shows 5/5 analyzed, Buy=2, Sell=1, Neutral=2, Avg Confidence 76%
+  - Top pick XAU/USD (94% confidence)
+  - Clicking AUD/USD card → detailed analysis + multi-factor bars update to show AUD/USD STRONG SELL
+  - "Re-analyze All" button → toast "Re-analyzing all 5 pairs…"
+- No console/runtime errors; ESLint clean
+
+Stage Summary:
+- AI now analyzes ALL active pairs in parallel (was: only the first pair)
+- Multi-Pair Signal Matrix in AI Engine shows aggregate + per-pair signals at a glance
+- Dashboard AI Signal widget shows all active pair chips with top-pick highlight
+- Click any pair to focus its detailed 7-dimension analysis
+- Re-analyze All button refreshes every pair at once

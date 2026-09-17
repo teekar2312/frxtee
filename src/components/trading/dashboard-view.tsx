@@ -33,7 +33,7 @@ import {
   fmtPrice,
   TRADING_PAIRS,
 } from "@/lib/trading-data";
-import { usePositions, useTicks, useAnalysis, useCandles } from "@/lib/trading-hooks";
+import { usePositions, useTicks, useMultiAnalysis, useCandles } from "@/lib/trading-hooks";
 import { useTradingStore, useActiveProvider } from "@/lib/trading-store";
 import { CandleChart } from "./candle-chart";
 import { StatTile, BadgeTone, SectionHeader } from "./primitives";
@@ -71,7 +71,13 @@ export function DashboardView() {
   const curve = React.useMemo(() => equityCurve(), []);
   const tick = tickData?.ticks.find((t) => t.symbol === mainSymbol);
 
-  const { data: analysisData } = useAnalysis(mainSymbol, aiProvider.id);
+  const { data: multiData } = useMultiAnalysis(symbols, aiProvider.id);
+  const results = multiData?.results ?? {};
+  const a = results[mainSymbol];
+  const bestPair = symbols
+    .map((s) => results[s])
+    .filter(Boolean)
+    .sort((x, y) => y!.confidence - x!.confidence)[0];
 
   return (
     <div className="space-y-3">
@@ -143,7 +149,7 @@ export function DashboardView() {
                 </div>
               }
             />
-            <ChartForSymbol symbol={mainSymbol} tf={mainTf} analysis={analysisData?.analysis} />
+            <ChartForSymbol symbol={mainSymbol} tf={mainTf} analysis={a} />
           </Card>
 
           <Card className="p-3">
@@ -203,21 +209,49 @@ export function DashboardView() {
           <Card className="p-3">
             <SectionHeader
               title="AI Signal"
-              desc={`${aiProvider.name} · ${aiProvider.model}`}
+              desc={`${aiProvider.name} · ${symbols.length} pairs analyzed`}
               icon={Brain}
-              right={
-                analysisData?.analysis ? (
-                  <SignalBadge signal={analysisData.analysis.signal} />
-                ) : null
-              }
+              right={a ? <SignalBadge signal={a.signal} /> : null}
             />
-            {analysisData?.analysis ? (
-              <AnalysisMini a={analysisData.analysis} />
+            {a ? (
+              <AnalysisMini a={a} />
             ) : (
               <div className="h-40 grid place-items-center text-xs text-muted-foreground">
-                Analyzing {mainSymbol}…
+                Analyzing {symbols.length} pairs…
               </div>
             )}
+            {symbols.length > 1 && bestPair ? (
+              <div className="mt-2 pt-2 border-t">
+                <div className="text-[10px] text-muted-foreground mb-1.5">
+                  All active pairs · top pick highlighted
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {symbols.map((s) => {
+                    const r = results[s];
+                    const isBest = bestPair?.symbol === s;
+                    return (
+                      <span
+                        key={s}
+                        className={
+                          "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] " +
+                          (isBest ? "border-primary bg-primary/10" : "border-border")
+                        }
+                      >
+                        <span className="font-medium">{s}</span>
+                        {r ? (
+                          <>
+                            <BadgeTone tone={signalTone(r.signal)}>{r.signal.replace("STRONG ", "")}</BadgeTone>
+                            <span className="text-muted-foreground tnum">{r.confidence}%</span>
+                          </>
+                        ) : (
+                          <span className="text-muted-foreground">…</span>
+                        )}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
           </Card>
 
           <div className="grid grid-cols-2 gap-2">
@@ -362,9 +396,13 @@ function PositionsTable() {
 }
 
 function SignalBadge({ signal }: { signal: string }) {
-  const tone =
-    signal.includes("BUY") ? "up" : signal.includes("SELL") ? "down" : "neutral";
-  return <BadgeTone tone={tone as any}>{signal}</BadgeTone>;
+  return <BadgeTone tone={signalTone(signal)}>{signal}</BadgeTone>;
+}
+
+function signalTone(s: string): "up" | "down" | "neutral" {
+  if (s.includes("BUY")) return "up";
+  if (s.includes("SELL")) return "down";
+  return "neutral";
 }
 
 function AnalysisMini({ a }: { a: any }) {

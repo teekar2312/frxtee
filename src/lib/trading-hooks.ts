@@ -73,6 +73,36 @@ export function useAnalysis(symbol: string, provider: string) {
   });
 }
 
+/** Analyze ALL active pairs in parallel. Returns a map of symbol -> analysis. */
+export function useMultiAnalysis(
+  symbols: string[],
+  provider: string,
+  enabled = true
+) {
+  return useQuery<{
+    results: Record<string, AIAnalysisResult | undefined>;
+  }>({
+    queryKey: ["multi-analysis", symbols.join(","), provider],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        symbols.map(async (s) => {
+          try {
+            const r = await j<{ analysis: AIAnalysisResult }>(
+              `/api/trading/analysis?symbol=${s}&provider=${provider}`
+            );
+            return [s, r.analysis] as const;
+          } catch {
+            return [s, undefined] as const;
+          }
+        })
+      );
+      return { results: Object.fromEntries(entries) };
+    },
+    enabled: enabled && symbols.length > 0,
+    staleTime: 60_000,
+  });
+}
+
 export function useBacktest(symbol: string, trades = 120) {
   return useQuery<{
     summary: BacktestSummary;

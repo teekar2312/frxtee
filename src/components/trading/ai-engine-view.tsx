@@ -4,34 +4,52 @@ import * as React from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import {
   Brain,
   Cpu,
   Gauge,
+  LayoutGrid,
   LineChart,
   RefreshCw,
-  Server,
   Sparkles,
-  TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   AI_PROVIDERS,
-  ANALYSIS_DIMENSIONS,
   fmtPrice,
+  TRADING_PAIRS,
 } from "@/lib/trading-data";
-import { useAnalysis } from "@/lib/trading-hooks";
+import { useMultiAnalysis } from "@/lib/trading-hooks";
 import { useTradingStore, useActiveProvider } from "@/lib/trading-store";
 import { BadgeTone, SectionHeader, StatTile } from "./primitives";
 
 export function AIEngineView() {
   const store = useTradingStore();
   const active = useActiveProvider();
-  const symbol = store.symbols[0] ?? "EURUSD";
-  const { data, isFetching, refetch } = useAnalysis(symbol, active.id);
-  const a = data?.analysis;
+  const symbols = store.symbols;
+
+  // focus pair — the one whose detailed analysis is shown
+  const [focus, setFocus] = React.useState<string>(symbols[0] ?? "EURUSD");
+  React.useEffect(() => {
+    if (!symbols.includes(focus)) setFocus(symbols[0] ?? "EURUSD");
+  }, [symbols, focus]);
+
+  const { data, isFetching, refetch } = useMultiAnalysis(symbols, active.id);
+  const results = data?.results ?? {};
+  const a = results[focus];
+
+  // aggregate stats across all pairs
+  const valid = symbols.map((s) => results[s]).filter(Boolean);
+  const buyCount = valid.filter((x) => x!.signal.includes("BUY")).length;
+  const sellCount = valid.filter((x) => x!.signal.includes("SELL")).length;
+  const neutralCount = valid.filter((x) => x!.signal === "NEUTRAL").length;
+  const avgConf = valid.length
+    ? Math.round(valid.reduce((s, x) => s + x!.confidence, 0) / valid.length)
+    : 0;
+  const bestPair = valid
+    .map((x) => x!)
+    .sort((a, b) => b.confidence - a.confidence)[0];
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
@@ -131,35 +149,129 @@ export function AIEngineView() {
             );
           })}
         </Card>
+
+        <Card className="p-3">
+          <SectionHeader title="ML Self-Learning" icon={LineChart} />
+          <div className="grid grid-cols-2 gap-2">
+            <StatTile label="Model Version" value="v2.4.1" sub="online" />
+            <StatTile label="Training Trades" value="12,480" sub="last 90d" />
+            <StatTile label="Win Rate (val)" value="61.3%" tone="up" />
+            <StatTile label="Retrained" value="2h ago" sub="auto-scheduled" tone="warn" />
+          </div>
+          <Separator className="my-2" />
+          <div className="text-[11px] text-muted-foreground">
+            The model retrains nightly on closed-trade outcomes and recent market
+            regimes. Prediction drift &gt; 8% triggers an early retrain.
+          </div>
+        </Card>
       </div>
 
-      {/* analysis output */}
+      {/* analysis output — multi-pair */}
       <div className="xl:col-span-2 space-y-3">
+        {/* Multi-pair signal matrix */}
         <Card className="p-3">
           <SectionHeader
-            title={`AI Analysis · ${symbol}`}
+            title="Multi-Pair Signal Matrix"
+            desc={`${symbols.length} active pairs · ${active.name} analyzes all`}
+            icon={LayoutGrid}
+            right={
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => {
+                  refetch();
+                  toast.success(`Re-analyzing all ${symbols.length} pairs…`);
+                }}
+                disabled={isFetching}
+              >
+                <RefreshCw className={cn("h-3 w-3 mr-1", isFetching && "animate-spin")} />
+                Re-analyze All
+              </Button>
+            }
+          />
+          {symbols.length === 0 ? (
+            <div className="h-20 grid place-items-center text-xs text-muted-foreground">
+              No active pairs — select pairs in Trading view
+            </div>
+          ) : (
+            <>
+              {/* aggregate summary */}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
+                <StatTile label="Pairs Analyzed" value={`${valid.length}/${symbols.length}`} />
+                <StatTile label="Buy Signals" value={String(buyCount)} tone="up" />
+                <StatTile label="Sell Signals" value={String(sellCount)} tone="down" />
+                <StatTile label="Neutral" value={String(neutralCount)} />
+                <StatTile label="Avg Confidence" value={`${avgConf}%`} tone={avgConf > 70 ? "up" : "warn"} />
+              </div>
+              {bestPair ? (
+                <div className="rounded-md border border-primary/30 bg-primary/5 p-2 mb-3 text-xs">
+                  <span className="text-muted-foreground">Top pick: </span>
+                  <span className="font-semibold">{bestPair.symbol}</span>
+                  <span className="mx-1.5">·</span>
+                  <BadgeTone tone={signalTone(bestPair.signal)}>{bestPair.signal}</BadgeTone>
+                  <span className="mx-1.5">·</span>
+                  <span className="tnum font-semibold">{bestPair.confidence}%</span>
+                  <span className="text-muted-foreground ml-1">confidence</span>
+                </div>
+              ) : null}
+              {/* pair grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-80 overflow-y-auto scroll-thin">
+                {symbols.map((s) => {
+                  const r = results[s];
+                  const p = TRADING_PAIRS.find((x) => x.symbol === s);
+                  return (
+                    <button
+                      key={s}
+                      onClick={() => setFocus(s)}
+                      className={cn(
+                        "text-left rounded-md border p-2 transition-colors",
+                        focus === s
+                          ? "border-primary bg-primary/5"
+                          : "border-border hover:bg-muted/40"
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">{p?.display ?? s}</span>
+                        {r ? (
+                          <BadgeTone tone={signalTone(r.signal)}>{r.signal}</BadgeTone>
+                        ) : (
+                          <span className="text-[10px] text-muted-foreground">…</span>
+                        )}
+                      </div>
+                      {r ? (
+                        <div className="flex items-center gap-2 mt-1 text-[10px] text-muted-foreground tnum">
+                          <span>conf {r.confidence}%</span>
+                          <span>·</span>
+                          <span className="text-danger">SL {fmtPrice(r.suggestedSL, s.includes("JPY") ? 3 : 5)}</span>
+                          <span>·</span>
+                          <span className="text-success">TP {fmtPrice(r.suggestedTP, s.includes("JPY") ? 3 : 5)}</span>
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-muted-foreground mt-1">analyzing…</div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </Card>
+
+        {/* Focused pair detailed analysis */}
+        <Card className="p-3">
+          <SectionHeader
+            title={`Detailed Analysis · ${focus}`}
             desc={`${active.name} · ${active.model} · ${active.latencyMs}ms`}
             icon={Brain}
             right={
-              <div className="flex items-center gap-2">
-                {a ? <BadgeTone tone={signalTone(a.signal)}>{a.signal}</BadgeTone> : null}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={() => refetch()}
-                  disabled={isFetching}
-                >
-                  <RefreshCw className={cn("h-3 w-3 mr-1", isFetching && "animate-spin")} />
-                  Re-analyze
-                </Button>
-              </div>
+              a ? <BadgeTone tone={signalTone(a.signal)}>{a.signal}</BadgeTone> : null
             }
           />
           {!a ? (
             <div className="h-48 grid place-items-center text-xs text-muted-foreground">
               <div className="flex items-center gap-2">
-                <Sparkles className="h-4 w-4 animate-pulse" /> Analyzing market context…
+                <Sparkles className="h-4 w-4 animate-pulse" /> Analyzing {focus}…
               </div>
             </div>
           ) : (
@@ -167,7 +279,7 @@ export function AIEngineView() {
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 <StatTile label="Confidence" value={`${a.confidence}%`} tone={a.confidence > 70 ? "up" : "warn"} />
                 <StatTile label="Risk Score" value={`${a.riskScore}%`} tone={a.riskScore > 50 ? "down" : "up"} />
-                <StatTile label="Entry" value={fmtPrice(a.suggestedEntry, symbol.includes("JPY") ? 3 : 5)} />
+                <StatTile label="Entry" value={fmtPrice(a.suggestedEntry, focus.includes("JPY") ? 3 : 5)} />
                 <StatTile label="Provider" value={active.name} sub={active.model} />
               </div>
               <p className="text-sm leading-relaxed bg-muted/30 rounded-md p-2.5">
@@ -178,19 +290,19 @@ export function AIEngineView() {
                 <div className="rounded-md border p-2">
                   <div className="text-[10px] text-muted-foreground">Suggested Entry</div>
                   <div className="text-sm font-semibold tnum">
-                    {fmtPrice(a.suggestedEntry, symbol.includes("JPY") ? 3 : 5)}
+                    {fmtPrice(a.suggestedEntry, focus.includes("JPY") ? 3 : 5)}
                   </div>
                 </div>
                 <div className="rounded-md border p-2">
                   <div className="text-[10px] text-muted-foreground">Stop Loss</div>
                   <div className="text-sm font-semibold tnum text-danger">
-                    {fmtPrice(a.suggestedSL, symbol.includes("JPY") ? 3 : 5)}
+                    {fmtPrice(a.suggestedSL, focus.includes("JPY") ? 3 : 5)}
                   </div>
                 </div>
                 <div className="rounded-md border p-2">
                   <div className="text-[10px] text-muted-foreground">Take Profit</div>
                   <div className="text-sm font-semibold tnum text-success">
-                    {fmtPrice(a.suggestedTP, symbol.includes("JPY") ? 3 : 5)}
+                    {fmtPrice(a.suggestedTP, focus.includes("JPY") ? 3 : 5)}
                   </div>
                 </div>
                 <div className="rounded-md border p-2">
@@ -203,21 +315,24 @@ export function AIEngineView() {
                 className="w-full"
                 disabled={store.autoTradeMode}
                 onClick={() =>
-                  toast.success(`Signal queued: ${a.signal} ${symbol} (AI)`)
+                  toast.success(`Signal queued: ${a.signal} ${focus} (AI)`, {
+                    description: `Entry ${fmtPrice(a.suggestedEntry, focus.includes("JPY") ? 3 : 5)} · ${a.confidence}% confidence`,
+                  })
                 }
               >
                 <Sparkles className="h-4 w-4 mr-2" />
                 {store.autoTradeMode
                   ? "Auto-trade active — AI executes signals"
-                  : `Execute ${a.signal} ${symbol}`}
+                  : `Execute ${a.signal} ${focus}`}
               </Button>
             </div>
           )}
         </Card>
 
+        {/* Multi-factor for focused pair */}
         <Card className="p-3">
           <SectionHeader
-            title="Multi-Factor Analysis"
+            title={`Multi-Factor Analysis · ${focus}`}
             desc="ML scoring across 7 dimensions"
             icon={Gauge}
           />
@@ -265,21 +380,6 @@ export function AIEngineView() {
               Run analysis to see scores
             </div>
           )}
-        </Card>
-
-        <Card className="p-3">
-          <SectionHeader title="ML Self-Learning" icon={LineChart} />
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            <StatTile label="Model Version" value="v2.4.1" sub="online" />
-            <StatTile label="Training Trades" value="12,480" sub="last 90d" />
-            <StatTile label="Win Rate (val)" value="61.3%" tone="up" />
-            <StatTile label="Retrained" value="2h ago" sub="auto-scheduled" tone="warn" />
-          </div>
-          <Separator className="my-2" />
-          <div className="text-[11px] text-muted-foreground">
-            The model retrains nightly on closed-trade outcomes and recent market
-            regimes. Prediction drift &gt; 8% triggers an early retrain.
-          </div>
         </Card>
       </div>
     </div>
