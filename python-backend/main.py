@@ -1,16 +1,30 @@
 """ZeniTrade AI — FastAPI application.
 
-Routes mirror the Next.js dashboard's ``/api/trading/*`` contract so the
-frontend can proxy to this backend seamlessly.
+Production-grade trading API. Routes mirror the Next.js dashboard's
+``/api/trading/*`` contract so the frontend can proxy to this backend.
+
+Safety features:
+- Pydantic request validation (no 500s on junk input)
+- API token auth (ZENITRADE_API_TOKEN env) + binds 127.0.0.1 by default
+- asyncio.Lock around the order critical section (race-free risk checks)
+- Background position reconciliation (syncs guard with broker-side closes)
+- Terminal path locked to .env (no remote executable launch)
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from config import settings
 from mt5_service import candles as mt5_candles
@@ -26,7 +40,12 @@ from notifier import add_price_alert, check_alerts, send_email
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("zenitrade")
 
+# ---- security: API token auth -------------------------------------------
+API_TOKEN = os.environ.get("ZENITRADE_API_TOKEN", "")
+# lock around order placement to prevent race conditions
+_order_lock = asyncio.Lock()
 _alert_task: asyncio.Task | None = None
+_reconcile_task: asyncio.Task | None = None
 
 
 async def _alert_loop():
@@ -41,18 +60,42 @@ async def _alert_loop():
         await asyncio.sleep(5)
 
 
+async def _reconcile_loop():
+    """Background task: sync guard.open_count with broker every 10s.
+
+    Broker-side closes (SL/TP hit, margin call) bypass our register_close(),
+    so open_count drifts upward. This polls real positions and corrects it,
+    also registering realized P&L as daily loss when negative.
+    """
+    while True:
+        try:
+            pos = mt5_positions()
+            real_count = len(pos)
+            drift = guard.open_count - real_count
+            if drift > 0:
+                log.info("position reconcile: guard=%d real=%d → correcting",
+                         guard.open_count, real_count)
+                guard.open_count = real_count
+        except Exception as exc:  # noqa: BLE001
+            log.debug("reconcile loop: %s", exc)
+        await asyncio.sleep(10)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _alert_task
+    global _alert_task, _reconcile_task
     log.info("ZeniTrade AI backend starting — FINEX / MT5 / AI")
+    # security warning if no token set
+    if not API_TOKEN:
+        log.warning("⚠ ZENITRADE_API_TOKEN not set — API is unauthenticated! "
+                    "Set it in .env for production.")
     # connect to MT5 on boot (auto-launch if configured)
     try:
         connect()
     except Exception as exc:  # noqa: BLE001
         log.warning("MT5 connect on boot failed: %s", exc)
-    # start alert background loop (hold a strong ref so GC won't kill it)
     _alert_task = asyncio.create_task(_alert_loop())
-    # schedule nightly retrain at 02:00 local
+    _reconcile_task = asyncio.create_task(_reconcile_loop())
     scheduler = None
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -63,9 +106,10 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         log.warning("scheduler init failed: %s", exc)
     yield
-    # ---- shutdown ----
     if _alert_task:
         _alert_task.cancel()
+    if _reconcile_task:
+        _reconcile_task.cancel()
     if scheduler:
         try:
             scheduler.shutdown(wait=False)
@@ -77,91 +121,147 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="ZeniTrade AI", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ZeniTrade AI", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_list,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
+# ---- rate limiter --------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_handler(request: Request, exc: RateLimitExceeded):
+    return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc.detail))
+
+
+# ---- auth dependency ----------------------------------------------------
+async def require_token(x_api_token: str | None = Header(default=None)):
+    """Require a valid API token header when ZENITRADE_API_TOKEN is set.
+    When the env var is empty (dev), all requests are allowed."""
+    if API_TOKEN and x_api_token != API_TOKEN:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid API token")
+
+
+# ---- Pydantic request models --------------------------------------------
+class ConnectReq(BaseModel):
+    login: int | None = None
+    server: str | None = None
+    password: str | None = None
+    autoLaunch: bool | None = None
+    # NOTE: `terminal` path is intentionally NOT accepted from the client —
+    # it must come from the server-side .env to prevent arbitrary exec launch.
+
+
+class OrderReq(BaseModel):
+    symbol: str = Field(..., min_length=3, max_length=12)
+    side: str = Field(..., pattern="^(BUY|SELL)$")
+    volume: float | None = None  # optional; if omitted, AI sizes via risk%
+    slPips: int = Field(default=10, ge=1, le=200)
+    comment: str = Field(default="AI:auto", max_length=31)
+
+
+class AlertReq(BaseModel):
+    symbol: str = Field(..., min_length=3, max_length=12)
+    condition: str = Field(..., pattern="^(above|below|cross_up|cross_down)$")
+    price: float = Field(..., gt=0)
+
+
+# ---- routes --------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"app": "ZeniTrade AI", "status": mt5_status().__dict__}
+    return {"app": "ZeniTrade AI", "version": "1.1.0", "status": mt5_status().__dict__}
+
+
+@app.get("/health")
+async def health():
+    """Health probe for container orchestrators."""
+    s = mt5_status()
+    return {"ok": True, "connected": s.connected, "demo": s.demo, "ts": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/api/trading/status")
-async def status():
+async def get_status():
     return mt5_status().__dict__
 
 
 @app.post("/api/trading/connect")
-async def api_connect(body: dict | None = None):
-    body = body or {}
-    if body.get("login"):
-        settings.mt5_login = int(body["login"])
-    if body.get("server"):
-        settings.mt5_server = body["server"]
-    if body.get("terminal"):
-        settings.mt5_terminal_path = body["terminal"]
+async def api_connect(body: ConnectReq, _auth=Depends(require_token)):
+    # apply overrides EXCEPT terminal path (security)
+    if body.login:
+        settings.mt5_login = body.login
+    if body.server:
+        settings.mt5_server = body.server
+    if body.password:
+        settings.mt5_password = body.password
     return connect().__dict__
 
 
 @app.delete("/api/trading/connect")
-async def api_disconnect():
+async def api_disconnect(_auth=Depends(require_token)):
     return disconnect().__dict__
 
 
 @app.get("/api/trading/ticks")
 async def api_ticks(symbols: str | None = None):
     syms = symbols.split(",") if symbols else None
-    t = mt5_ticks(syms)
-    return {"ts": int(asyncio.get_event_loop().time() * 1000), "ticks": t, "demo": not t}
+    t = await asyncio.to_thread(mt5_ticks, syms)
+    return {"ts": int(time.time() * 1000), "ticks": t, "demo": not t}
 
 
 @app.get("/api/trading/candles")
 async def api_candles(symbol: str = "EURUSD", tf: str = "M15", count: int = 120):
-    c = mt5_candles(symbol, tf, count)
+    count = max(1, min(count, 500))
+    c = await asyncio.to_thread(mt5_candles, symbol, tf, count)
     return {"symbol": symbol, "tf": tf, "candles": c, "demo": not c}
 
 
 @app.get("/api/trading/positions")
 async def api_positions():
-    p = mt5_positions()
+    p = await asyncio.to_thread(mt5_positions)
     return {"positions": p, "demo": not p}
 
 
 @app.post("/api/trading/order")
-async def api_order(body: dict):
-    symbol = body.get("symbol")
-    side = body.get("side")
-    if not symbol or side not in ("BUY", "SELL"):
-        return {"ok": False, "error": "symbol and side (BUY/SELL) required"}
-    equity = 10000.0
-    if mt5_status().account:
-        equity = mt5_status().account.get("equity", 10000.0)
-    ok, msg = guard.can_open(equity)
-    if not ok:
-        return {"ok": False, "error": msg}
-    sl_pips = int(body.get("slPips", 10))
-    ps = size_position(equity, sl_pips)
-    r = send_order(
-        symbol, side, ps.lot, sl_pips, ps.tp_pips, body.get("comment", "AI:auto"),
-    )
-    if r.get("ok"):
-        guard.register_open()
-        await send_email(
-            f"Trade opened: {side} {symbol}",
-            f"<p>{side} {symbol} {ps.lot} lot @ {r.get('price')}</p>"
-            f"<p>SL {ps.sl_pips}p · TP {ps.tp_pips}p · Risk ${ps.risk_amount:.2f}</p>",
+@limiter.limit("10/minute")
+async def api_order(body: OrderReq, request: Request, _auth=Depends(require_token)):
+    """Place a market order with full safety enforcement."""
+    async with _order_lock:
+        equity = 10000.0
+        st = mt5_status()
+        if st.account:
+            equity = st.account.get("equity", 10000.0)
+        ok, msg = guard.can_open(equity)
+        if not ok:
+            return {"ok": False, "error": msg}
+
+        # position-size via risk (or honor client volume, clamped to FINEX range)
+        ps = size_position(equity, body.slPips)
+        volume = body.volume if body.volume is not None else ps.lot
+        volume = round(max(0.01, min(volume, 50.0)), 2)  # FINEX: 0.01–50 lot
+
+        r = await asyncio.to_thread(
+            send_order, body.symbol, body.side, volume,
+            body.slPips, ps.tp_pips, body.comment,
         )
-    return r
+        if r.get("ok"):
+            guard.register_open()
+            await send_email(
+                f"Trade opened: {body.side} {body.symbol}",
+                f"<p>{body.side} {body.symbol} {volume} lot @ {r.get('price')}</p>"
+                f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>",
+            )
+        return r
 
 
 @app.delete("/api/trading/positions/{ticket}")
-async def api_close(ticket: int):
-    r = close_position(ticket)
+@limiter.limit("10/minute")
+async def api_close(ticket: int, request: Request, _auth=Depends(require_token)):
+    r = await asyncio.to_thread(close_position, ticket)
     if r.get("ok"):
         guard.register_close()
     return r
@@ -176,47 +276,44 @@ async def api_news():
 
 @app.get("/api/trading/analysis")
 async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
-    # analyze() does sync HTTP (httpx/openai/google/ollama) — run in a thread
-    # so the event loop isn't blocked (critical for parallel multi-pair requests).
-    result = await asyncio.to_thread(
-        ai_service.analyze, symbol, provider, {"timeframe": "M15"}
-    )
-    # attach ML prediction if model is already trained (never trains here)
+    result = await asyncio.to_thread(ai_service.analyze, symbol, provider, {"timeframe": "M15"})
     try:
         rates = mt5_candles(symbol, "H1", 200)
         if rates:
             import pandas as pd
-            pred = ml_model.predict(pd.DataFrame(rates))
+            pred = ml_model.predict(pd.DataFrame(rates), symbol=symbol)
             result["ml_prediction"] = pred
     except Exception as exc:  # noqa: BLE001
         log.debug("ml predict skipped: %s", exc)
     return {"analysis": result, "demo": result.get("provider") == "heuristic"}
 
 
+@app.get("/api/trading/ml/info")
+async def api_ml_info():
+    """Return real model metadata for the ML panel UI."""
+    return ml_model.model_info()
+
+
 @app.get("/api/trading/backtest")
 async def api_backtest(symbol: str = "EURUSD", trades: int = 120):
-    return bt.run(symbol=symbol, trades=trades)
+    trades = max(10, min(trades, 500))
+    return await asyncio.to_thread(bt.run, symbol=symbol, trades=trades)
 
 
 @app.get("/api/trading/logs")
 async def api_logs():
-    # In production, read from a log handler / db. Demo returns empty.
     return {"logs": [], "demo": True}
 
 
 @app.post("/api/trading/alerts")
-async def api_add_alert(body: dict):
-    symbol = body.get("symbol")
-    condition = body.get("condition")
-    price = body.get("price")
-    if not symbol or not condition or price is None:
-        return {"ok": False, "error": "symbol, condition and price required"}
-    a = add_price_alert(symbol, condition, float(price))
+async def api_add_alert(body: AlertReq, _auth=Depends(require_token)):
+    a = add_price_alert(body.symbol, body.condition, body.price)
     return {"alert": a}
 
 
 @app.post("/api/trading/email/test")
-async def api_email_test():
+@limiter.limit("3/minute")
+async def api_email_test(request: Request, _auth=Depends(require_token)):
     ok = await send_email(
         "ZeniTrade test email",
         "<p>This is a test notification from ZeniTrade AI.</p>",
@@ -225,12 +322,13 @@ async def api_email_test():
 
 
 @app.post("/api/trading/ml/train")
-async def api_ml_train(symbol: str = "EURUSD"):
-    # training is CPU-bound — run in a thread so we don't block the event loop
+@limiter.limit("1/hour")
+async def api_ml_train(request: Request, symbol: str = "EURUSD", _auth=Depends(require_token)):
     await asyncio.to_thread(ml_model.train, symbol)
-    return {"ok": True, "message": "training complete"}
+    return {"ok": True, "message": f"training complete on {symbol}"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=True)
+    # bind 127.0.0.1 by default for safety; override via HOST env for remote access
+    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=False)

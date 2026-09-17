@@ -20,7 +20,7 @@ import {
   fmtPrice,
   TRADING_PAIRS,
 } from "@/lib/trading-data";
-import { useMultiAnalysis } from "@/lib/trading-hooks";
+import { useMultiAnalysis, useMLInfo } from "@/lib/trading-hooks";
 import { useTradingStore, useActiveProvider } from "@/lib/trading-store";
 import { BadgeTone, SectionHeader, StatTile } from "./primitives";
 
@@ -37,6 +37,7 @@ export function AIEngineView() {
   }, [symbols, focus]);
 
   const { data, isFetching, refetch } = useMultiAnalysis(symbols, active.id);
+  const ml = useMLInfo();
   const results = data?.results ?? {};
   const a = results[focus];
 
@@ -171,9 +172,8 @@ export function AIEngineView() {
                     );
                     const d = await res.json();
                     if (d.ok) {
-                      toast.success(
-                        d.message ?? `Model retrained on ${focus}`
-                      );
+                      toast.success(d.message ?? `Model retrained on ${focus}`);
+                      ml.refetch(); // refresh real model metrics
                     } else {
                       toast.error("Retrain failed");
                     }
@@ -192,16 +192,44 @@ export function AIEngineView() {
             }
           />
           <div className="grid grid-cols-2 gap-2">
-            <StatTile label="Model Version" value="v2.4.1" sub="online" />
-            <StatTile label="Training Trades" value="12,480" sub="last 90d" />
-            <StatTile label="Win Rate (val)" value="61.3%" tone="up" />
-            <StatTile label="Retrained" value="2h ago" sub="auto-scheduled" tone="warn" />
+            <StatTile
+              label="Model Version"
+              value={ml.data?.exists ? ml.data.version : "—"}
+              sub={ml.data?.exists ? "online" : "not trained"}
+              tone={ml.data?.exists ? "up" : "warn"}
+            />
+            <StatTile
+              label="Samples"
+              value={ml.data?.n_samples ? ml.data.n_samples.toLocaleString() : "—"}
+              sub={ml.data?.symbol ? `trained on ${ml.data.symbol}` : "no model"}
+            />
+            <StatTile
+              label="Test Accuracy"
+              value={ml.data?.test_acc != null ? `${(ml.data.test_acc * 100).toFixed(1)}%` : "—"}
+              sub={ml.data?.train_acc != null ? `train ${(ml.data.train_acc * 100).toFixed(1)}%` : ""}
+              tone={ml.data?.test_acc != null && ml.data.test_acc > 0.55 ? "up" : "warn"}
+            />
+            <StatTile
+              label="Retrained"
+              value={
+                ml.data?.trained_at
+                  ? new Date(ml.data.trained_at).toLocaleString("en-GB", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      day: "2-digit",
+                      month: "short",
+                    })
+                  : "—"
+              }
+              sub={ml.data?.demo ? "demo" : "auto-scheduled"}
+              tone="warn"
+            />
           </div>
           <Separator className="my-2" />
           <div className="text-[11px] text-muted-foreground">
-            The model retrains nightly on closed-trade outcomes and recent market
-            regimes. Prediction drift &gt; 8% triggers an early retrain. Click
-            Retrain to manually retrain on the focused pair.
+            Model retrains nightly at 02:00 (auto-scheduled) or on demand
+            via Retrain. Train/test split: 80/20 chronological. The model is
+            symbol-specific — retrain for each pair you trade.
           </div>
         </Card>
       </div>

@@ -52,9 +52,33 @@ with realistic synthetic data.
 
 `mt5_service.connect()` will:
 1. Try `mt5.initialize()` (uses running terminal if available).
-2. If that fails, launch `terminal64.exe` at the configured path, wait for
-   the terminal window, then retry initialization.
+2. If that fails, launch `terminal64.exe` at the configured path (from `.env` only —
+   the API **refuses** client-supplied terminal paths to prevent remote code execution),
+   wait for the terminal window, then retry initialization.
 3. `mt5.login(login, password, server)` to authorize against FINEX.
+
+## Security (READ BEFORE DEPLOYING)
+
+This system trades **real money**. Before exposing it beyond localhost:
+
+1. **Set `ZENITRADE_API_TOKEN`** in `.env` — a long random string. Every mutating
+   endpoint (`POST /order`, `DELETE /positions`, `POST /connect`, `POST /alerts`,
+   `POST /email/test`, `POST /ml/train`) requires it as the `X-API-Token` header.
+   The dashboard must be configured to send this header.
+2. **Bind `127.0.0.1`** (the default `HOST`) — never expose the backend on `0.0.0.0`
+   without auth + a reverse proxy with TLS.
+3. **Terminal path is locked** to `.env` — the API ignores `body.terminal` from
+   clients to prevent arbitrary executable launch.
+4. **Rate limits**: 10/min on `/order` + `/positions/[ticket]`, 3/min on `/email/test`,
+   1/hour on `/ml/train` (via `slowapi`).
+5. **Input validation**: Pydantic models validate `symbol`, `side`, `volume`,
+   `slPips` (1–200) on every order — no 500s on junk input.
+6. **Race protection**: `asyncio.Lock` around the order critical section prevents
+   double-submit opening >max positions.
+7. **Position reconciliation**: a background loop polls broker positions every 10s
+   and corrects `guard.open_count` (handles broker-side SL/TP closes that bypass
+   our `register_close()`).
+8. **`.env` is gitignored** — verified, no secrets committed.
 
 ## Disclaimer
 

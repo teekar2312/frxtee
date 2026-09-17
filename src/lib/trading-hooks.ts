@@ -115,3 +115,23 @@ export function useBacktest(symbol: string, trades = 120) {
     staleTime: 60_000,
   });
 }
+
+export interface MLModelInfo {
+  exists: boolean;
+  version: string;
+  train_acc: number | null;
+  test_acc: number | null;
+  symbol: string | null;
+  trained_at: string | null;
+  n_samples: number | null;
+  demo?: boolean;
+}
+
+export function useMLInfo() {
+  return useQuery<MLModelInfo>({
+    queryKey: ["ml-info"],
+    queryFn: () => j("/api/trading/ml/info"),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+}

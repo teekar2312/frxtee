@@ -30,3 +30,4 @@ aiosmtplib==3.0.2       # async email
 
 # Utils
 APScheduler==3.10.4     # scheduled retrain / news polling
+slowapi==0.1.9          # rate limiting (order/email/ml-train endpoints)

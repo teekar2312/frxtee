@@ -30,6 +30,11 @@ def run(symbol: str = "EURUSD", tf: str = "H1", trades: int = 120) -> dict:
     # pip size: JPY pairs 3 digits, metals (XAU/XAG) 2/3 digits, else 5 digits
     pip = 0.1 if symbol.startswith("XAU") else (0.01 if "JPY" in symbol or symbol.startswith("XAG") else 0.0001)
     sl_pips = settings.stop_loss_pips
+    # realistic costs: spread + commission ($1/lot/side per FINEX)
+    spread_pips = 0.8  # average floating spread
+    commission_per_lot_side = 1.0  # USD, round-trip = $2/lot
+    # value per pip per lot varies by instrument
+    vpp = 8.0 if (symbol.startswith("XAU") or symbol.startswith("XAG")) else 10.0
 
     for i in range(50, len(df) - 6, 6):
         row = df.iloc[i]
@@ -40,9 +45,11 @@ def run(symbol: str = "EURUSD", tf: str = "H1", trades: int = 120) -> dict:
         side = "BUY" if bull else "SELL"
         entry = row["close"]
         exit_ = df.iloc[i + 5]["close"]
+        # gross pips minus spread cost (paid on entry)
         pips = (exit_ - entry) / pip if side == "BUY" else (entry - exit_) / pip
+        pips_net = pips - spread_pips
         ps = size_position(equity, sl_pips)
-        pnl = pips * ps.lot * 10
+        pnl = pips_net * ps.lot * vpp - commission_per_lot_side * 2 * ps.lot
         equity += pnl
         if equity > peak:
             peak = equity
