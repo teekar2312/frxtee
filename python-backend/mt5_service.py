@@ -378,7 +378,8 @@ def _retcode_msg(retcode: int) -> str:
 
 
 def send_order(symbol: str, side: str, volume: float, sl_pips: float,
-               tp_pips: float, comment: str = "AI:auto") -> dict:
+               tp_pips: float, comment: str = "AI:auto",
+               max_spread_pips: float = 5.0) -> dict:
     if not _ensure_connected():
         return {"ok": False, "error": "MT5 not connected"}
     info = _get_symbol_info(symbol)  # cached
@@ -386,6 +387,10 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
         return {"ok": False, "error": f"symbol {symbol} not found"}
     tick = mt5.symbol_info_tick(symbol)  # type: ignore
     pip = _pip_for_digits(info.digits)
+    # spread filter — refuse if spread too wide (news spike protection)
+    spread_pips = (tick.ask - tick.bid) / pip
+    if max_spread_pips > 0 and spread_pips > max_spread_pips:
+        return {"ok": False, "error": f"Spread too wide ({spread_pips:.1f}p > {max_spread_pips}p) — likely news volatility"}
     price = tick.ask if side == "BUY" else tick.bid
     sl = price - sl_pips * pip if side == "BUY" else price + sl_pips * pip
     tp = price + tp_pips * pip if side == "BUY" else price - tp_pips * pip
@@ -454,3 +459,89 @@ def close_position(ticket: int) -> dict:
         "ok": True, "retcode": r.retcode, "price": close_price,
         "pnl": float(pnl), "pips": float(pips), "volume": p.volume,
     }
+
+
+def modify_sl_tp(ticket: int, sl: float | None = None, tp: float | None = None) -> dict:
+    """Modify SL/TP of an open position (for trailing stop / break-even).
+
+    Only modifies fields that are not None. Returns ok=True on success.
+    """
+    if not _ensure_connected():
+        return {"ok": False, "error": "MT5 not connected"}
+    pos = mt5.positions_get(ticket=ticket)  # type: ignore
+    if not pos:
+        return {"ok": False, "error": "position not found"}
+    p = pos[0]
+    info = _get_symbol_info(p.symbol)  # type: ignore
+    if not info:
+        return {"ok": False, "error": "symbol info not found"}
+
+    # keep existing SL/TP if not overriding
+    new_sl = sl if sl is not None else p.sl
+    new_tp = tp if tp is not None else p.tp
+    # round to symbol digits
+    if new_sl:
+        new_sl = round(new_sl, info.digits)
+    if new_tp:
+        new_tp = round(new_tp, info.digits)
+
+    req = {
+        "action": mt5.TRADE_ACTION_SLTP,  # type: ignore
+        "symbol": p.symbol,
+        "position": ticket,
+        "sl": new_sl,
+        "tp": new_tp,
+    }
+    r = mt5.order_send(req)  # type: ignore
+    if r is None:
+        return {"ok": False, "error": "order_send returned None"}
+    if r.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
+        return {"ok": False, "error": _retcode_msg(r.retcode), "retcode": r.retcode}
+    log.info("SL/TP modified: ticket=%s sl=%s tp=%s", ticket, new_sl, new_tp)
+    return {"ok": True, "ticket": ticket, "sl": new_sl, "tp": new_tp}
+
+
+def partial_close(ticket: int, volume: float) -> dict:
+    """Partially close a position (scale-out). Closes `volume` lots.
+
+    Returns ok=True with realized pnl proportional to closed volume.
+    """
+    if not _ensure_connected():
+        return {"ok": False, "error": "MT5 not connected"}
+    pos = mt5.positions_get(ticket=ticket)  # type: ignore
+    if not pos:
+        return {"ok": False, "error": "position not found"}
+    p = pos[0]
+    if volume >= p.volume:
+        # full close — delegate to close_position
+        return close_position(ticket)
+    info = _get_symbol_info(p.symbol)  # type: ignore
+    if not info:
+        return {"ok": False, "error": "symbol info not found"}
+    tick = mt5.symbol_info_tick(p.symbol)  # type: ignore
+    side = "SELL" if p.type == 0 else "BUY"
+    close_price = tick.bid if side == "SELL" else tick.ask
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
+        "symbol": p.symbol, "volume": volume,
+        "type": mt5.ORDER_TYPE_SELL if side == "SELL" else mt5.ORDER_TYPE_BUY,  # type: ignore
+        "position": ticket,
+        "price": close_price,
+        "deviation": 20, "magic": 99001, "comment": "partial_close",
+        "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
+        "type_filling": _filling_mode(info),
+    }
+    r = mt5.order_send(req)  # type: ignore
+    if r is None:
+        return {"ok": False, "error": "order_send returned None"}
+    if r.retcode != mt5.TRADE_RETCODE_DONE:  # type: ignore
+        return {"ok": False, "error": _retcode_msg(r.retcode), "retcode": r.retcode}
+    pip = _pip_for_digits(info.digits)
+    pips = ((close_price - p.price_open) / pip if side == "SELL"
+            else (p.price_open - close_price) / pip)
+    # proportional P&L for partial volume
+    pnl_ratio = volume / p.volume
+    pnl = float(getattr(p, "profit", 0.0) or 0.0) * pnl_ratio
+    log.info("partial close: ticket=%s vol=%s pnl=%.2f", ticket, volume, pnl)
+    return {"ok": True, "price": close_price, "pnl": pnl, "pips": float(pips),
+            "volume_closed": volume, "remaining": p.volume - volume}

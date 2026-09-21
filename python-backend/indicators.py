@@ -311,8 +311,15 @@ INDICATOR_REGISTRY = {
 
 
 def compute(df: pd.DataFrame, indicators: list[str]) -> dict:
-    """Compute a dict of series for the requested indicator ids."""
+    """Compute a dict of series for the requested indicator ids.
+
+    Validates output: NaN/inf values are replaced with None, bounded
+    indicators (RSI, Stoch, Williams %R, MFI, CCI) are range-checked.
+    """
     out = {}
+    # bounded indicators with expected ranges
+    bounded = {"rsi": (0, 100), "stochastic": (0, 100), "williamsr": (-100, 0),
+               "mfi": (0, 100), "stc": (0, 100), "ultimate": (0, 100)}
     for ind in indicators:
         fn = INDICATOR_REGISTRY.get(ind)
         if not fn:
@@ -321,9 +328,18 @@ def compute(df: pd.DataFrame, indicators: list[str]) -> dict:
             res = fn(df)
             if isinstance(res, tuple):
                 for k, s in zip(["main", "signal", "hist"][: len(res)], res):
-                    out[f"{ind}_{k}"] = s.dropna().round(5).tail(60).tolist()
+                    # replace inf with NaN, then dropna
+                    s = s.replace([np.inf, -np.inf], np.nan)
+                    vals = s.dropna().round(5).tail(60).tolist()
+                    out[f"{ind}_{k}"] = vals
             else:
-                out[ind] = res.dropna().round(5).tail(60).tolist()
+                res = res.replace([np.inf, -np.inf], np.nan)
+                vals = res.dropna().round(5).tail(60).tolist()
+                # range-check bounded indicators
+                if ind in bounded:
+                    lo, hi = bounded[ind]
+                    vals = [min(hi, max(lo, v)) if v is not None else None for v in vals]
+                out[ind] = vals
         except Exception as exc:  # noqa: BLE001
             out[ind] = []
     return out

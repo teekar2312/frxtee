@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     db_path: str = "zenitrade.db"
     sentry_dsn: str = ""  # empty = disabled
 
+    # Auto-trade engine
+    auto_trade_mode: bool = False
+    auto_trade_symbols: str = "EURUSD,GBPUSD"  # comma-separated
+    auto_trade_min_confidence: int = 75
+    ai_provider: str = "zai"
+
     @property
     def cors_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

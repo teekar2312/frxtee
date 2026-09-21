@@ -428,6 +428,13 @@ export function AIEngineView() {
                 disabled={store.autoTradeMode || executing}
                 onClick={async () => {
                   if (!a) return;
+                  // confidence threshold — refuse low-confidence signals
+                  if (a.confidence < 60) {
+                    toast.error(
+                      `Confidence too low (${a.confidence}% < 60%) — signal rejected`
+                    );
+                    return;
+                  }
                   const side = a.signal.includes("SELL") ? "SELL" : "BUY";
                   // only execute directional signals
                   if (a.signal === "NEUTRAL") {

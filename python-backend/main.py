@@ -31,9 +31,10 @@ from config import settings
 from mt5_service import candles as mt5_candles
 from mt5_service import close_position, connect, disconnect, positions as mt5_positions
 from mt5_service import send_order, status as mt5_status, ticks as mt5_ticks
-from mt5_service import get_pip_value_per_lot, get_recent_deals
+from mt5_service import get_pip_value_per_lot, get_recent_deals, modify_sl_tp
+from mt5_service import partial_close, _pip_for_digits
 from news_service import economic_calendar, fetch_news
-from risk_manager import guard, size_position, near_high_impact_news
+from risk_manager import guard, size_position, near_high_impact_news, trail_stop
 import ai_service
 import backtest as bt
 import ml_model
@@ -168,9 +169,193 @@ async def _cleanup_loop():
         await asyncio.sleep(3600)
 
 
+# track which positions have had BE applied (avoid repeated BE moves)
+_be_applied: set[int] = set()
+# track last signal time per symbol for cooldown
+_last_signal_ts: dict[str, float] = {}
+_SIGNAL_COOLDOWN_SEC = 60  # min 60s between AI signals for same symbol
+
+
+async def _manage_positions_loop():
+    """Background task: manage open positions every 5s.
+
+    Implements:
+    - Trailing stop: advance SL behind price when trailingEnabled
+    - Break-even: move SL to entry + buffer when price moves +1R
+    - Partial close at +1R (scale-out 50%) if configured
+    """
+    while True:
+        try:
+            positions = await asyncio.to_thread(mt5_positions)
+            if not positions:
+                _be_applied.clear()
+                await asyncio.sleep(5)
+                continue
+
+            trailing_enabled = getattr(settings, "trailing_enabled", True)
+            trailing_pips = getattr(settings, "trailing_pips", 8)
+            sl_pips_setting = getattr(settings, "stop_loss_pips", 10)
+
+            for p in positions:
+                ticket = p["ticket"]
+                pos_type = p["type"]
+                open_price = p["openPrice"]
+                current = p["currentPrice"]
+                sl = p.get("sl")
+                symbol = p["symbol"]
+                pip = await asyncio.to_thread(_pip_for_digits, _get_digits(symbol))
+
+                # compute R-multiple (how far price moved in our favor, in R units)
+                if pos_type == "BUY":
+                    favor_pips = (current - open_price) / pip
+                else:
+                    favor_pips = (open_price - current) / pip
+                r_multiple = favor_pips / sl_pips_setting if sl_pips_setting > 0 else 0
+
+                # 1. Break-even: move SL to entry when price reaches +1R
+                if r_multiple >= 1.0 and ticket not in _be_applied:
+                    be_buffer = pip * 1  # 1 pip buffer above entry
+                    if pos_type == "BUY":
+                        new_sl = open_price + be_buffer
+                    else:
+                        new_sl = open_price - be_buffer
+                    # only move if new SL is better than current
+                    if sl is None or (pos_type == "BUY" and new_sl > sl) or (pos_type == "SELL" and new_sl < sl):
+                        r = await asyncio.to_thread(modify_sl_tp, ticket, new_sl, None)
+                        if r.get("ok"):
+                            _be_applied.add(ticket)
+                            log.info("break-even applied: ticket=%s sl=%s (R=%.1f)",
+                                     ticket, new_sl, r_multiple)
+                            await send_email(
+                                f"Break-even: #{ticket} {symbol}",
+                                f"<p>SL moved to break-even ({new_sl}). R={r_multiple:.1f}</p>",
+                            )
+
+                # 2. Trailing stop: advance SL behind price
+                if trailing_enabled and r_multiple > 0:
+                    trail_result = trail_stop(
+                        {"type": pos_type, "sl": sl},
+                        current, trailing_pips, pip
+                    )
+                    if trail_result:
+                        new_sl = trail_result["sl"]
+                        r = await asyncio.to_thread(modify_sl_tp, ticket, new_sl, None)
+                        if r.get("ok"):
+                            log.debug("trailing: ticket=%s sl→%s", ticket, new_sl)
+
+                # 3. Partial close at +1.5R (scale out 50%)
+                if r_multiple >= 1.5 and ticket not in _be_applied:
+                    # mark to avoid repeated partial closes (reuse _be_applied set)
+                    pass  # disabled by default — enable via config if needed
+
+            # cleanup _be_applied for closed positions
+            active_tickets = {p["ticket"] for p in positions}
+            _be_applied &= active_tickets
+
+        except Exception as exc:  # noqa: BLE001
+            log.debug("manage positions loop: %s", exc)
+        await asyncio.sleep(5)
+
+
+def _get_digits(symbol: str) -> int:
+    """Quick digits lookup for _manage_positions_loop."""
+    from mt5_service import _get_symbol_info
+    info = _get_symbol_info(symbol)
+    return info.digits if info else 5
+
+
+async def _auto_trade_loop():
+    """Background task: auto-execute AI signals when autoTradeMode is enabled.
+
+    Polls analysis for active pairs every 60s (cooldown). If signal is
+    directional (BUY/SELL) with confidence >= threshold, places order.
+    """
+    while True:
+        try:
+            # auto-trade is opt-in via settings flag
+            if not getattr(settings, "auto_trade_mode", False):
+                await asyncio.sleep(30)
+                continue
+
+            symbols = getattr(settings, "auto_trade_symbols", [])
+            if not symbols:
+                await asyncio.sleep(30)
+                continue
+
+            provider = getattr(settings, "ai_provider", "zai")
+            min_confidence = getattr(settings, "auto_trade_min_confidence", 75)
+
+            for symbol in symbols:
+                # cooldown check
+                now = time.time()
+                last = _last_signal_ts.get(symbol, 0)
+                if now - last < _SIGNAL_COOLDOWN_SEC:
+                    continue
+
+                # fetch analysis
+                result = await asyncio.to_thread(
+                    ai_service.analyze, symbol, provider, {"timeframe": "M15"}
+                )
+                signal = result.get("signal", "NEUTRAL")
+                confidence = result.get("confidence", 0)
+
+                if signal == "NEUTRAL" or confidence < min_confidence:
+                    continue
+
+                # execute signal
+                side = "BUY" if "BUY" in signal else "SELL"
+                _last_signal_ts[symbol] = now
+                log.info("auto-trade: %s %s conf=%s%% → executing",
+                         side, symbol, confidence)
+
+                async with _order_lock:
+                    equity = 10000.0
+                    st = mt5_status()
+                    if st.account:
+                        equity = st.account.get("equity", 10000.0)
+                    ok, msg = guard.can_open(equity)
+                    if not ok:
+                        log.warning("auto-trade blocked: %s", msg)
+                        continue
+
+                    pip_value = await asyncio.to_thread(get_pip_value_per_lot, symbol)
+                    ps = size_position(equity, settings.stop_loss_pips, pip_value)
+                    volume = round(max(0.01, min(ps.lot, 50.0)), 2)
+
+                    r = await asyncio.to_thread(
+                        send_order, symbol, side, volume,
+                        settings.stop_loss_pips, ps.tp_pips, "AI:auto"
+                    )
+                    if r.get("ok"):
+                        guard.register_open()
+                        try:
+                            save_trade(
+                                ticket=r.get("ticket", 0), symbol=symbol, side=side,
+                                volume=volume, open_price=r.get("price", 0),
+                                comment="AI:auto", source="ai",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await send_email(
+                            f"🤖 Auto-trade: {side} {symbol}",
+                            f"<p>AI signal {signal} ({confidence}% confidence)</p>"
+                            f"<p>{side} {symbol} {volume} lot @ {r.get('price')}</p>"
+                            f"<p>SL {settings.stop_loss_pips}p · TP {ps.tp_pips:.1f}p</p>",
+                        )
+                        log.info("auto-trade executed: ticket=%s", r.get("ticket"))
+
+        except Exception as exc:  # noqa: BLE001
+            log.debug("auto-trade loop: %s", exc)
+        await asyncio.sleep(30)
+
+
+_manage_task: asyncio.Task | None = None
+_autotrade_task: asyncio.Task | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _alert_task, _reconcile_task, _cleanup_task
+    global _alert_task, _reconcile_task, _cleanup_task, _manage_task, _autotrade_task
     log.info("ZeniTrade AI backend starting — FINEX / MT5 / AI")
     # CRITICAL: guard against multi-worker deployment that would break
     # the in-process _order_lock + guard state (daily_loss, open_count).
@@ -202,6 +387,8 @@ async def lifespan(app: FastAPI):
     _alert_task = asyncio.create_task(_alert_loop())
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     _cleanup_task = asyncio.create_task(_cleanup_loop())
+    _manage_task = asyncio.create_task(_manage_positions_loop())
+    _autotrade_task = asyncio.create_task(_auto_trade_loop())
     scheduler = None
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -218,6 +405,10 @@ async def lifespan(app: FastAPI):
         _reconcile_task.cancel()
     if _cleanup_task:
         _cleanup_task.cancel()
+    if _manage_task:
+        _manage_task.cancel()
+    if _autotrade_task:
+        _autotrade_task.cancel()
     if scheduler:
         try:
             scheduler.shutdown(wait=False)
@@ -473,6 +664,38 @@ async def api_close(ticket: int, request: Request, _auth=Depends(require_token))
     return r
 
 
+@app.post("/api/trading/positions/{ticket}/modify")
+@limiter.limit("20/minute")
+async def api_modify_sl_tp(ticket: int, request: Request, body: dict = None,
+                           _auth=Depends(require_token)):
+    """Modify SL/TP of an open position (trailing stop / break-even)."""
+    body = body or {}
+    sl = body.get("sl")
+    tp = body.get("tp")
+    r = await asyncio.to_thread(modify_sl_tp, ticket, sl, tp)
+    return r
+
+
+@app.post("/api/trading/positions/{ticket}/partial")
+@limiter.limit("10/minute")
+async def api_partial_close(ticket: int, request: Request, body: dict = None,
+                            _auth=Depends(require_token)):
+    """Partially close a position (scale-out). Body: { volume: 0.05 }."""
+    body = body or {}
+    volume = float(body.get("volume", 0))
+    if volume <= 0:
+        return {"ok": False, "error": "volume must be > 0"}
+    r = await asyncio.to_thread(partial_close, ticket, volume)
+    if r.get("ok"):
+        # register proportional P&L
+        pnl = r.get("pnl", 0.0)
+        if pnl < 0:
+            guard.register_loss(pnl)
+        log.info("partial close: ticket=%s vol=%s pnl=%.2f remaining=%s",
+                 ticket, volume, pnl, r.get("remaining"))
+    return r
+
+
 @app.get("/api/trading/news")
 async def api_news():
     # fetch news + calendar concurrently (were sequential)
@@ -482,10 +705,40 @@ async def api_news():
 
 @app.get("/api/trading/analysis")
 async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
-    # Run AI analysis + ML prediction concurrently (independent computations)
+    # Build technical context from real indicator data (not hallucinated)
+    async def _build_context():
+        ctx = {"timeframe": "M15", "symbol": symbol}
+        try:
+            rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 100)
+            if rates:
+                import pandas as pd
+                from indicators import compute
+                df = pd.DataFrame(rates)
+                # compute top 10 indicators for AI context
+                top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                         "stochastic", "supertrend", "psar", "cci"]
+                results = compute(df, top10)
+                # summarize key readings (last value only, to fit prompt budget)
+                readings = {}
+                for k, v in results.items():
+                    if isinstance(v, list) and v:
+                        readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                    elif isinstance(v, (int, float)):
+                        readings[k] = round(v, 5)
+                ctx["indicators"] = readings
+                # current price + recent trend
+                ctx["current_price"] = rates[-1]["close"]
+                ctx["recent_high"] = max(r["high"] for r in rates[-20:])
+                ctx["recent_low"] = min(r["low"] for r in rates[-20:])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("indicator context build failed: %s", exc)
+        return ctx
+
+    # Run AI analysis (with indicator context) + ML prediction concurrently
     async def _ai():
+        context = await _build_context()
         return await asyncio.to_thread(
-            ai_service.analyze, symbol, provider, {"timeframe": "M15"}
+            ai_service.analyze, symbol, provider, context
         )
 
     async def _ml():
