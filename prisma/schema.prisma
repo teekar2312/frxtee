@@ -1,8 +1,8 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+// ZeniTrade AI — Prisma schema
+// The Python backend uses its own SQLite DB (db.py) for trades/alerts/logs/risk.
+// This Prisma schema is reserved for future dashboard-side features (user
+// accounts, saved layouts) if needed. The DATABASE_URL env must point to a
+// writable SQLite file for Prisma Client to initialize without error.
 
 generator client {
   provider = "prisma-client-js"
@@ -13,20 +13,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-model Post {
-  id        String   @id @default(cuid())
-  title     String
-  content   String?
-  published Boolean  @default(false)
-  authorId  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
+// Reserved for future dashboard-side features (auth, saved layouts).
+// Currently no models are needed — all trading data lives in the Python
+// backend's SQLite DB (zenitrade.db) managed by db.py.

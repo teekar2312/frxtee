@@ -3107,3 +3107,45 @@ Stage Summary:
 - All deferred MEDIUM items from optimization audits now implemented
 - System is complete: all CRITICAL/HIGH/MEDIUM findings from 8 audit rounds
   are implemented and verified
+
+---
+Task ID: F (Cleanup + production finalization)
+Agent: Z.ai Code (main)
+Task: Clean up basis kode and prepare for production
+
+Work Log:
+Cleanup:
+- Removed 48 orphan screenshot files (*.png in root — all from audit/verification rounds)
+- Removed stale directories: examples/ (websocket demo), tests/ (build scripts), download/ (README stub)
+- Removed stub route src/app/api/trading/account/ (never implemented)
+- Removed dead useAnalysis hook (replaced by useMultiAnalysis + batch endpoint)
+- Removed unused _DRIFT_WINDOW constant in ml_model.py (deque maxlen replaces it)
+- Cleaned Prisma schema — removed default User/Post boilerplate models (unused;
+  Python backend has its own SQLite via db.py). Schema is now minimal + documented.
+
+Production readiness:
+- .gitignore: added entries for python-backend/__pycache__/, *.pyc, zenitrade.db,
+  models/, data/, .venv/, *.db, *.db-wal, screenshots. Whitelisted .env.example
+  + config.example.env via negation patterns.
+- Created .env.example for Next.js dashboard (TRADING_BACKEND_URL, ZENITRADE_API_TOKEN,
+  DATABASE_URL, LOG_FORMAT, SENTRY_DSN) — documented + production-ready.
+- python-backend/config.example.env already complete (MT5, news APIs, AI providers,
+  SMTP, security token, DB path, Sentry DSN).
+- LOG_FORMAT=json env activates structured JSON logging for ELK/Loki/CloudWatch.
+- Production entry point (main.py __main__) uses reload=False (was dev flag).
+- Dockerfile + docker-compose.yml already production-ready (healthcheck, volumes,
+  env passthrough, service dependency).
+
+Verification:
+- All 11 Python files pass ast.parse
+- Frontend ESLint clean (0 errors, 0 warnings)
+- Dashboard smoke test (Agent Browser + VLM): renders correctly — stat tiles,
+  chart, positions, ticker tape, AI signal widget all present. No broken areas.
+- File structure clean: 0 orphan pngs, 0 stale dirs, 13 API routes, 11 Python files
+
+Stage Summary:
+- Codebase cleaned of all demo artifacts, dead code, and stale files
+- .gitignore production-complete (Python artifacts, DB, screenshots, env)
+- .env.example + config.example.env document all required vars
+- Prisma schema cleaned (no unused boilerplate models)
+- System is production-ready: clean, documented, Docker-deployable

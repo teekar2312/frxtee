@@ -209,7 +209,6 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
 
 # ---- drift detection -----------------------------------------------------
 _RECENT_PREDICTIONS: deque = deque(maxlen=50)  # O(1) append/pop, bounded
-_DRIFT_WINDOW = 50
 _DRIFT_THRESHOLD = 0.08  # 8% confidence drop triggers retrain
 
 

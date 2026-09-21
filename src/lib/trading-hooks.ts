@@ -65,15 +65,6 @@ export function useLogs() {
   });
 }
 
-export function useAnalysis(symbol: string, provider: string) {
-  return useQuery<{ analysis: AIAnalysisResult }>({
-    queryKey: ["analysis", symbol, provider],
-    queryFn: () =>
-      j(`/api/trading/analysis?symbol=${symbol}&provider=${provider}`),
-    staleTime: 60_000,
-  });
-}
-
 /** Analyze ALL active pairs via single batch endpoint (1 round-trip).
  * Falls back to parallel individual fetches if batch endpoint unavailable. */
 export function useMultiAnalysis(
