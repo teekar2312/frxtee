@@ -24,7 +24,8 @@ def _spawn(coro) -> None:
     task.add_done_callback(_pending_tasks.discard)
 
 
-async def send_email(subject: str, body: str) -> bool:
+async def send_email(subject: str, body: str, retries: int = 2) -> bool:
+    """Send email with retry. Non-blocking when called via _spawn."""
     if not settings.smtp_user or not settings.email_to:
         log.info("email skipped (not configured): %s", subject)
         return False
@@ -32,17 +33,30 @@ async def send_email(subject: str, body: str) -> bool:
     msg["From"] = settings.smtp_user
     msg["To"] = settings.email_to
     msg["Subject"] = subject
-    try:
-        await aiosmtplib.send(
-            msg, hostname=settings.smtp_host, port=settings.smtp_port,
-            username=settings.smtp_user, password=settings.smtp_password,
-            start_tls=True,
-        )
-        log.info("email sent: %s -> %s", subject, settings.email_to)
-        return True
-    except Exception as exc:
-        log.error("email failed: %s", exc)
-        return False
+    for attempt in range(retries + 1):
+        try:
+            await aiosmtplib.send(
+                msg, hostname=settings.smtp_host, port=settings.smtp_port,
+                username=settings.smtp_user, password=settings.smtp_password,
+                start_tls=settings.smtp_port != 465,  # implicit TLS on 465
+                use_tls=settings.smtp_port == 465,
+            )
+            log.info("email sent: %s -> %s", subject, settings.email_to)
+            return True
+        except Exception as exc:
+            if attempt < retries:
+                log.warning("email attempt %d failed: %s — retrying in 2s", attempt + 1, exc)
+                await asyncio.sleep(2)
+            else:
+                log.error("email failed after %d attempts: %s — %s", retries + 1, subject, exc)
+                return False
+    return False
+
+
+def notify_async(subject: str, body: str) -> None:
+    """Fire-and-forget email notification (non-blocking).
+    Use this in trading loops to avoid blocking on SMTP."""
+    _spawn(send_email(subject, body))
 
 
 def add_price_alert(symbol: str, condition: str, price: float) -> dict:

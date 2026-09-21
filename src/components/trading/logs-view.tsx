@@ -5,6 +5,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Download, ScrollText, Search, Terminal } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useLogs } from "@/lib/trading-hooks";
 import { BadgeTone, SectionHeader } from "./primitives";
@@ -45,7 +46,31 @@ export function LogsView() {
           desc="Real-time engine, MT5, news & trade logs"
           icon={Terminal}
           right={
-            <Button variant="outline" size="sm" className="h-7 text-xs">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => {
+                if (filtered.length === 0) {
+                  toast.error("No logs to export");
+                  return;
+                }
+                const csv = [
+                  ["timestamp", "level", "source", "message"].join(","),
+                  ...filtered.map((l) =>
+                    [l.ts, l.level, l.source, `"${l.message.replace(/"/g, '""')}"`].join(",")
+                  ),
+                ].join("\n");
+                const blob = new Blob([csv], { type: "text/csv" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `zenitrade-logs-${Date.now()}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+                toast.success(`Exported ${filtered.length} log entries`);
+              }}
+            >
               <Download className="h-3 w-3 mr-1" /> Export
             </Button>
           }

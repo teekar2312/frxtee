@@ -33,7 +33,7 @@ import {
   fmtPrice,
   TRADING_PAIRS,
 } from "@/lib/trading-data";
-import { usePositions, useTicks, useMultiAnalysis, useCandles, useStatus } from "@/lib/trading-hooks";
+import { usePositions, useTicks, useMultiAnalysis, useCandles, useStatus, useTrades } from "@/lib/trading-hooks";
 import { useTradingStore, useActiveProvider } from "@/lib/trading-store";
 import { CandleChart } from "./candle-chart";
 import { StatTile, BadgeTone, SectionHeader } from "./primitives";
@@ -52,6 +52,7 @@ export function DashboardView() {
   const { data: tickData } = useTicks(true);
   const { data: posData } = usePositions();
   const { data: statusData } = useStatus();
+  const { data: tradesData } = useTrades();
   const symbols = useTradingStore((s) => s.symbols);
   const timeframes = useTradingStore((s) => s.timeframes);
   const aiProvider = useActiveProvider();
@@ -69,7 +70,14 @@ export function DashboardView() {
   const positions = posData?.positions ?? [];
   const floatingPnl = positions.reduce((a, p) => a + p.profit, 0);
   // dayPnl = floating (unrealized) + realized from closed trades today
-  const dayPnl = floatingPnl;
+  const todayClosed = (tradesData?.trades ?? []).filter((t: any) => {
+    if (!t.close_time) return false;
+    const d = new Date(t.close_time);
+    const now = new Date();
+    return d.toDateString() === now.toDateString();
+  });
+  const realizedPnl = todayClosed.reduce((a: number, t: any) => a + (t.pnl || 0), 0);
+  const dayPnl = floatingPnl + realizedPnl;
 
   const mainSymbol = symbols[0] ?? "EURUSD";
   const mainTf = timeframes[0] ?? "M15";

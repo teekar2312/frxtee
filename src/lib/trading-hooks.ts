@@ -136,6 +136,15 @@ export interface MLModelInfo {
   demo?: boolean;
 }
 
+export function useTrades() {
+  return useQuery<{ trades: any[]; demo?: boolean }>({
+    queryKey: ["trades"],
+    queryFn: () => j("/api/trading/trades"),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
 export function useMLInfo() {
   return useQuery<MLModelInfo>({
     queryKey: ["ml-info"],

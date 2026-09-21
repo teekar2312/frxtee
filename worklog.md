@@ -4592,3 +4592,286 @@ Top 3 cross-cutting root causes:
    signal source. It's a marketing demo, not a validation tool.
 
 No code changes made. Findings handed off for implementation.
+
+
+---
+Task ID: D1
+Agent: Dashboard/Notif/Alerts/Reporting Auditor
+Task: Deep-audit Dashboard UX, Notifications, Price Alert engine, and Trade Reporting (23 specific concerns across 4 areas)
+
+Scope: Read worklog last 3 sections (N1 News/AI/Sentiment, S2 Session/Indicator/Execution, T1 Trailing/Backtest/ML) for context on ZeniTrade AI (Next.js dashboard + Python FastAPI + MT5). Read 9 target files: dashboard-view.tsx, alerts-view.tsx, logs-view.tsx, python-backend/notifier.py, main.py (alert/email/logs/news routes + _alert_loop/_manage_positions_loop/_auto_trade_loop/lifespan), db.py (trades/alerts/logs/risk_state/ml_models tables), src/lib/trading-hooks.ts, src/app/api/trading/email/test/route.ts, src/app/api/trading/alerts/route.ts. Cross-checked: trading-store.ts (emailEnabled/emailTo/dailyTarget/trailingEnabled state), trading-data.ts (PriceAlert/Position/LogEntry types), backend-proxy.ts (timeout default 1500ms), config.py (smtp_* defaults), risk_manager.py (guard.daily_loss/register_close), mt5_service.py (status()/account.equity), src/app/api/trading/status/route.ts (demo fallback), src/app/api/trading/logs/route.ts (DEMO_LOGS fallback), src/lib/demo-logs.ts. Verified via grep: get_trades imported in main.py:42 but 0 callers (dead code), no GET /alerts endpoint on either side, no notifications/audit_log table, no prev_bid tracking, no notification prefs table, no /api/trading/trades route, no trade-history view component, no CSV export handler. NO code changes made — audit only.
+
+==================================================================
+AREA 1: DASHBOARD COMPLETENITY (10 findings)
+==================================================================
+
+#1 — HIGH — Day P&L tile is floating-only; realized P&L from today's closed trades never summed
+  File: src/components/trading/dashboard-view.tsx:70-72
+    const floatingPnl = positions.reduce((a, p) => a + p.profit, 0);
+    // dayPnl = floating (unrealized) + realized from closed trades today
+    const dayPnl = floatingPnl;
+  Problem: Code comment explicitly admits the missing piece ("floating + realized") but the implementation stops at floatingPnl. Realized P&L from today's closed trades lives in the trades table (close_time, pnl columns populated by close_trade() at main.py:741 / _reconcile_loop at main.py:149), but there is NO /api/trading/trades endpoint and the trades table is never aggregated. Day P&L tile therefore under-reports the moment any trade closes today. A trader closing a +$200 trade sees Day P&L = $0 until the next open position moves.
+  Fix: Backend add `GET /api/trading/trades?since=today` calling db.get_trades filtered by close_time today. Frontend useQuery sums realized pnl into dayPnl. (Cross-ref #27.)
+
+#2 — MEDIUM — Equity tile double-counts floating P&L; "demo $10,000" fallback is silent
+  File: src/components/trading/dashboard-view.tsx:64-67, 94
+    const accountEquity = statusData?.account?.equity ?? 10000;
+    ...
+    <StatTile label="Equity" value={fmtMoney(equity + floatingPnl)} ... />
+  Problem: (a) MT5's info.equity ALREADY equals balance + floating P&L (verified mt5_service.py:186-187). The tile then adds `+ floatingPnl` again → overstates equity by the current floating P&L on every render. (b) When MT5 is disconnected (demo mode, the default at startup), account is null and equity silently falls back to $10000 with no "DEMO" badge — user can't tell real vs simulated capital.
+  Fix: Tile should show `equity` alone, not `equity + floatingPnl`. Add `demoMode && <Badge>DEMO</Badge>` overlay on the tile when statusData?.demo is true.
+
+#3 — HIGH — "Daily Risk" tile uses floatingPnl as proxy for daily loss; backend's authoritative daily_loss never exposed
+  File: src/components/trading/dashboard-view.tsx:116-121
+    value={`${((dayPnl < 0 ? Math.abs(dayPnl) : 0) / balance * 100).toFixed(2)}%`}
+  Problem: This tile is supposed to show "% of daily risk limit used" — the value the backend's `guard.can_open()` (risk_manager.py:96) actually uses to gate new entries. But: (a) dayPnl is floating-only (#1) — misses realized losses already incurred today. (b) When dayPnl>0 (small profit) but a previous trade lost $150 today, the tile shows "0.00%" even though the actual daily loss exposure is 1.5%. (c) Backend has `guard.daily_loss` (risk_manager.py:57) — the AUTHORITATIVE tracker — but it is NEVER exposed to the frontend. UI's daily risk % can disagree with backend's actual halt threshold → "why did my order get blocked?" confusion. The /metrics route (main.py:590) exposes daily_loss but no /status extension; frontend doesn't call /metrics.
+  Fix: Extend /api/trading/status to include `daily_loss`, `open_count`, `daily_risk_used_pct`. Frontend reads authoritative value; tile shows real `guard.daily_loss / equity * 100`.
+
+#4 — MEDIUM — "Daily Target" tile shows static config %, not progress toward target
+  File: src/components/trading/dashboard-view.tsx:110-115
+  Problem: Tile renders `fmtPct(dailyTarget)` (e.g. "2.00%") and the dollar equivalent (`$200 / day`). Never shows progress: how close is current Day P&L to the target? A trader wants "0.8% of 2.0% achieved (40%)" not the static config.
+  Fix: Sub-text should read `{fmtPct(dayPnl/balance*100)} of ${fmtPct(dailyTarget)} ({{pct_complete}}%)`. Add progress bar in StatTile.
+
+#5 — MEDIUM — "Risk/Reward" and "Max Drawdown" mini-tiles are hardcoded strings
+  File: src/components/trading/dashboard-view.tsx:263-266
+    <StatTile label="Risk/Reward" value="1 : 1.5" sub="configured" icon={Target} />
+    <StatTile label="Max Drawdown" value="-2.4%" sub="today" tone="down" />
+  Problem: RR "1 : 1.5" is a hardcoded string that happens to match settings.rr_ratio default 1.5, but it is NEVER fetched from backend (no field in /status). Max Drawdown "-2.4%" with sub "today" is a fake static number with no basis in actual equity history. Both tiles mislead.
+  Fix: Fetch rr_ratio via /status (add to settings echo). Compute real max drawdown from trade history / equity curve (#7). Render 0/blank while loading.
+
+#6 — MEDIUM — Quick "Risk OK" badge is hardcoded true; never reflects actual risk state
+  File: src/components/trading/dashboard-view.tsx:274-276
+    <Badge variant="secondary" className="text-[10px] gap-1">
+      <ShieldCheck className="h-3 w-3" /> Risk OK
+    </Badge>
+  Problem: Always renders "Risk OK" green. Never turns red/amber when daily risk limit is near breach (guard.can_open()=False), when margin level <60% (risk_manager.py:105), when weekend gap risk blocks entries (line 120-123), or when news blackout is active (main.py:670). Misleading during real risk events. (Note: the "Trailing ON/OFF" badge at line 277-286 and "N pairs · N TF" badge at line 287-289 DO bind to real store state — those are correct.)
+  Fix: Bind badge to a new /status field `risk_state: "ok" | "warning" | "halted"` populated from guard.can_open() + near_high_impact_news(). Show "Risk OK" / "Risk HIGH" / "HALTED (news)" / "HALTED (weekend)".
+
+#7 — HIGH — 48h Equity Curve is synthetic random walk (sin + Math.random); ignores real trade history
+  File: src/components/trading/dashboard-view.tsx:41-49, 77
+    function equityCurve() {
+      let v = 10000;
+      const out: { i: number; v: number }[] = [];
+      for (let i = 0; i < 48; i++) {
+        v += (Math.sin(i / 3) + (Math.random() - 0.45)) * 60;
+        out.push({ i, v: Math.round(v) });
+      }
+      return out;
+    }
+    const curve = React.useMemo(() => equityCurve(), []);
+  Problem: The `trades` table has all data needed (open_time, close_time, pnl) to reconstruct a real 48h equity timeline — but the equity curve is a fake sin+random walk with zero correlation to actual trading. Misleading to a trader evaluating their performance. The curve also never updates after mount (useMemo with [] deps) so even the synthetic data is static.
+  Fix: Backend add `GET /api/trading/equity-curve?hours=48` reconstructing from trades table (start balance + cumulative realized pnl, sampled hourly, interpolated with floating P&L at sample times). Frontend useQuery replaces the synthetic curve; refetch every 60s.
+
+#8 — LOW — Position table shows real broker positions with live P&L — VERIFIED OK
+  File: src/components/trading/dashboard-view.tsx:320-402 PositionsTable uses usePositions() (5s refetch).
+  No fix needed — works as designed (real broker data when MT5 connected, empty-state when not).
+
+#9 — LOW — AI Signal widget truncates dimensions to top 4 of 7
+  File: src/components/trading/dashboard-view.tsx:415 `const top = (a.dimensions ?? []).slice(0, 4);`
+  Problem: AnalysisMini shows only 4 of 7 dimensions. Real multi-pair analysis IS shown (useMultiAnalysis batch endpoint at trading-hooks.ts:70) and dimension bars ARE real (driven by analysis.dimensions.score). UX truncation, not a bug.
+  Fix: Show all 7 in a 3-col grid, or add "show all" expander.
+
+#10 — LOW — Responsive layout: 6-col stat row breaks correctly on mobile; tables scrollable — VERIFIED OK
+  File: dashboard-view.tsx:91 `grid-cols-2 md:grid-cols-3 lg:grid-cols-6` — proper responsive.
+        dashboard-view.tsx:330 `max-h-72 overflow-y-auto scroll-thin` — table scroll.
+  No fix needed.
+
+==================================================================
+AREA 2: NOTIFICATIONS (7 findings)
+==================================================================
+
+#11 — HIGH — send_email has NO retry; transient SMTP failures silently lose the email forever
+  File: python-backend/notifier.py:35-45
+    try:
+        await aiosmtplib.send(...)
+        return True
+    except Exception as exc:
+        log.error("email failed: %s", exc)
+        return False
+  Problem: Single attempt. If SMTP server is briefly unreachable (DNS hiccup, TLS handshake timeout, greylisting, rate-limit) the email is gone with no retry. For CRITICAL notifications like "Trade opened" (main.py:719), "Orphaned trade" (main.py:710), "Auto-trade executed" (main.py:420), the trader may never know. Caller gets `False` returned but `await send_email(...)` callers in main.py ignore the return value — they fire-and-forget on the trading loop. No metric, no alert, no recovery.
+  Fix: Add retry-with-backoff (3 attempts, 2s/4s/8s exponential). Better: persistent outbox table `notifications_outbox` (subject, body, status, attempts, next_retry_at) drained by a background worker. Surface `unsent_count` in /metrics.
+
+#12 — HIGH — send_email calls in main.py BLOCK the management/auto-trade loops during SMTP outage
+  File: main.py:247 (BE), 300 (partial), 420 (auto-trade), 710 (orphaned), 719 (order opened)
+  Problem: All use `await send_email(...)` directly inside loops. aiosmtplib's default connect timeout is 10s. If SMTP server is unreachable, EACH BE move / partial close / auto-trade execution blocks the loop up to 10s. _manage_positions_loop runs every 5s — a single SMTP failure delays ALL position management (including stop-loss checks) by 10s+. Direct money risk if price moves during the block.
+  Note: check_alerts (notifier.py:100) uses `_spawn(send_email(...))` (fire-and-forget) — INCONSISTENT. Either all should be async-queued, or none.
+  Fix: Never `await send_email` inside a trading loop. Route all notifications through `_spawn` (or better, a persistent queue worker per #11).
+
+#13 — HIGH — Manual close position (DELETE /positions/{ticket}) and manual partial close do NOT send email
+  File: main.py:733-745 (api_close), 760-777 (api_partial_close)
+  Problem: Order-opened emails fire correctly (main.py:719) but order-closed emails do not. `api_close` calls close_trade + guard.register_close but no `await send_email(...)`. Same for `api_partial_close` — only the auto-manage loop at line 300 emails; the manual API endpoint at line 760-777 does not. A trader closes a position manually (via UI button) and gets no email confirmation, no audit trail entry. Inconsistent with auto-close flow.
+  Fix: Add `await send_email(f"Trade closed: #{ticket} {symbol}", f"...P&L ${pnl} pips={pips}...")` after guard.register_close in api_close. Same pattern in api_partial_close.
+
+#14 — CRITICAL — Notification preferences UI is dead: 5 SwitchRow toggles all wired to `onChange={() => {}}`
+  File: src/components/trading/alerts-view.tsx:219-225
+    <SwitchRow label="Trade open / close" checked={true} onChange={() => {}} />
+    <SwitchRow label="Daily risk limit breach" checked={true} onChange={() => {}} />
+    <SwitchRow label="Price alert triggered" checked={true} onChange={() => {}} />
+    <SwitchRow label="High-impact news (15min)" checked={false} onChange={() => {}} />
+    <SwitchRow label="AI signal (confidence > 80%)" checked={true} onChange={() => {}} />
+  Problem: All 5 toggles are no-ops — checked values are hardcoded booleans, onChange handlers are empty. No backend support either: there's no `notification_prefs` table (verified — db.py has only trades/alerts/logs/risk_state/ml_models), no `/api/trading/notifications/prefs` route, and `send_email` calls (notifier.py:27, main.py:247/300/420/710/719) never check any user preference before sending. The user sees a fully-rendered "Notification preferences" UI that does absolutely nothing — false sense of control over which events notify.
+  Fix: Add `notification_prefs` table (event_type, channel, enabled). Add GET/PUT routes. `send_email` calls (or wrapper) check prefs before sending. Frontend SwitchRows call PUT with the new state.
+
+#15 — MEDIUM — Email-only delivery; no webhook / Telegram / push alternative for time-critical alerts
+  File: python-backend/notifier.py (entire module — only SMTP)
+  Problem: Email latency is 5s–5min in practice (greylisting, spam filters, mobile push throttling, mailbox polling). For trading alerts where 30 seconds can mean 30 pips, this is too slow. No webhook (Discord/Slack/custom HTTP), no Telegram bot, no mobile push (FCM/APNs). The notifier module is hardcoded to aiosmtplib with no abstraction.
+  Fix: Add `NotificationChannel` ABC (Email, Webhook, Telegram, Push). Send to all enabled channels in parallel. Webhook is the easiest first addition — single HTTP POST, no SMTP dependency.
+
+#16 — MEDIUM — No batching/dedup; 10 simultaneous alerts → 10 separate SMTP connections and emails
+  File: python-backend/notifier.py:100 (`_spawn(send_email(...))` per triggered alert, in the for-loop at line 72)
+  Problem: Each triggered alert spawns its own fire-and-forget task opening its own SMTP connection. If 5 alerts fire in the same 5s tick (e.g. correlated FX move), user gets 5 separate emails within 1 second. SMTP providers (esp. Gmail) rate-limit at ~100/day and may flag as spam if burst >10/min. No dedup by symbol/event-type either — if 2 alerts set on EURUSD at 1.0880 and 1.0885 both fire same tick, both email separately.
+  Fix: Batch into a digest — collect triggered alerts in a 30s window, send 1 email with all. Add `notification_dedup_key` (symbol + event_type) so BE move on ticket X emails once, not on every trailing tick. Cap concurrent SMTP connections at 3.
+
+#17 — MEDIUM — "Recent Notifications" panel is hardcoded demo data, not real notifications sent
+  File: src/components/trading/alerts-view.tsx:247-253 (the `recent` array)
+    const recent = [
+      { id: "1", tag: "trade", tone: "up", msg: "OPEN BUY EURUSD 0.10 @ 1.08642 (AI:auto)", ts: "2m ago" },
+      { id: "2", tag: "alert", tone: "warn", msg: "XAUUSD crossed above 2350.0", ts: "12m ago" },
+      ...
+    ];
+  Problem: 5 fake notifications rendered as if real. Never reflects actual notifications sent. A user who got an actual alert email won't see it echoed here; a user who didn't will think they did. No backend support — no `notifications` table (verified), no `/api/trading/notifications` route.
+  Fix: Add `notifications` table (subject, body, channel, status, sent_at). Persist every send_email call. Add GET /api/trading/notifications?limit=50. Frontend useQuery replaces the hardcoded array.
+
+#18 — LOW — send_email always uses start_tls=True; breaks implicit-TLS SMTPS on port 465
+  File: python-backend/notifier.py:36-40
+    await aiosmtplib.send(
+        msg, hostname=settings.smtp_host, port=settings.smtp_port,
+        username=settings.smtp_user, password=settings.smtp_password,
+        start_tls=True,
+    )
+  Problem: `start_tls=True` upgrades a plaintext connection to TLS via STARTTLS command — correct for port 587 (default in config.py:50). But if user configures port 465 (SMTPS, implicit TLS), `start_tls=True` will fail because the connection is already TLS. No fallback. config.py default is 587, so most users won't hit this — but power users configuring Office365/SMTPS will silently fail with cryptic "email failed: SMTPServerDisconnected".
+  Fix: Use `use_tls=(settings.smtp_port == 465)` and `start_tls=(settings.smtp_port != 465)`. Or add `smtp_security` setting.
+
+==================================================================
+AREA 3: PRICE ALERTS (8 findings)
+==================================================================
+
+#19 — CRITICAL — Frontend alert list is hardcoded demo data; no GET /alerts endpoint on either side
+  File: src/components/trading/alerts-view.tsx:19-38 (useState initialized with 2 hardcoded alerts a1/a2),
+        src/app/api/trading/alerts/route.ts (only POST exported — no GET),
+        python-backend/main.py:955-958 (only @app.post("/api/trading/alerts") — no @app.get)
+  Problem: Three cascading issues:
+    (a) AlertsView initializes `alerts` state with 2 fake alerts ("EURUSD above 1.088" and "XAUUSD cross_up 2350") that don't exist in DB. On every page load, user sees fake data.
+    (b) User creates real alert → POST /alerts succeeds → `setAlerts` prepends to local state → alert shows immediately (good). But on page refresh, local state resets to the 2 fake alerts — the real alert is invisible.
+    (c) User clicks the Switch toggle on a real alert (alerts-view.tsx:75-77 `toggle`) or Trash delete (line 78-80 `remove`) — both functions mutate LOCAL state only, never call backend. Backend still considers the alert active. The alert will STILL trigger and STILL send email even after user "deleted" it.
+  Fix: Add `@app.get("/api/trading/alerts")` in main.py calling `db.get_alerts(active_only=False)`. Add Next.js GET route. Replace local `useState` with `useQuery(['alerts'])` (refetchInterval 10s). Toggle calls `PATCH /api/trading/alerts/{id}` (new); delete calls `DELETE /api/trading/alerts/{id}` (new). Invalidate query on success.
+
+#20 — HIGH — Triggered alerts stay "active:true" in UI forever; no real-time sync of trigger state
+  File: src/components/trading/alerts-view.tsx (entire component has no alert polling)
+  Problem: When `check_alerts()` (notifier.py:87-103) fires an alert, it sets `active=0, triggered=1` in DB and sends the email. The frontend has no idea — no polling, no WebSocket. The alert row continues to show Switch=ON and no "triggered" badge indefinitely. After page refresh, the alert disappears entirely (replaced by demo a1/a2 — see #19). User has no real-time feedback that their alert fired, only the eventual email.
+  Fix: Same as #19 — useQuery with 10s refetch. Triggered alerts render with `triggered` badge and Switch=OFF (read-only). Add `triggered_at` display.
+
+#21 — MEDIUM — "cross_up" / "cross_down" conditions don't detect actual crosses; identical to above/below
+  File: python-backend/notifier.py:81-86
+    hit = (
+        (a["condition"] == "above"     and t["bid"] > a["price"])
+        or (a["condition"] == "below"    and t["bid"] < a["price"])
+        or (a["condition"] == "cross_up"   and t["bid"] > a["price"])
+        or (a["condition"] == "cross_down" and t["bid"] < a["price"])
+    )
+  Problem: cross_up and above are EVALUATED IDENTICALLY (both `t["bid"] > a["price"]`). Same for cross_down/below. Verified via grep: no `prev_bid` / `previous_price` / `last_price` tracking anywhere in notifier.py or main.py. A real "cross up" alert should fire ONLY when previous bid was below target AND current bid is above — confirming a directional cross. Current logic fires whenever current bid is above target, regardless of history.
+  Fix: Maintain module-level dict `_prev_bid: dict[str, float]` in notifier.py, updated each check_alerts call. `cross_up` fires iff `prev_bid <= target < current_bid`. `cross_down` fires iff `prev_bid >= target > current_bid`. Initialize prev_bid for new symbols.
+
+#22 — HIGH — Alert with "above" condition fires immediately if price already past target
+  File: python-backend/notifier.py:81-86 (same logic as #21)
+  Problem: User creates an "EURUSD above 1.0900" alert when EURUSD is currently at 1.0915. Next _alert_loop tick (≤5s later — main.py:114), check_alerts evaluates `t["bid"]=1.0915 > a["price"]=1.0900` → True → fires immediately, sends email, marks inactive. User gets a useless "alert triggered" notification for a level that was already passed. Most trading platforms require the price to retreat and re-cross, or refuse creation when the condition is already true.
+  Fix: At alert creation (POST /alerts), check current price. If condition would immediately fire, either (a) reject with 400 "price already past this level — use cross_up/cross_down to detect a fresh cross", or (b) auto-convert "above" → "cross_up" with a notice. Combine with #21 fix.
+
+#23 — MEDIUM — No alert history view; triggered alerts invisible after refresh; trigger price not persisted
+  File: src/components/trading/alerts-view.tsx (no triggered-only filter), python-backend/db.py:67-76 (alerts table has triggered_at but no triggered_price column), notifier.py:100-103 (only writes triggered_at via mark_alert_triggered; current bid `t["bid"]` is included in email body but NOT stored in DB)
+  Problem: After an alert fires, `mark_alert_triggered` (db.py:177-182) sets `active=0, triggered_at=<unix>`. The DB row remains. But: (a) the Alerts view never queries triggered alerts — there's no "History" tab. (b) The actual price at which the alert triggered (`t["bid"]` available in check_alerts at line 78) is never persisted — only the target price is in the DB. For audit ("alert said XAUUSD above 2350, what was the actual trigger price?"), this is missing.
+  Fix: Add `triggered_price REAL` column to alerts table. check_alerts writes `t["bid"]` to it on fire. Add "Triggered History" section to AlertsView querying GET /alerts?triggered_only=true. Show: symbol, condition, target price, triggered_at (formatted), triggered_price.
+
+#24 — MEDIUM — No alert editing; only create + (broken #19) toggle + (broken #19) delete
+  File: src/components/trading/alerts-view.tsx (no edit UI; no PUT/PATCH route)
+  Problem: User can create a new alert but cannot EDIT an existing one (e.g. adjust price from 1.0880 to 1.0875, change condition from above to cross_up). For a trader refining alert levels as volatility shifts (ATR expands → widen alert distance), this is essential. Currently the only path is delete + recreate, which loses the created_at timestamp and audit history.
+  Fix: Add `PUT /api/trading/alerts/{id}` accepting {price?, condition?}. Add edit (pencil) icon to alert row that opens an inline form. Invalidate query on success.
+
+#25 — LOW — Alert types limited to above/below/cross_up/cross_down; no %-change or time-based alerts
+  File: python-backend/main.py:552-555 (AlertReq pattern `^(above|below|cross_up|cross_down)$`),
+        notifier.py:81-86 (handler only covers those 4)
+  Problem: No "EURUSD up 1% in last hour" (volatility alert) or "alert me at 14:30 before CPI release" (time-based reminder). Traders commonly want both. The 4 supported types are the bare minimum.
+  Fix: Extend AlertReq with optional `pct_change` (e.g. {pct: 1.0, window_min: 60}) and `trigger_at_iso` (ISO timestamp). Backend evaluates accordingly (pct_change requires storing price N minutes ago; time-based fires once at scheduled time). Feature gap, not a bug.
+
+#26 — HIGH — check_alerts mutates in-memory state BEFORE DB write; if DB write fails, alert re-fires next tick → duplicate email
+  File: python-backend/notifier.py:87-99
+    if hit:
+        a["triggered"] = 1
+        a["active"] = 0
+        triggered.append(a)
+        # mark in DB
+        try:
+            from db import mark_alert_triggered  # redundant — already imported at line 67
+            if isinstance(a.get("id"), int):
+                mark_alert_triggered(a["id"])
+            elif isinstance(a.get("id"), str) and a["id"].startswith("pa-"):
+                mark_alert_triggered(int(a["id"][3:]))
+        except Exception:  # noqa: BLE001
+            pass
+  Problem: In-memory mutation (`a["triggered"]=1, a["active"]=0`) happens BEFORE the DB write attempt. If `mark_alert_triggered` raises (DB locked, disk full, integrity error), the bare `except: pass` swallows it — but the in-memory list `active` is local to this check_alerts call. On the NEXT call (5s later), `get_alerts(active_only=True)` re-queries DB → alert is STILL active=1 → fires AGAIN → sends SECOND email. Verified the import inside the try block is redundant (mark_alert_triggered already imported at line 67 inside the function-level try). Combined with #16 (no batching), a 5-alert burst during a DB lock → 5 emails per 5s tick → SMTP flood → rate-limit ban.
+  Fix: Remove redundant re-import. Don't mutate in-memory before DB write succeeds — write DB first; on success mutate; on failure log.error (don't swallow) and DON'T send email (the alert will retry next tick).
+
+==================================================================
+AREA 4: REPORTING (7 findings)
+==================================================================
+
+#27 — CRITICAL — No trade history view; `get_trades()` is dead code (imported but never called)
+  File: python-backend/db.py:144-149 (get_trades defined),
+        python-backend/main.py:42 (`from db import ... get_trades ...` — imported but 0 callers; verified via grep),
+        src/app/api/trading/ (no trades/ directory — confirmed by `ls`)
+  Problem: The `trades` table records every order open (save_trade at main.py:692 in api_order) and close (close_trade at main.py:741 in api_close, and _reconcile_loop at main.py:149 for broker-side closes). Schema includes ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, comment, source. But there is NO `GET /api/trading/trades` route, NO Next.js API route, NO UI view component (verified — `ls src/components/trading/` has no history-view.tsx; grep for "history|closedTrade|tradeHistory" in components returns no matches). The `get_trades` function is imported in main.py:42 but NEVER called. Traders have no way to see their closed-trade history with P&L. The data sits unused in SQLite. The dashboard's PositionsTable (dashboard-view.tsx:320) shows OPEN positions only — closed trades vanish from the UI entirely.
+  Fix: Add `@app.get("/api/trading/trades")` in main.py calling db.get_trades(limit=200) with optional since/symbol filters. Add Next.js GET route. Create `src/components/trading/history-view.tsx` with sortable table (ticket, symbol, side, vol, open_price, close_price, pnl, pips, open_time, close_time, source, comment). Add to sidebar nav as "History".
+
+#28 — HIGH — No daily/weekly/monthly P&L summary; only per-trade (and even that doesn't exist — #27)
+  File: N/A — feature completely missing
+  Problem: A trader evaluating strategy needs aggregated P&L by period. Current dashboard shows "Day P&L" (floating-only — #1) but no weekly/monthly rollup. No way to answer "am I profitable this week?", "what was my worst day this month?", "how does this week compare to last?". No comparison vs daily target over time. The data is in trades table (close_time column is indexed — db.py:105); the aggregation doesn't exist.
+  Fix: Add `GET /api/trading/pnl/summary?period=daily|weekly|monthly&limit=30` aggregating trades table by close_time bucket. Return per-period: realized_pnl, win_count, loss_count, win_rate, profit_factor, avg_win, avg_loss, expectancy. Show in new "Reports" view or expand dashboard.
+
+#29 — HIGH — Export button is dead — no onClick handler; no CSV/Excel export of logs OR trades
+  File: src/components/trading/logs-view.tsx:48-51
+    <Button variant="outline" size="sm" className="h-7 text-xs">
+      <Download className="h-3 w-3 mr-1" /> Export
+    </Button>
+  Problem: Button renders but has no `onClick` prop. Clicking does nothing. No CSV/Excel export of logs OR trades. For compliance (record-keeping requirement in most jurisdictions: 5-7 years of trade history, FINRA 4511, MiFID II RTS-6), this is a blocker — there's no way to extract the data out of SQLite.
+  Fix: Implement `onClick={() => window.location.href = '/api/trading/trades/export?format=csv'}`. Backend route streams CSV from trades table (use Python's csv module, set Content-Disposition: attachment). Same for /logs/export. Add Excel (xlsx) format option via openpyxl.
+
+#30 — MEDIUM — Performance metrics (win rate, profit factor, avg R, sharpe) only in backtest view, NOT for live trading
+  File: src/components/trading/backtest-view.tsx:118-119 (Win Rate, Profit Factor tiles computed on simulated trades)
+  Problem: Backtest view shows winRate, profitFactor, maxDrawdown, sharpe, avgWin, avgLoss — but these are computed on SIMULATED backtest trades (or demo data when backend down — backtest/route.ts:44 `seeded()`). For LIVE trading, there is NO equivalent. A trader cannot see "my live win rate is 62% over 47 closed trades", "live profit factor 1.8", "live expectancy +0.3R". The data exists in trades table (pnl, pips columns); the aggregation doesn't.
+  Fix: Add `GET /api/trading/performance` that computes win_rate, profit_factor, avg_win, avg_loss, expectancy, avg_R (requires SL pips per trade — currently not stored, would need schema migration), sharpe ratio, max drawdown from trades table (closed trades only). Show in dashboard as a new "Live Performance" tile or expand the StatTile row.
+
+#31 — HIGH — Audit trail broken: DBLogHandler level=WARNING means full order lifecycle (signal→risk→send→fill→SL/TP→close) NEVER reaches the DB logs table
+  File: python-backend/main.py:93 (`_db_handler = DBLogHandler(level=logging.WARNING)`),
+        main.py:84-90 (DBLogHandler.emit calls add_log)
+  Problem: DBLogHandler is configured at WARNING level — INFO records never reach the `logs` table. Verified the full order lifecycle is logged at INFO: auto-trade signal received (main.py:389 `log.info("auto-trade: ... → executing")`), auto-trade executed (line 426 `log.info("auto-trade executed: ticket=%s")`), break-even applied (line 245 `log.info("break-even: ticket=...")`), partial close (line 297 `log.info("partial close: ticket=...")`), broker-side close detected (line 143 `log.info("broker-side close detected: ticket=%s pnl=%.2f")`). The Logs view (api_logs → db.get_logs) therefore shows only WARNING+ events (auto-trade blocked, order failed, orphaned trade, trailing rejected). Compliance teams querying the DB logs table CANNOT reconstruct: which AI signal fired when, what risk check passed/failed, when the order was sent, what fill price, when SL/TP/BE/trail moved, when and why it closed. This is a direct compliance violation for any regulated trading operation.
+  Fix: (Preferred) Create a dedicated `audit_log` table (id, ts, event_type, ticket, symbol, side, price, volume, pnl, r_multiple, sl, tp, source, details_json) — append-only, no UPDATE/DELETE. Explicitly write at each lifecycle point: signal_received, risk_check_passed, risk_check_failed, order_sent, order_filled, sl_moved_be, sl_moved_trail, partial_closed, position_closed, orphaned_trade. (Quick) Lower DBLogHandler to INFO AND add a `level="TRADE"` custom level — but this conflates audit with operational logs.
+
+#32 — MEDIUM — No CSV/Excel export for trades; trade data locked in SQLite with no API surface
+  File: db.py (trades table populated), main.py (no trades route — see #27)
+  Problem: Even if the Export button worked (#29), there's no /api/trading/trades endpoint to pull from. Combined with #27 and #29, the entire reporting layer is missing — data goes IN (save_trade at order open, close_trade at order close) but never comes OUT.
+  Fix: Same as #27 + #29. The export route can reuse the GET /trades query and serialize to CSV.
+
+#33 — LOW — DBLogHandler.emit() swallows all exceptions silently; log failures invisible
+  File: python-backend/main.py:84-90
+    class DBLogHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                add_log(record.levelname, record.name, record.getMessage())
+            except Exception:
+                pass  # never let logging crash the app
+  Problem: If DB is locked / disk full / migrations needed, `add_log` raises and the exception is swallowed. The log record is LOST with no metric, no alert, no fallback. In a compliance context (FINRA 4511, MiFID II), silently dropping log records is itself a compliance violation — log integrity must be verifiable. The "never let logging crash the app" comment is correct for app stability, but the silent drop is wrong.
+  Fix: On DB failure, write the record to a fallback file (`logs_fallback.log` with rotation) AND increment a `db_log_failures` counter exposed via /metrics. Alert if counter > threshold. Optionally retry the DB write with a bounded queue.
+
+==================================================================
+SUMMARY
+==================================================================
+33 findings total: 6 CRITICAL/HIGH-tier architectural gaps + 17 MEDIUM + 10 LOW.
+Top systemic issues:
+  (1) The entire Reporting layer is missing — no /trades API, no trade-history view, no P&L summary, no export, no live performance metrics (#27-30, #32). The trades table is populated but NEVER read.
+  (2) The alert subsystem is half-built — frontend uses demo data, no GET/PATCH/DELETE routes, toggle/delete are local-only, cross detection is fake (#19-26).
+  (3) Notification preferences UI is fully fake — 5 dead toggles (#14), no preferences table, no per-event filtering.
+  (4) Audit trail is broken at the handler level — INFO lifecycle events never reach DB (#31), silently dropped on failure (#33).
+  (5) SMTP delivery is fragile — no retry, blocks trading loop, no batching, no alternative channels (#11, #12, #15, #16, #18).
+  (6) Dashboard equity curve is synthetic random walk; Day P&L misses realized P&L; daily risk % doesn't match backend's authoritative guard.daily_loss (#1, #3, #7).
+
+Findings handed off for implementation. No code changes made.

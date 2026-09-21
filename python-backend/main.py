@@ -38,7 +38,7 @@ from risk_manager import guard, size_position, near_high_impact_news, trail_stop
 import ai_service
 import backtest as bt
 import ml_model
-from notifier import add_price_alert, check_alerts, send_email
+from notifier import add_price_alert, check_alerts, send_email, notify_async
 from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade, cleanup_old
 
 # ---- structured JSON logging (for production log aggregation) --------------
@@ -82,15 +82,23 @@ if settings.sentry_dsn:
 
 # ---- DB-backed log handler ------------------------------------------------
 class DBLogHandler(logging.Handler):
-    """Write WARNING+ log records to the SQLite logs table."""
+    """Write log records to SQLite logs table.
+
+    Captures INFO+ from 'zenitrade' logger (trade lifecycle, order events)
+    and WARNING+ from other loggers (MT5, news, AI — reduce noise).
+    """
     def emit(self, record):
         try:
-            add_log(record.levelname, record.name, record.getMessage())
+            # only persist INFO+ from zenitrade logger, WARNING+ from others
+            if record.name == "zenitrade" and record.levelno >= logging.INFO:
+                add_log(record.levelname, record.name, record.getMessage())
+            elif record.levelno >= logging.WARNING:
+                add_log(record.levelname, record.name, record.getMessage())
         except Exception:  # noqa: BLE001
             pass  # never let logging crash the app
 
-# attach DB handler to root logger (WARNING+ only to avoid spam)
-_db_handler = DBLogHandler(level=logging.WARNING)
+# attach DB handler to root logger
+_db_handler = DBLogHandler(level=logging.INFO)
 logging.getLogger().addHandler(_db_handler)
 
 # ---- security: API token auth -------------------------------------------
@@ -244,7 +252,7 @@ async def _manage_positions_loop():
                             _be_applied.add(ticket)
                             log.info("break-even: ticket=%s sl=%s (R=%.2f, pos_sl=%.1fp)",
                                      ticket, new_sl, r_multiple, pos_sl_pips)
-                            await send_email(
+                            notify_async(
                                 f"Break-even: #{ticket} {symbol}",
                                 f"<p>SL moved to break-even ({new_sl}). R={r_multiple:.1f}</p>"
                                 f"<p>Position SL: {pos_sl_pips:.1f} pips</p>",
@@ -297,7 +305,7 @@ async def _manage_positions_loop():
                             log.info("partial close: ticket=%s vol=%s pnl=%.2f remaining=%s",
                                      ticket, partial_vol, r.get("pnl", 0),
                                      r.get("remaining", 0))
-                            await send_email(
+                            notify_async(
                                 f"Partial close: #{ticket} {symbol}",
                                 f"<p>Closed {partial_vol} lot ({pc_ratio*100:.0f}%). "
                                 f"P&L: ${r.get('pnl', 0):.2f}</p>"
@@ -417,7 +425,7 @@ async def _auto_trade_loop():
                             )
                         except Exception:  # noqa: BLE001
                             pass
-                        await send_email(
+                        notify_async(
                             f"🤖 Auto-trade: {side} {symbol}",
                             f"<p>AI signal {signal} ({confidence}% confidence)</p>"
                             f"<p>{side} {symbol} {volume} lot @ {r.get('price')}</p>"
@@ -707,7 +715,7 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
                                   "DB save failed: %s. Trade is live but untracked!",
                                   ticket, body.side, body.symbol, volume,
                                   r.get("price"), exc)
-                        await send_email(
+                        notify_async(
                             f"⚠ CRITICAL: Orphaned trade #{ticket}",
                             f"<p>Order was filled on MT5 but DB persistence failed.</p>"
                             f"<p>Ticket: {ticket}<br>Symbol: {body.symbol}<br>"
@@ -716,7 +724,7 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
                             f"<p>Error: {exc}</p>"
                             f"<p><b>Manual reconciliation required.</b></p>",
                         )
-            await send_email(
+            notify_async(
                 f"Trade opened: {body.side} {body.symbol}",
                 f"<p>{body.side} {body.symbol} {volume} lot @ {r.get('price')}</p>"
                 f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>"
@@ -733,15 +741,26 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
 @app.delete("/api/trading/positions/{ticket}")
 @limiter.limit("10/minute")
 async def api_close(ticket: int, request: Request, _auth=Depends(require_token)):
+    log.info("manual close requested: ticket=%s", ticket)
     r = await asyncio.to_thread(close_position, ticket)
     if r.get("ok"):
         # persist closed trade + register realized P&L for daily risk
         pnl = r.get("pnl", 0.0)
+        pips = r.get("pips", 0.0)
         try:
-            close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+            close_trade(ticket, r.get("price", 0), pnl, pips)
         except Exception:  # noqa: BLE001
             pass
         guard.register_close(pnl)
+        log.info("trade closed: ticket=%s pnl=%.2f pips=%.1f", ticket, pnl, pips)
+        # email notification for manual close (was missing)
+        notify_async(
+            f"Trade closed: #{ticket}",
+            f"<p>Manual close at {r.get('price', 0)}</p>"
+            f"<p>P&L: ${pnl:.2f} ({pips:.1f} pips)</p>",
+        )
+    else:
+        log.warning("manual close failed: ticket=%s error=%s", ticket, r.get("error"))
     return r
 
 
@@ -950,6 +969,39 @@ async def api_logs(level: str = "ALL", q: str | None = None):
         return {"logs": logs, "demo": False}
     except Exception:  # noqa: BLE001
         return {"logs": [], "demo": True}
+
+
+@app.get("/api/trading/trades")
+async def api_trades():
+    """Return trade history from DB."""
+    try:
+        trades = get_trades(limit=200)
+        return {"trades": trades, "demo": False}
+    except Exception:  # noqa: BLE001
+        return {"trades": [], "demo": True}
+
+
+@app.get("/api/trading/export")
+async def api_export():
+    """Export trades as CSV."""
+    import csv as _csv
+    import io as _io
+    try:
+        trades = get_trades(limit=1000)
+        if not trades:
+            return {"csv": "", "demo": True}
+        output = _io.StringIO()
+        writer = _csv.DictWriter(output, fieldnames=[
+            "ticket", "symbol", "side", "volume", "open_price", "close_price",
+            "pnl", "pips", "open_time", "close_time", "comment", "source"
+        ])
+        writer.writeheader()
+        for t in trades:
+            writer.writerow({k: t.get(k, "") for k in writer.fieldnames})
+        return {"csv": output.getvalue(), "demo": False}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("export failed: %s", exc)
+        return {"csv": "", "demo": True}
 
 
 @app.post("/api/trading/alerts")
