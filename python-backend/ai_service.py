@@ -41,22 +41,65 @@ The 7 dimension ids must be: central_bank, economic_data, politics, fiscal,
 commodities, sentiment, breaking_news."""
 
 
+# provider fallback order — if primary fails, try next in chain
+_PROVIDER_CASCADE = {
+    "zai": ["zai", "groq", "google", "local"],
+    "groq": ["groq", "zai", "google", "local"],
+    "google": ["google", "zai", "groq", "local"],
+    "local": ["local", "zai", "groq", "google"],
+}
+
+
 def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str, Any]:
     """Run analysis with the chosen provider. Falls back to a rule-based
-    heuristic if no provider/keys configured."""
-    user_msg = f"Analyze {symbol} for a scalping setup (TF M15/H1). " \
-               f"Market context: {json.dumps(context or {})[:800]}"
-    try:
-        if provider == "zai":
-            return _call_zai(symbol, user_msg)
-        if provider == "groq":
-            return _call_groq(symbol, user_msg)
-        if provider == "google":
-            return _call_google(symbol, user_msg)
-        if provider == "local":
-            return _call_ollama(symbol, user_msg)
-    except Exception as exc:
-        log.error("AI provider %s failed: %s — using heuristic", provider, exc)
+    heuristic if no provider/keys configured.
+
+    Provider cascade: if the primary provider fails, try the next in the
+    chain (e.g. Z.AI → Groq → Google → Ollama) before giving up to heuristic.
+    """
+    # build a rich context string — no truncation (was [:800], slicing mid-JSON)
+    ctx = context or {}
+    # format indicators readably for the LLM
+    indicator_str = ""
+    if "indicators" in ctx:
+        ind_parts = []
+        for k, v in ctx["indicators"].items():
+            if v is not None:
+                ind_parts.append(f"{k}={v}")
+        indicator_str = "Indicators: " + ", ".join(ind_parts[:10]) + ". "
+    price_str = ""
+    if "current_price" in ctx:
+        price_str = f"Current price: {ctx['current_price']}. "
+    if "recent_high" in ctx and "recent_low" in ctx:
+        price_str += f"Recent 20-bar range: {ctx['recent_low']}-{ctx['recent_high']}. "
+    # include sentiment if available
+    sentiment_str = ""
+    if "sentiment" in ctx:
+        s = ctx["sentiment"]
+        sentiment_str = f"News sentiment: {s.get('summary', 'neutral')} ({s.get('score', 0):+.1f}). "
+
+    user_msg = (
+        f"Analyze {symbol} for a scalping setup (TF M15/H1). "
+        f"{price_str}{indicator_str}{sentiment_str}"
+        f"Timeframe: {ctx.get('timeframe', 'M15')}."
+    )
+
+    # provider cascade — try primary, then fallbacks
+    cascade = _PROVIDER_CASCADE.get(provider, [provider])
+    for p in cascade:
+        try:
+            if p == "zai" and settings.zai_api_key:
+                return _call_zai(symbol, user_msg)
+            if p == "groq" and settings.groq_api_key:
+                return _call_groq(symbol, user_msg)
+            if p == "google" and settings.google_api_key:
+                return _call_google(symbol, user_msg)
+            if p == "local":
+                return _call_ollama(symbol, user_msg)
+        except Exception as exc:
+            log.warning("AI provider %s failed: %s — trying next in cascade", p, exc)
+            continue
+    log.warning("All AI providers failed — using heuristic fallback")
     return _heuristic(symbol)
 
 

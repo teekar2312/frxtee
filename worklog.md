@@ -3558,3 +3558,507 @@ Top-priority fixes (do these first):
 6. #13 + #19 + #18: Confidence threshold, spread filter, order timeout — the three pre-execution safety gates that are entirely missing.
 
 NO code changes were made. Audit only.
+
+---
+Task ID: N1
+Agent: News/AI/Sentiment Auditor
+
+Task: Deep-audit News API (Finnhub/MARKETAUX), AI Decision Engine, and Sentiment Filter (20 issues across 3 areas)
+
+Scope: Read worklog (last 3 sections A1/A1-fix/S2 for context) + 9 target files:
+  backend  — news_service.py, ai_service.py, main.py (news+analysis routes, near_high_impact_news),
+             risk_manager.py (near_high_impact_news function)
+  frontend — src/lib/demo-news.ts, src/app/api/trading/news/route.ts,
+             src/app/api/trading/analysis/batch/route.ts, src/components/trading/news-view.tsx,
+             src/components/trading/ai-engine-view.tsx
+Cross-checked supporting files: config.py (key defaults), trading-hooks.ts (staleTime/refetch),
+trading-data.ts (TRADING_PAIRS), backend-proxy.ts (timeout defaults), indicators.py:313-345
+(compute() returns 18 keys × tail(60) lists per pair).
+
+NO code changes — audit only.
+
+==================================================================
+AREA 1: NEWS API — FINNHUB / MARKETAUX / ECONOMIC CALENDAR (7 findings + 3 extras)
+==================================================================
+
+#1 — MEDIUM — API keys checked silently; frontend masks the "no key" state from users
+  File: python-backend/news_service.py:45-46 (_finnhub: `if not settings.finnhub_api_key: return []`),
+        python-backend/news_service.py:68-69 (_marketaux: same pattern),
+        python-backend/main.py:703 (`return {"news": n, "calendar": cal, "demo": not n}`),
+        src/app/api/trading/news/route.ts:12 (`{...r.data, demo: false}` — overrides backend flag)
+  Problem: Each provider guards with an empty-string check and returns `[]` on miss — no WARN log,
+  no error, no metric. The route's `demo` flag becomes `not n` (true when both lists empty).
+  But the Next.js route then OVERWRITES the backend verdict with `demo: false` on every reachable
+  response. End-state when no keys configured: backend reachable → returns `{news: [], demo: true}`
+  → frontend coerces to `{news: [], demo: false}`. UI shows the live "Radio" badge (news-view.tsx:39)
+  on an EMPTY list. Users cannot tell the difference between "no news right now" and "we never wired
+  the keys". No env validation on backend startup either.
+  Fix: (a) Log WARN at module load if `finnhub_api_key` or `marketaux_api_key` is empty.
+  (b) In `proxyBackend` callers, do NOT override `demo` — pass through `r.data.demo`.
+  (c) Add a `GET /api/trading/news/status` returning `{finnhub: bool, marketaux: bool, calendar:
+  bool}` so the UI can show a per-source key-missing chip.
+
+#2 — CRITICAL — MARKETAUX free-tier quota exhausted in ~100 minutes
+  File: python-backend/news_service.py:21-41 (60s news cache → 1 call/min),
+        python-backend/news_service.py:67-94 (one MARKETAUX GET per cache miss),
+        python-backend/main.py:702 (`asyncio.gather(fetch_news(), economic_calendar())`)
+  Problem: MARKETAUX free tier = 100 requests/day. `fetch_news()` caches for 60s and unconditionally
+  calls MARKETAUX on cache miss → 1 call/min → 1440 calls/day → 14.4× the daily quota. After ~100
+  minutes of uptime, every MARKETAUX call returns 429 (or 402 payment required) until UTC midnight
+  reset. There is no per-provider counter, no skip-on-quota-exceeded flag, no daily-budget
+  enforcement. Finnhub (60/min, no daily cap) is fine at 1/min news + 1/5min calendar, but MARKETAUX
+  silently degrades to "always 429" within the first trading session.
+  Fix: Track per-provider daily counters (`_marketaux_calls_today`, reset on UTC date rollover) in
+  the CACHE dict alongside `ts`. If counter ≥ 90 (10% safety margin), skip MARKETAUX for the rest
+  of the day and log WARN once per skip-day. Optionally raise cache TTL to 5min when budget < 20
+  remaining.
+
+#3 — HIGH — No 429 backoff; retries immediately on next 60s tick
+  File: python-backend/news_service.py:31-37 (gather returns exception, logged, skipped),
+        python-backend/news_service.py:47 (`httpx.AsyncClient(timeout=15)`)
+  Problem: `r.raise_for_status()` raises on 429/402; `gather(..., return_exceptions=True)` swallows
+  the exception into the results list, logs "news source error", and skips the source for this
+  cycle. On the NEXT cache expiry (60s later), the code calls the SAME provider again with the SAME
+  params — no exponential backoff, no `Retry-After` header respect, no circuit breaker. A quota-
+  exhausted MARKETAUX (see #2) will be hammered once per minute forever.
+  Fix: Wrap each provider in a small `ProviderState` class with `last_429_ts` + `backoff_until`.
+  On HTTP 429/402/503: set `backoff_until = now + 2^min(5, attempts) × 60s` and skip the provider
+  until that timestamp. Reset attempt counter after a successful 200. Respect `Retry-After` header
+  if present.
+
+#4 — MEDIUM — No force-refresh; news can lag up to 60s on a hard refresh click
+  File: python-backend/news_service.py:24 (`if ... < 60 and CACHE["news"]: return`),
+        src/lib/trading-hooks.ts:50-56 (useNews: refetchInterval 60_000, staleTime 30_000),
+        src/components/trading/news-view.tsx (no "refresh now" button rendered)
+  Problem: `fetch_news()` only takes the cache path — there's no `force=True` parameter. If breaking
+  news hits the wire 5s after a cache fill, the dashboard shows stale headlines for 55s. The TanStack
+  `refetch` will hit the backend, but the backend handler returns the same cached list. There's no
+  client-side "refresh now" button either (compare to AI engine's "Re-analyze All" at
+  ai-engine-view.tsx:290-302). For an asset class where 30-50 pip spikes occur on FOMC headlines,
+  55s of staleness is unacceptable.
+  Fix: (a) Add `force: bool = False` to `fetch_news()` and `economic_calendar()` — when true, skip
+  the cache read (still under the lock). (b) Add `?force=1` query support on `GET /api/trading/news`.
+  (c) Render a RefreshCw button next to the "live" badge that calls `refetch({ force: true })` via
+  a custom query function.
+
+#5 — HIGH — Symbol mapping is broken: raw tickers stored, never normalized to the 14 pairs
+  File: python-backend/news_service.py:58 (`"symbols": _extract_symbols(i.get("related", ""))`),
+        python-backend/news_service.py:81 (`syms = [e.get("symbol") for e in ents ...]`),
+        python-backend/news_service.py:97-98 (`def _extract_symbols(related): return [s for s in (related or "").split(",") if s][:4]`)
+  Problem: Finnhub's forex-news `related` field is comma-separated and may contain ANY of: currency
+  pair codes ("EUR/USD"), single-currency codes ("USD"), indices, or stocks. MARKETAUX entities'
+  `symbol` is the entity's primary listing — typically a STOCK ticker ("AAPL", "TSLA", "BARC").
+  The code stores these raw with no normalization and no currency-code mapping. Net effect: a
+  Finnhub article "Fed holds rates" with `related="USD,EUR/USD"` lands in the cache as
+  `symbols: ["USD", "EUR/USD"]` — neither matches the dashboard's "EURUSD" pair id. MARKETAUX's
+  "US CPI" article entities = `[{symbol:"SPY",...}]` → stored as `symbols: ["SPY"]`. The news-view
+  pair filter (news-view.tsx:23-28) doesn't even attempt to match symbols — it only filters by
+  source/impact/title-substring. So a USD news article appears for ALL pairs indiscriminately,
+  and AI never sees news filtered to the analyzed symbol.
+  Fix: Build a `CURRENCY_OF_PAIR` map (EURUSD → ["EUR","USD"], USDJPY → ["USD","JPY"], …) plus
+  `PAIRS_BY_CURRENCY` reverse index. In `_extract_symbols`: tokenize, upper-case, strip slashes,
+  match against the 14 pair symbols first, then expand single currency codes to all pairs
+  containing that currency (e.g., "USD" → ["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD",
+  "USDCAD","NZDUSD","XAUUSD","XAGUSD"]). Add a `currencies: list[str]` field per news item so the
+  AI/risk layer can consume it without re-parsing `symbols`.
+
+#6 — MEDIUM — No deduplication across Finnhub + MARKETAUX
+  File: python-backend/news_service.py:30-41 (`out.extend(res)` for both providers, no dedup)
+  Problem: Both providers frequently cross-publish the same wire story (Reuters/Associated Press).
+  `fetch_news()` simply extends the list and sorts by `publishedAt`. A duplicate headline appears
+  twice in the news-view scroll list, and — worse — would be double-counted by any future
+  sentiment aggregator. There's no title-hash, no URL match, no publishedAt+source dedup.
+  Fix: After extend, dedup on `url` first (most reliable when present), falling back to a
+  normalized title hash (`hashlib.md5(re.sub(r"\s+"," ",title.lower().strip())).hexdigest()`)
+  within a 2-minute `publishedAt` window. Keep the Finnhub entry preferentially (richer `related`).
+
+#7 — LOW/MEDIUM — HTTP polling only; Finnhub websocket (wss://ws.finnhub.io) not used
+  File: python-backend/news_service.py (entire file is async HTTP via httpx),
+        python-backend/main.py:699-703 (HTTP GET polling),
+        src/lib/trading-hooks.ts:50-56 (60s refetch interval)
+  Problem: Finnhub offers a free websocket that pushes news the moment it's published. The system
+  uses 60s HTTP polling instead — best-case 60s lag, worst-case 119s (cache filled at t=0, news
+  arrives at t=1, next refresh at t=60, response received at t=61). For a scalping terminal that
+  trades M15 and uses news-blackout windows, this lag directly impacts the `near_high_impact_news`
+  pre-event check (which queries the same 5-min-cached calendar, so that's already double-stale).
+  The trade-off (simplicity vs latency) is undocumented anywhere in the codebase. Adding WS would
+  also let us drop the news cache TTL to "on message".
+  Fix: Optional. Add a `news_ws.py` background task that subscribes to Finnhub WS, pushes new
+  items to `CACHE["news"]` directly, and falls back to HTTP polling if WS disconnects. Document
+  the polling-only decision in a code comment if not implementing.
+
+#1a (extra) — CRITICAL — News route's proxyBackend timeout (1.5s) < backend's external fetch (15s)
+  File: src/app/api/trading/news/route.ts:9-11 (proxyBackend called with no timeout arg),
+        src/lib/backend-proxy.ts:34 (`timeoutMs = 1500` default),
+        python-backend/news_service.py:47 (`httpx.AsyncClient(timeout=15)`)
+  Problem: Cold-cache first request: backend's `fetch_news()` issues two concurrent external GETs
+  with 15s timeout each. The Next.js route gives up at 1.5s and `proxyBackend` returns `{data: null,
+  proxied: false}`. The route then falls through to `jsonWithDemo({news: DEMO_NEWS, calendar: []},
+  false)` — but `false` is the `proxied` arg, so `demo: !false = true`. So users see DEMO_NEWS with
+  `demo: true` for the first ~15-30s after every cache expiry. TanStack Query retries with default
+  exponential backoff — eventually the cache warms and subsequent reads are fast. But during the
+  cold-cache window, the dashboard actively lies (real-looking "Fed officials signal patience"
+  headlines are demo content, not real).
+  Fix: Pass `8000` (or higher) as the 3rd arg to `proxyBackend` in news/route.ts (the analysis
+  batch route already does this at line 72). Alternatively, run `fetch_news()` in the backend's
+  lifespan startup so the cache is warm before the first request.
+
+#2a (extra) — MEDIUM — `api_analysis_batch` hardcodes `demo: True` regardless of provider outcome
+  File: python-backend/main.py:797 (`return {"results": results, "provider": provider, "demo": True}`)
+  Problem: Batch route always claims `demo: True` even when Z.AI returned a real analysis. Then
+  the frontend route at src/app/api/trading/analysis/batch/route.ts:75 OVERWRITES with
+  `demo: false` on every reachable response. Net effect: when AI key is missing and the analyze()
+  call fell back to `_heuristic()` (per-provider "heuristic" string still in each result), the
+  frontend reports `demo: false`. The single-pair route at main.py:760 correctly derives demo from
+  `result.get("provider") == "heuristic"` — the batch endpoint should do the same.
+  Fix: In api_analysis_batch, compute `demo = all(r.get("provider") == "heuristic" for r in
+  results.values() if r)`. Pass through `demo` in the frontend route (do NOT override with false).
+
+#3a (extra) — HIGH — Demo calendar events lack `time` field → news blackout silently disabled
+  File: python-backend/news_service.py:139-144 (`_demo_calendar` returns events with no `time`),
+        python-backend/risk_manager.py:194-196 (`ev_time = event.get("time") or ... or publishedAt;
+        if not ev_time: continue`)
+  Problem: When `finnhub_api_key` is empty (dev / fresh-clone / .env-not-loaded), the calendar
+  falls back to `_demo_calendar()`. Each demo event has only `event`, `country`, `actual`,
+  `estimate`, `impact` — no `time`/`date`/`publishedAt` field. `near_high_impact_news()` then
+  hits `if not ev_time: continue` for every demo event and returns `(False, "ok")`. Result: the
+  `avoid_high_impact_news` safety guard (risk_manager.py:179, main.py:589) is silently disabled
+  in demo mode. A user testing the dashboard locally sees "trading allowed" near a "US CPI"
+  calendar event that, in production, would block the order.
+  Fix: Add `"time": datetime.now(timezone.utc).isoformat()` (or a near-future timestamp) to each
+  demo calendar entry. Better: parameterize `_demo_calendar(offset_minutes: int = 5)` so the demo
+  event is always 5 minutes in the future, exercising the blackout path in dev.
+
+==================================================================
+AREA 2: AI DECISION ENGINE (7 findings)
+==================================================================
+
+#8 — CRITICAL — Context truncation + batch/auto-trade paths pass ZERO market data
+  File: python-backend/ai_service.py:48 (`f"Market context: {json.dumps(context or {})[:800]}"`),
+        python-backend/main.py:297 (auto-trade: `ai_service.analyze, symbol, provider,
+        {"timeframe": "M15"}` — no indicators, no price, no news),
+        python-backend/main.py:775 (batch: same `{"timeframe": "M15"}` context — no indicators),
+        python-backend/main.py:718-732 (single-pair route BUILDS context with 10 indicators
+        + current_price + recent_high/low, but those values then get truncated by [:800])
+  Problem: Three layers of failure:
+   (a) `json.dumps(context)[:800]` slices the JSON string mid-token. With 18 indicator keys
+       (ema, rsi, macd_main/signal/hist, atr, bbands_main/signal/hist, vwap,
+       stochastic_main/signal/hist, supertrend_main/signal/hist, psar_main, cci_main) each at ~25
+       chars, plus current_price/recent_high/recent_low, the JSON easily runs 700-900 chars for
+       JPY/metal pairs. The slice produces malformed JSON like `...{"cci_main":45.32,"current_pri`
+       — the LLM has to guess the rest.
+   (b) The BATCH endpoint (the primary multi-pair signal matrix UI at ai-engine-view.tsx:284-371)
+       passes only `{"timeframe": "M15"}` as context — NO indicators, NO price data, NO news. The
+       LLM is asked to "Analyze EURUSD for a scalping setup" with literally just the symbol name
+       and timeframe.
+   (c) The AUTO-TRADE loop (the production execution engine) ALSO passes only `{"timeframe":
+       "M15"}` — same zero-context problem. When `auto_trade_mode = true` and a real account is
+       connected, orders fire on hallucinated signals.
+  Verified: main.py:775 `asyncio.to_thread(ai_service.analyze, sym, provider, {"timeframe":
+  "M15"})` — no `_build_context()` call, no candles, no indicators. Same at main.py:297.
+  Fix: (1) Move `_build_context()` into a shared helper (e.g., `ai_service.build_context(symbol)`
+  that internally calls mt5_candles + indicators.compute). Use it in BOTH api_analysis and
+  api_analysis_batch. The auto-trade loop should also use it.
+  (2) Drop the `[:800]` truncation entirely. Pass the full context. Modern LLMs (glm-4.6,
+  llama-3.3-70b, gemini-1.5-pro) all accept ≥8k tokens — 1-2KB of indicator JSON is trivial. If
+  prompt-size discipline is desired, compress to a one-line summary like
+  `"EMA:1.0865,RSI:52.3,MACD:+0.0001,ATR:0.0012,BB:[1.085,1.087],VWAP:1.0866,Stoch:[52,48],
+  SuperTrend:long,PSAR:1.0870,CCI:45"` instead of raw JSON.
+  (3) Add `"news_summary"` and `"sentiment"` fields to context (see Area 3 findings).
+
+#9 — HIGH — No provider cascade; Z.AI failure → straight to heuristic
+  File: python-backend/ai_service.py:49-60 (try block dispatches to one provider; except
+  catches all Exception and calls `_heuristic` with no retry on alternate provider),
+        python-backend/config.py:22-25 (groq, google, ollama keys all configured but never
+        consulted as fallback)
+  Problem: If Z.AI is unreachable (network blip, 5xx, key expired), the code goes straight to
+  `_heuristic()` — a deterministic md5-hash pseudorandom signal generator (ai_service.py:186-188
+  `h = int(hashlib.md5(symbol.encode()).hexdigest(), 16); sig = signals[h % 5]`). The hash is
+  STATIC per symbol, so a "Z.AI failure" means the dashboard shows the same fake BUY signal for
+  EURUSD forever (until Z.AI comes back). Groq, Google, Ollama are all configured but never
+  consulted as fallbacks even though they're all OpenAI-compatible / SDK-callable in <30 lines.
+  Fix: Replace the single-provider dispatch with an ordered cascade: e.g., primary = `provider`,
+  fallbacks = ["groq", "google", "zai"] (excluding primary). On any exception, try next provider
+  in the cascade; only call `_heuristic` if ALL providers fail. Log the cascade hop at WARN so
+  operators can see provider health.
+
+#10 — MEDIUM — STRONG BUY treated identically to BUY (no position-size multiplier, no priority)
+  File: python-backend/main.py:306 (`side = "BUY" if "BUY" in signal else "SELL"`),
+        python-backend/main.py:322 (`ps = size_position(equity, settings.stop_loss_pips,
+        pip_value)` — STRONG vs normal produce same lot),
+        python-backend/risk_manager.py:26-45 (`size_position` has no `signal_strength` param),
+        src/components/trading/ai-engine-view.tsx:438 (`side = a.signal.includes("SELL") ?
+        "SELL" : "BUY"` — frontend collapses STRONG into normal too)
+  Problem: The LLM emits 5 signal levels (STRONG BUY/BUY/NEUTRAL/SELL/STRONG SELL per
+  ai_service.py:35), but the execution layer flattens them to 3 (BUY/NEUTRAL/SELL). STRONG BUY
+  gets the same `risk_per_trade_pct` (1.0% default), same lot size, same SL/TP distance, same
+  execution priority as a 51%-confidence BUY. The signal granularity the LLM produces is thrown
+  away. This also means the AI "Top pick" highlight at ai-engine-view.tsx:319-329 (sorts by
+  `confidence`) doesn't consider STRONG vs normal — a 70% BUY ranks above a 69% STRONG BUY even
+  though the latter is the LLM's stronger directional call.
+  Fix: (a) Add `signal_strength: float` to PositionSize (e.g., 1.0× for BUY, 1.5× for STRONG BUY).
+  `size_position(equity, sl_pips, vpp, risk_pct=risk_pct * strength)`. (b) Frontend: pass the full
+  signal string (not collapsed to BUY/SELL) and surface STRONG vs normal in the button label and
+  trade size preview. (c) Auto-trade loop: lower the `min_confidence` threshold for STRONG signals
+  (e.g., STRONG BUY at 65%, BUY at 75%) — STRONG signals are higher-conviction and shouldn't be
+  filtered as aggressively.
+
+#11 — MEDIUM — Confidence uncalibrated; no overconfidence detection
+  File: python-backend/ai_service.py:164-167 (`if not isinstance(out.get("confidence"),
+  (int, float)): out["confidence"] = 50` — only type-check, no range/sanity),
+        python-backend/main.py:286,302 (`min_confidence = 75`, `if confidence < min_confidence:
+        continue`),
+        python-backend/ai_service.py:189 (heuristic returns `55 + (h % 40)` — i.e., 55-95% range)
+  Problem: The LLM's `confidence` value is taken at face value. LLMs — especially smaller models
+  like glm-4.6 and llama-3.3-70b — are notoriously overconfident, often returning 85-95% for
+  nearly every directional call. The auto-trade gate at min_confidence=75 then executes nearly
+  every signal, defeating the purpose of the threshold. There's no historical tracking of
+  "predicted confidence" vs "realized outcome" (e.g., Brier score, reliability diagram), no
+  per-provider calibration table, no clipping (a 100% confidence should be capped). The heuristic
+  fallback returns 55-95% (also high) which means even the FALLBACK looks "tradeable".
+  Fix: (a) Track per-provider calibration in SQLite: `INSERT INTO ai_calibration(provider,
+  predicted_bucket, realized_outcome) VALUES (...)`. After ≥30 samples, derive a Platt/sigmoid
+  mapping. (b) Apply a `calibrate(conf, provider)` step in `analyze()` before returning. (c) For
+  the heuristic fallback specifically, cap confidence at 50% — it should never be allowed to
+  trigger auto-trade (which requires 75%).
+
+#12 — HIGH — Stale signal execution; 59-second-old analysis can be traded
+  File: src/lib/trading-hooks.ts:108 (`staleTime: 60_000` for useMultiAnalysis),
+        src/components/trading/ai-engine-view.tsx:429-475 (Execute button onClick — no
+        freshness check; reads `a` from cached query data),
+        src/app/api/trading/order/route.ts (not read in this audit, but order endpoint at
+        main.py:575-595 does NOT re-run analysis or check signal age),
+        python-backend/main.py:267-349 (auto-trade loop polls every 30s — also stale by up to
+        30s on top of the 60s analysis window)
+  Problem: Multi-pair analysis is cached for 60s (staleTime). A user opens the AI Engine view at
+  t=0 (fresh analysis), waits 59s, then clicks Execute. The order hits the backend at t=60. The
+  signal was computed using candle data from t=0 — by t=60, 4 new M15 candles may have closed and
+  the AI's BUY signal may be invalidated. There's no client-side guard ("signal is 59s old, re-
+  analyze?") and no backend-side check ("order request claims AI signal but no analysis happened
+  in the last 30s"). The auto-trade loop is worse — it polls analysis every 30s but the analysis
+  itself was computed from a 30s-old query, so orders can act on 60-90s-stale signals.
+  Fix: (a) Client: in the Execute onClick, compare `new Date(a.generatedAt)` to `Date.now()`. If
+  delta > 30_000, show a confirm dialog: "Signal is 45s old — re-analyze first?" (b) Backend: add
+  a `signal_age_max_ms` check (default 30_000) to the order endpoint; refuse with
+  `{"ok": false, "error": "Stale signal — re-analyze"}` if the client doesn't pass a recent
+  analysis token. (c) Auto-trade loop: refresh analysis right before the order, not on a 30s poll
+  cadence — i.e., move the analyze() call INSIDE the order critical section.
+
+#13 — MEDIUM — No multi-provider consensus; first-provider-wins
+  File: python-backend/ai_service.py:50-57 (provider dispatch is a single `if/elif` chain —
+  one call, one result),
+        python-backend/main.py:285 (`provider = getattr(settings, "ai_provider", "zai")` —
+        single provider chosen at config time),
+        src/components/trading/ai-engine-view.tsx:27-29 (single `active` provider from store)
+  Problem: If Z.AI says STRONG BUY on EURUSD and Groq says STRONG SELL on EURUSD, the system only
+  ever shows Z.AI's signal (whichever provider is `active`). There's no consensus / voting / quorum
+  mechanism. For high-stakes auto-trade execution, a single LLM's opinion is risky — ensemble
+  methods (majority vote, weighted-by-calibration) measurably outperform single models in
+  classification tasks. The infrastructure (4 providers wired) exists; only the orchestration is
+  missing. No code path ever calls two providers concurrently and compares.
+  Fix: Add a `consensus(symbols, providers: list[str]) -> dict[symbol, AnalysisResult]` mode that
+  calls N providers concurrently and returns a vote: BUY if ≥ ceil(N/2) providers say BUY, NEUTRAL
+  if disagreement, with confidence = mean of agreeing providers. Expose via `GET /api/trading/
+  analysis/consensus?symbols=EURUSD,GBPUSD&providers=zai,groq,google`. Add a "Consensus" toggle in
+  the AI Provider card (ai-engine-view.tsx:60-114) that activates this mode.
+
+#14 — HIGH — Prompt lacks indicator semantics; LLM has to guess what RSI=52 means
+  File: python-backend/ai_service.py:31-41 (SYSTEM_PROMPT — describes 7 dimensions and JSON
+  contract, but says NOTHING about how to interpret indicator values),
+        python-backend/ai_service.py:47-48 (`user_msg = f"Analyze {symbol}... Market context:
+        {json.dumps(context or {})[:800]}"` — dumps raw JSON keys with no legend),
+        python-backend/main.py:718-728 (top10 indicator keys are ema/rsi/macd/atr/bbands/vwap/
+        stochastic/supertrend/psar/cci — but compute() at indicators.py:329-334 returns
+        `macd_main/signal/hist`, `bbands_main/signal/hist`, etc., so 18 keys land in `readings`)
+  Problem: The SYSTEM_PROMPT instructs the LLM to analyze 7 dimensions and return JSON — but
+  doesn't tell it (a) what indicators are being provided, (b) what their overbought/oversold
+  thresholds are, (c) what the current trend regime is, (d) what the entry/SL/TP conventions are.
+  The user_msg just dumps `{"indicators": {"ema": 1.0865, "rsi": 52.34, "macd_main": 0.00012,
+  "atr": 0.0012, "bbands_main": 1.085, ...}, "current_price": 1.0865, "recent_high": 1.087}`.
+  The LLM has to GUESS that `rsi: 52.34` is "neutral" (not overbought). Combined with finding #8
+  (truncation), the LLM may receive a partial JSON like `{"ema":1.0865,"rsi":52.34,"macd_main":`
+  — then it has no indicators at all and falls back to general knowledge.
+  Fix: Extend SYSTEM_PROMPT with an "Indicator Reference" block:
+  ```
+  You will receive a JSON object `context` with these fields:
+  - current_price, recent_high, recent_low (price levels)
+  - indicators.ema (50-period EMA — above=uptrend, below=downtrend)
+  - indicators.rsi (0-100; >70 overbought, <30 oversold)
+  - indicators.macd_main, macd_signal, macd_hist (positive hist = bullish momentum)
+  - indicators.atr (volatility in price units — SL = 1.5×ATR recommended)
+  - indicators.bbands_main, bbands_signal, bbands_hist (price near upper=overbought)
+  ...
+  ```
+  Also drop the `[:800]` slice (see #8) and pass the full context.
+
+==================================================================
+AREA 3: SENTIMENT FILTER (6 findings)
+==================================================================
+
+#15 — CRITICAL — "Sentiment Summary" card is hardcoded 42/33/25 — does not aggregate, does not feed AI
+  File: src/components/trading/news-view.tsx:171-188 (Sentiment Summary card),
+        src/components/trading/news-view.tsx:173-183 (literal `<div>42%</div>... 33%... 25%`),
+        src/components/trading/news-view.tsx:185-187 (`Aggregated across Finnhub + MARKETAUX
+        over last 24h.` — text claim),
+        python-backend/news_service.py (no aggregate sentiment endpoint exists),
+        python-backend/main.py:706-760 (`_build_context()` — does NOT pass any news/sentiment
+        into the AI prompt)
+  Problem: Three independent failures compounded into one CRITICAL:
+   (a) The "Sentiment Summary" card displays literal `42%` / `33%` / `25%` and a paragraph
+       claiming "Aggregated across Finnhub + MARKETAUX over last 24h." The numbers are NOT
+       computed — they're hardcoded JSX. Users see the same percentages on every launch, regardless
+       of real news flow. This is a UI honesty violation on a trading terminal.
+   (b) The backend never computes an aggregate sentiment score per symbol. `fetch_news()` returns
+       a flat list of news items each with its own `sentiment` field — there's no
+       `aggregate_sentiment(symbol)` function and no endpoint like `GET /api/trading/sentiment/
+       EURUSD`.
+   (c) `_build_context()` for the AI analysis doesn't include news or sentiment at all. The AI's
+       "sentiment" dimension (ai_service.py:27) and "breaking_news" dimension (line 28) are
+       pure LLM hallucinations — they have ZERO connection to the actual fetched news. A hawkish
+       Fed surprise and a dovish Fed surprise produce the same LLM output (because the LLM has no
+       idea what just happened — it only sees the symbol name and timeframe).
+  Fix: (a) Backend: add `aggregate_sentiment(symbol: str) -> {score: -1..1, bullish_pct,
+  bearish_pct, neutral_pct, sample_count, latest_ts}` that filters cached news by the symbol's
+  currencies (see #5, #18), computes a time-weighted mean (see #19), returns the breakdown. Expose
+  via `GET /api/trading/sentiment?symbol=EURUSD`.
+  (b) Frontend: replace the hardcoded `<div>42%</div>` with `{data?.sentiment?.bullish_pct ?? 0}%`
+  driven by a new `useSentiment(symbol)` hook. If no data, show "—" and a "no sentiment data"
+  tooltip — never fabricate numbers.
+  (c) AI: add `ctx["sentiment"] = aggregate_sentiment(symbol)` and `ctx["recent_news"] =
+  [{"title": n.title, "sentiment": n.sentiment, "impact": n.impact} for n in news[:5]]` in
+  `_build_context()`. The LLM then has real news to reason about, not just symbol+timeframe.
+
+#16 — MEDIUM — Impact scoring ignores currency; one event blocks ALL pairs
+  File: python-backend/risk_manager.py:171 (`def near_high_impact_news(minutes: int = 15) ->
+  tuple[bool, str]` — no symbol parameter),
+        python-backend/risk_manager.py:190-211 (loops calendar, blocks if ANY high-impact
+  event is within window — no currency filter),
+        python-backend/main.py:589 (`blackout, reason = await asyncio.to_thread(
+  near_high_impact_news, 15)` — no symbol passed)
+  Problem: `near_high_impact_news` takes only a minutes window — not the symbol being traded. So
+  when the calendar shows an Australian GDP release (high impact, AUD), the system blocks EURUSD,
+  GBPUSD, USDJPY — pairs that have zero fundamental exposure to AUD. A BoE rate decision blocks
+  USDJPY trading. The user sees "News blackout: high-impact BoE Rate Decision released 5m ago"
+  when they try to enter a USDJPY scalp — frustrating and capital-inefficient. Conversely, a
+  EUR-specific event (e.g., ECB) correctly blocks EURUSD but also incorrectly blocks XAUUSD.
+  Fix: Change signature to `near_high_impact_news(symbol: str, minutes: int = 15)`. Resolve
+  `currencies = CURRENCY_OF_PAIR[symbol]` (e.g., EURUSD → ["EUR", "USD"]). Filter calendar events
+  by `event["country"]` matching ISO 4217 currency codes (US→USD, GB→GBP, JP→JPY, AU→AUD,
+  CA→CAD, CH→CHF, NZ→NZD, EMU member states→EUR). Only block if event currency ∈ pair's
+  currencies. Update main.py:589 to pass `body.symbol`.
+
+#17 — HIGH — Sentiment is display-only; never affects can_open() or signal generation
+  File: python-backend/risk_manager.py:93-125 (`can_open` checks daily_loss, open_count,
+  margin_level, drawdown, weekend, news_blackout — does NOT check sentiment),
+        python-backend/main.py:295-303 (auto-trade: reads `signal` + `confidence`, executes
+  if confidence ≥ 75 — never reads news sentiment),
+        python-backend/main.py:706-760 (api_analysis: `_build_context()` returns ctx WITHOUT
+  news/sentiment — AI doesn't see sentiment),
+        src/components/trading/ai-engine-view.tsx:426-475 (Execute button: only checks
+  `a.confidence < 60` and `a.signal === "NEUTRAL"` — no sentiment check)
+  Problem: News sentiment is collected (news_service.py:101-106 `_sentiment()`), displayed in the
+  UI (news-view.tsx:106-116 badge), and then... completely ignored by the trading layer. A
+  "STRONG SELL on USD" sentiment across 5 negative USD headlines doesn't prevent a BUY EURUSD
+  order. A "STRONG BUY on JPY" sentiment doesn't boost USDJPY SELL signal priority. The only
+  news→trade coupling is `near_high_impact_news()` (binary blackout based on calendar impact, not
+  actual sentiment — see #16). The 7-dimension AI "sentiment" score in `result.dimensions` is the
+  LLM's guess, not derived from real news.
+  Fix: (a) Add `sentiment_score: float` to PositionSize / order context. (b) In `can_open()`,
+  accept a `symbol` arg and reject orders when aggregate sentiment strongly contradicts the side
+  (e.g., sentiment_score < -0.5 and side == "BUY" → reject "Sentiment strongly bearish on USD").
+  (c) In `_build_context()`, inject `ctx["sentiment"]` (see #15). (d) Frontend: in the Execute
+  button onClick, fetch sentiment and show a warning toast if signal contradicts sentiment (don't
+  block — let user override with explicit confirmation).
+
+#18 — HIGH — Currency-specific sentiment not tracked; per-stock scores averaged misleadingly
+  File: python-backend/news_service.py:101-106 (`_sentiment(entities)` averages `sentiment_score`
+  across ALL entities in an article),
+        python-backend/news_service.py:59 (Finnhub: `"sentiment": "neutral"` hardcoded — Finnhub
+  API doesn't return per-article sentiment, so always neutral),
+        python-backend/news_service.py:88 (MARKETAUX: uses `_sentiment(i.get("entities", []))`)
+  Problem: MARKETAUX's `entities[].sentiment_score` is per-ENTITY (per-stock), not per-currency.
+  An article "Fed hawkish — stocks fall, USD rises" might return entities:
+  `[{symbol:"SPY", sentiment_score:-0.6}, {symbol:"EURUSD", sentiment_score:-0.3}]` (EURUSD falls
+  because USD rises). The `_sentiment()` function averages these (-0.45) and labels the article
+  "negative" — which is correct for SPY but wrong as a USD signal (USD is positive). Then if the
+  user is analyzing EURUSD, the system has no way to extract "this article is USD-positive, so
+  bearish for EURUSD" — it only knows "article sentiment = negative". Finnhub articles are always
+  "neutral" (hardcoded line 59) so half the feed has no sentiment at all. EURUSD-specific news
+  flow (Fed + ECB) is never separated from generic market news.
+  Fix: (a) Replace `_sentiment()` with `_currency_sentiments(entities) -> dict[str, str]` that
+  maps each entity to its currency (SPY→USD, EURUSD→EUR+USD, AAPL→USD, BARC→GBP) and computes
+  per-currency sentiment. (b) Store `currency_sentiments: {"USD": "positive", "EUR": "negative"}`
+  per news item. (c) In aggregate_sentiment (see #15), use the symbol's currency pair to look up
+  the relevant sentiment — for EURUSD, combine EUR-sentiment (long-direction inverse) and USD-
+  sentiment (long-direction) into a single EURUSD-bias score.
+
+#19 — MEDIUM — No sentiment time-decay; 6-hour-old news weighted same as 5-min-old
+  File: python-backend/news_service.py:30-41 (fetch_news returns latest 20 per source, sorted
+  by publishedAt desc — no time filter),
+        python-backend/news_service.py (no `weight_by_age` function exists),
+        python-backend/news_service.py:57 (`summary: i.get("summary", "")[:240]` — recent news
+  indistinguishable from old in storage)
+  Problem: News items are stored with `publishedAt` but no weight. A 6-hour-old "Fed minutes"
+  article counts equally with a 5-minute-old "CPI print" in any future aggregation. Markets
+  discount old news rapidly — intraday FX volatility from a news shock decays ~50% within 30 min
+  and ~90% within 2 hours. The current implementation would surface a stale "US jobs weak"
+  headline as evidence against a fresh BUY signal even though the market has fully priced it in.
+  Also, `_finnhub()` returns up to 20 items with no max-age filter (news_service.py:64
+  `for i in items[:20]`), so the cache may include items from days ago.
+  Fix: (a) In `_finnhub()` and `_marketaux()`, filter `items` to `publishedAt > now - 24h` before
+  storing. (b) In `aggregate_sentiment(symbol)` (see #15), apply exponential decay:
+  `weight = exp(-age_minutes / 120)` (2-hour half-life). Multiply each item's contribution by its
+  weight before averaging. (c) Surface "latest_news_age_min" in the sentiment endpoint so the
+  UI can show "Last update: 12m ago" and de-emphasize stale readings.
+
+#20 — MEDIUM — No contradictory-sentiment resolution; both providers' items coexist
+  File: python-backend/news_service.py:30-41 (out.extend(res) for both providers — no
+  conflict detection),
+        python-backend/news_service.py:101-106 (per-article sentiment only — no per-currency
+  reconciliation)
+  Problem: If Finnhub reports "Fed hawkish" (label: positive for USD — though the code marks
+  Finnhub items as neutral by default per line 59, this only makes the problem worse: zero
+  information) and MARKETAUX reports "US jobs weak" (label: negative for USD), both items land
+  in `CACHE["news"]` with their independent sentiment labels. There's no reconciliation layer that
+  says "USD net sentiment across last 1h = +0.2 (mildly hawkish despite the jobs miss)". The AI
+  gets the raw list (or more likely, no list at all per #15) and has no aggregated view. A
+  future `aggregate_sentiment()` (per #15) must define a conflict policy: weighted-mean (current
+  items dominate per #19), majority-vote (loses nuance), or "uncertainty-aware" (return
+  `confidence: low` when provider signals disagree by > 0.5).
+  Fix: (a) Compute `sentiment_consensus` = time-weighted mean (per #19) of per-currency
+  sentiment (per #18). (b) Compute `sentiment_dispersion` = stddev of provider signals — if
+  dispersion > 0.4, set `sentiment_confidence: "low"` and surface a UI warning "Providers
+  disagree on USD sentiment". (c) Inject both consensus and dispersion into the AI context so
+  the LLM knows when sentiment is fractured and should reduce confidence.
+
+==================================================================
+SUMMARY
+==================================================================
+Critical: 4 (#2 MARKETAUX quota, #8 context truncation + zero-context batch/auto-trade, #15
+hardcoded sentiment card, #1a news route 1.5s timeout)
+High:     7 (#3 no 429 backoff, #5 broken symbol mapping, #9 no provider cascade, #12 stale
+signal execution, #14 prompt lacks indicator semantics, #17 sentiment display-only, #18
+currency-specific sentiment not tracked, #3a demo calendar missing time field)
+Medium:   9 (#1 silent key check + masked demo, #4 no force-refresh, #6 no dedup, #10 STRONG
+vs BUY collapsed, #11 uncalibrated confidence, #13 no consensus, #16 impact ignores currency,
+#19 no time-decay, #20 no conflict resolution, #2a hardcoded demo flag on batch)
+Low:      1 (#7 polling-only, undocumented trade-off)
+
+Top 3 cross-cutting root causes:
+1. The "context" object passed to `analyze()` is treated as decoration, not data. Single-pair
+   route truncates it to 800 chars; batch endpoint and auto-trade loop omit it entirely. Until
+   this is fixed, every "AI signal" in the multi-pair matrix and every auto-trade order is the
+   LLM's prior on the symbol name, not an analysis of current market state.
+2. The news→trade wiring is broken at every layer: symbol mapping is raw tickers (#5),
+   sentiment is per-stock not per-currency (#18), there's no aggregate (#15), no time-decay
+   (#19), no conflict resolution (#20), and nothing is injected into the AI prompt (#17). The
+   news blackout (#16) is the ONLY coupling, and it's overly broad (blocks all pairs on any
+   high-impact event) and silently disabled in demo mode (#3a).
+3. Demo-state honesty is systematically broken. The news route overrides `demo: false`
+   (route.ts:12), the batch analysis route overrides `demo: false` (batch/route.ts:75), the
+   batch endpoint hardcodes `demo: True` (main.py:797), the demo calendar omits `time` so
+   blackout silently disables (#3a), and the Sentiment Summary card shows hardcoded 42/33/25%
+   (news-view.tsx:173-183). A user running this in dev has no reliable way to know whether they
+   are looking at real data, cached data, demo data, or hallucinated LLM output.
+
+No code changes made. Findings handed off for implementation.

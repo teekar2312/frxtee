@@ -170,20 +170,42 @@ export function NewsView() {
             <SectionHeader title="Sentiment Summary" />
             <div className="grid grid-cols-3 gap-2 text-center">
               <div className="rounded-md border p-2">
-                <div className="text-lg font-semibold text-success tnum">42%</div>
+                <div className="text-lg font-semibold text-success tnum">
+                  {data?.sentiment?.bullish ?? "—"}%
+                </div>
                 <div className="text-[10px] text-muted-foreground">Bullish</div>
               </div>
               <div className="rounded-md border p-2">
-                <div className="text-lg font-semibold text-muted-foreground tnum">33%</div>
+                <div className="text-lg font-semibold text-muted-foreground tnum">
+                  {data?.sentiment?.neutral ?? "—"}%
+                </div>
                 <div className="text-[10px] text-muted-foreground">Neutral</div>
               </div>
               <div className="rounded-md border p-2">
-                <div className="text-lg font-semibold text-danger tnum">25%</div>
+                <div className="text-lg font-semibold text-danger tnum">
+                  {data?.sentiment?.bearish ?? "—"}%
+                </div>
                 <div className="text-[10px] text-muted-foreground">Bearish</div>
               </div>
             </div>
-            <div className="text-[11px] text-muted-foreground mt-2">
-              Aggregated across Finnhub + MARKETAUX over last 24h.
+            <div className="flex items-center justify-between mt-2">
+              <div className="text-[11px] text-muted-foreground">
+                Score: <span className="font-semibold tnum">
+                  {data?.sentiment?.score != null
+                    ? (data.sentiment.score > 0 ? "+" : "") + data.sentiment.score
+                    : "—"}
+                </span>
+                {" · "}
+                <span className={
+                  data?.sentiment?.summary === "bullish" ? "text-success" :
+                  data?.sentiment?.summary === "bearish" ? "text-danger" : ""
+                }>
+                  {data?.sentiment?.summary ?? "—"}
+                </span>
+              </div>
+              <div className="text-[11px] text-muted-foreground">
+                {data?.sentiment?.count ?? 0} items · time-weighted
+              </div>
             </div>
           </Card>
         </div>

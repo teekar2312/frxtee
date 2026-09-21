@@ -33,7 +33,7 @@ from mt5_service import close_position, connect, disconnect, positions as mt5_po
 from mt5_service import send_order, status as mt5_status, ticks as mt5_ticks
 from mt5_service import get_pip_value_per_lot, get_recent_deals, modify_sl_tp
 from mt5_service import partial_close, _pip_for_digits
-from news_service import economic_calendar, fetch_news
+from news_service import economic_calendar, fetch_news, aggregate_sentiment
 from risk_manager import guard, size_position, near_high_impact_news, trail_stop
 import ai_service
 import backtest as bt
@@ -292,9 +292,33 @@ async def _auto_trade_loop():
                 if now - last < _SIGNAL_COOLDOWN_SEC:
                     continue
 
-                # fetch analysis
+                # build context with indicators + sentiment (was empty — hallucinated)
+                ctx = {"timeframe": "M15", "symbol": symbol}
+                try:
+                    rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 100)
+                    if rates:
+                        import pandas as pd
+                        from indicators import compute as ind_compute
+                        df = pd.DataFrame(rates)
+                        top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                                 "stochastic", "supertrend", "psar", "cci"]
+                        results = ind_compute(df, top10)
+                        readings = {}
+                        for k, v in results.items():
+                            if isinstance(v, list) and v:
+                                readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                        ctx["indicators"] = readings
+                        ctx["current_price"] = rates[-1]["close"]
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    ctx["sentiment"] = _get_symbol_sentiment(symbol)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # fetch analysis with real context
                 result = await asyncio.to_thread(
-                    ai_service.analyze, symbol, provider, {"timeframe": "M15"}
+                    ai_service.analyze, symbol, provider, ctx
                 )
                 signal = result.get("signal", "NEUTRAL")
                 confidence = result.get("confidence", 0)
@@ -700,7 +724,20 @@ async def api_partial_close(ticket: int, request: Request, body: dict = None,
 async def api_news():
     # fetch news + calendar concurrently (were sequential)
     n, cal = await asyncio.gather(fetch_news(), economic_calendar())
-    return {"news": n, "calendar": cal, "demo": not n}
+    # attach real aggregate sentiment (was hardcoded in UI)
+    sentiment = aggregate_sentiment()
+    return {"news": n, "calendar": cal, "sentiment": sentiment, "demo": not n}
+
+
+@app.get("/api/trading/sentiment")
+async def api_sentiment(symbol: str | None = None):
+    """Get aggregate sentiment, optionally filtered by symbol."""
+    return aggregate_sentiment(symbol)
+
+
+def _get_symbol_sentiment(symbol: str) -> dict:
+    """Sync helper to get sentiment for a symbol (for AI context)."""
+    return aggregate_sentiment(symbol)
 
 
 @app.get("/api/trading/analysis")
@@ -732,6 +769,11 @@ async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
                 ctx["recent_low"] = min(r["low"] for r in rates[-20:])
         except Exception as exc:  # noqa: BLE001
             log.debug("indicator context build failed: %s", exc)
+        # attach real sentiment (was hallucinated)
+        try:
+            ctx["sentiment"] = _get_symbol_sentiment(symbol)
+        except Exception:  # noqa: BLE001
+            pass
         return ctx
 
     # Run AI analysis (with indicator context) + ML prediction concurrently
@@ -766,13 +808,47 @@ async def api_analysis_batch(symbols: str, provider: str = "zai"):
 
     Runs all pair analyses concurrently — reduces 5 round-trips to 1 for the
     multi-pair signal matrix. Returns {results: {symbol: analysis}}.
+    Builds indicator context for each symbol (was empty — signals were
+    hallucinated from symbol name only).
     """
-    sym_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]  # cap at 10
+    sym_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]
+
+    async def _build_ctx(sym: str) -> dict:
+        """Build indicator + sentiment context for a symbol."""
+        ctx = {"timeframe": "M15", "symbol": sym}
+        try:
+            rates = await asyncio.to_thread(mt5_candles, sym, "M15", 100)
+            if rates:
+                import pandas as pd
+                from indicators import compute
+                df = pd.DataFrame(rates)
+                top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                         "stochastic", "supertrend", "psar", "cci"]
+                results = compute(df, top10)
+                readings = {}
+                for k, v in results.items():
+                    if isinstance(v, list) and v:
+                        readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                    elif isinstance(v, (int, float)):
+                        readings[k] = round(v, 5)
+                ctx["indicators"] = readings
+                ctx["current_price"] = rates[-1]["close"]
+                ctx["recent_high"] = max(r["high"] for r in rates[-20:])
+                ctx["recent_low"] = min(r["low"] for r in rates[-20:])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("batch context build failed for %s: %s", sym, exc)
+        # attach sentiment
+        try:
+            ctx["sentiment"] = _get_symbol_sentiment(sym)
+        except Exception:  # noqa: BLE001
+            pass
+        return ctx
 
     async def _analyze_one(sym: str):
         try:
+            context = await _build_ctx(sym)
             ai_result, ml_pred = await asyncio.gather(
-                asyncio.to_thread(ai_service.analyze, sym, provider, {"timeframe": "M15"}),
+                asyncio.to_thread(ai_service.analyze, sym, provider, context),
                 _ml_for_symbol(sym),
             )
             if ml_pred:
@@ -794,7 +870,7 @@ async def api_analysis_batch(symbols: str, provider: str = "zai"):
 
     pairs = await asyncio.gather(*[_analyze_one(s) for s in sym_list])
     results = dict(pairs)
-    return {"results": results, "provider": provider, "demo": True}
+    return {"results": results, "provider": provider, "demo": False}
 
 
 @app.get("/api/trading/ml/info")
