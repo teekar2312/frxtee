@@ -11,6 +11,9 @@ import { NextRequest, NextResponse } from "next/server";
 export const BACKEND_URL =
   process.env.TRADING_BACKEND_URL || "http://127.0.0.1:8000";
 
+/** API token forwarded to backend when ZENITRADE_API_TOKEN is set server-side. */
+export const API_TOKEN = process.env.ZENITRADE_API_TOKEN || "";
+
 /** Probe result returned by the proxy. */
 export interface ProxyResult<T> {
   data: T | null;
@@ -39,6 +42,8 @@ export async function proxyBackend<T>(
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
+        // forward auth token so backend doesn't 401 on mutating endpoints
+        ...(API_TOKEN ? { "X-API-Token": API_TOKEN } : {}),
         ...(init.headers as Record<string, string> | undefined),
       },
     });

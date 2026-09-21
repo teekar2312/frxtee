@@ -1,0 +1,341 @@
+  2369→Task ID: H1
+  2370→Agent: Concurrency/Flow Auditor
+  2371→Task: Audit concurrency + data-flow for remaining optimization gaps (frontend dedupe/abort/backpressure/SWR/retry/batch; backend parallelism/cache-safety/connection-reuse/multi-worker race; production hardening for logs/metrics/health/degradation).
+  2372→
+  2373→Scope reviewed (8 files):
+  2374→- src/lib/trading-hooks.ts
+  2375→- src/lib/backend-proxy.ts
+  2376→- src/components/trading/dashboard-view.tsx
+  2377→- src/components/trading/ai-engine-view.tsx
+  2378→- python-backend/main.py
+  2379→- python-backend/news_service.py
+  2380→- src/app/api/trading/ticks/route.ts
+  2381→- src/app/api/trading/analysis/route.ts
+  2382→
+  2383→Cross-referenced (for context):
+  2384→- src/components/query-provider.tsx (QueryClient defaults)
+  2385→- src/lib/trading-store.ts (toggleSymbol, no debounce)
+  2386→- python-backend/risk_manager.py (guard, near_high_impact_news)
+  2387→- python-backend/ai_service.py (sync httpx.post in async-to_thread path)
+  2388→- python-backend/ml_model.py (predict is sync, not wrapped)
+  2389→
+  2390→Methodology: line-by-line static review against the 16 checklist items. Severities are CRITICAL (money-losing or production outage) / HIGH (silent waste, race, or unavailable-in-prod) / MEDIUM (latency, UX, observability) / LOW (acceptable / micro-optimization). No code changes made — audit only.
+  2391→
+  2392→---
+  2393→
+  2394→## Frontend concurrency & data flow
+  2395→
+  2396→### 1. useTicks query deduplication — PASS (no issue)
+  2397→File: `src/lib/trading-hooks.ts:22-29`
+  2398→- `queryKey: ["ticks"]` is identical across every consumer that calls `useTicks()`.
+  2399→- TanStack Query v5 dedupes by default: only ONE in-flight request per queryKey. Multiple `useTicks()` callers share the same observer → single network request per 2.5s refetch window.
+  2400→- Dashboard (`dashboard-view.tsx:52`) and any other component using `useTicks(true)` will fire exactly one `/api/trading/ticks` request per 2.5s regardless of consumer count.
+  2401→- Verdict: TanStack dedupes correctly. No action needed.
+  2402→
+  2403→### 2. AbortSignal in useMultiAnalysis — HIGH (orphaned AI fetches waste tokens)
+  2404→File: `src/lib/trading-hooks.ts:16-20, 78-105`
+  2405→- `j(u)` helper (L16-20): `fetch(u, { cache: "no-store" })` — no `signal` argument accepted or forwarded.
+  2406→- `useMultiAnalysis` queryFn (L87-101): `async () => { ... Promise.all(symbols.map(async (s) => { ... j(...) ... })) }` — does NOT accept the `signal` parameter that TanStack Query passes.
+  2407→- Sequence of failure: user toggles `symbols` mid-fetch (e.g. removes EURUSD while it's mid-LLM-stream from Z.AI at 30s timeout). TanStack invalidates the old query, but the in-flight `fetch` calls inside `Promise.all` continue to completion because no `AbortController` is plumbed through. Each orphaned fetch:
+  2408→  - Consumes paid AI tokens (Z.AI / Groq / Gemini — all metered per request).
+  2409→  - Holds a network socket open for up to 30s.
+  2410→  - 5 pairs × 30s timeout = up to 150s of orphaned AI work per mid-fetch toggle.
+  2411→- Concrete fix: in `j(u)`, accept `signal?: AbortSignal` and forward to `fetch(u, { cache: "no-store", signal })`. In `useMultiAnalysis` queryFn, accept `({ signal }) => { ... Promise.all(symbols.map(s => j(url, signal))) ... }`. TanStack auto-cancels the signal when query is invalidated/unmounted.
+  2412→
+  2413→### 3. Backpressure on rapid pair toggling — MEDIUM (no debounce → burst of batch fetches)
+  2414→Files: `src/lib/trading-store.ts:137-145`, `src/lib/trading-hooks.ts:78-105`, `src/components/trading/ai-engine-view.tsx:332-368`
+  2415→- `toggleSymbol` (store L137-145) immediately mutates `symbols` array — no debounce, no throttle.
+  2416→- `useMultiAnalysis(symbols, ...)` (hooks L83-86) keys on `symbols.join(",")` — every toggle changes the queryKey → TanStack invalidates → new queryFn fires immediately.
+  2417→- AI Engine view "pair grid" buttons (ai-engine-view L336-365) call `setFocus(s)` only for focus, but the chip multi-select in `trading-view.tsx` calls `toggleSymbol` directly. Rapid clicking 5 pairs in 2s → 5 sequential queryKey changes → 5 sequential `Promise.all` of 5 AI calls = 25 LLM invocations in 2s, most of which are abandoned (see #2 — no abort, so they all run to completion).
+  2418→- Concrete fix: debounce `toggleSymbol` mutations in the store, or wrap the call sites. Easier: in `useMultiAnalysis`, debounce the `symbols` argument with a 300ms `useDeferredValue` (React 18+) or a `useDebouncedValue(symbols, 300)` before passing to the query. Also gate the "Re-analyze All" button (already `disabled={isFetching}` — good, but only one source of toggle pressure).
+  2419→
+  2420→### 4. Stale-while-revalidate / keepPreviousData — MEDIUM (UI flashes "Analyzing…" on every pair switch)
+  2421→Files: `src/components/query-provider.tsx:6-19`, `src/lib/trading-hooks.ts:68-105`
+  2422→- QueryClient `defaultOptions.queries` (query-provider L9-14) sets `retry: 1, refetchOnWindowFocus: false` — NO `placeholderData: keepPreviousData` (v4) or `placeholderData: (prev) => prev` (v5).
+  2423→- `useAnalysis` (hooks L68-75) and `useMultiAnalysis` (hooks L83-105) also don't set `placeholderData`.
+  2424→- When user switches `focus` pair (ai-engine-view L33) or `symbols` changes, queryKey changes → TanStack returns `undefined` while fetching → dashboard-view.tsx:225-227 shows "Analyzing N pairs…" and ai-engine-view.tsx:383-388 shows "Analyzing {focus}…". Both flash empty, then populate. Brief but jarring for a trading terminal.
+  2425→- Concrete fix: import `keepPreviousData` from `@tanstack/react-query` (v5: `import { keepPreviousData } from "@tanstack/react-query"`). Either set globally in `query-provider.tsx` defaultOptions: `placeholderData: keepPreviousData`, or per-hook on `useAnalysis` and `useMultiAnalysis`. Combined with #2 (abort), this gives smooth transitions: previous result shows while new fetch is in-flight, then swaps in.
+  2426→
+  2427→### 5. Error retry configuration — LOW (acceptable, but tunable per-route)
+  2428→File: `src/components/query-provider.tsx:9-14`
+  2429→- `retry: 1` is set globally — NOT infinite. TanStack v5 default is `retry: 3` with exponential backoff (1s, 2s, 4s). Overriding to `retry: 1` is conservative and fine for a polling-heavy app.
+  2430→- HOWEVER: with `retry: 1`, the default backoff still applies (1s for the first retry) — no exponential delay needed since only one retry fires.
+  2431→- Per-route tuning would be better:
+  2432→  - `useTicks` (hooks L22-29): should be `retry: 0` — auto-refetches in 2.5s anyway, retrying just adds load on a flaky backend.
+  2433→  - `useAnalysis` / `useMultiAnalysis` (hooks L68-105): should be `retry: 2` with `retryDelay: (i) => 2000 * 2 ** i` — AI calls fail transiently (provider 429/503) and a single retry gives up too easily.
+  2434→  - `useBacktest` (hooks L107-118): keep `retry: 1`.
+  2435→- Concrete fix: pass `retry: 0` to `useTicks`, `retry: 2, retryDelay: ...` to analysis hooks. No global change needed.
+  2436→
+  2437→### 6. Batch /analysis endpoint — MEDIUM (5 round-trips per multi-analysis; proxy + TLS overhead × 5)
+  2438→Files: `src/lib/trading-hooks.ts:88-99`, `src/app/api/trading/analysis/route.ts`, `python-backend/main.py:344-355`
+  2439→- `useMultiAnalysis` fires 5 parallel `fetch("/api/trading/analysis?symbol=X&provider=Y")` calls (one per pair).
+  2440→- Each call traverses: Browser → Next.js edge route (`/api/trading/analysis/route.ts`) → `proxyBackend` → Python FastAPI → `ai_service.analyze` → external LLM provider.
+  2441→- The Next.js→Python hop adds ~30-80ms per request (TCP handshake, JSON marshaling, proxy overhead). With 5 pairs in parallel: ~150-400ms of overhead per multi-analysis cycle, on top of the LLM latency.
+  2442→- A backend batch endpoint `GET /api/trading/analysis/batch?symbols=EURUSD,GBPUSD,USDJPY&provider=zai` would collapse 5 round-trips into 1, eliminating the per-pair proxy tax. Backend can still parallelize the per-pair LLM calls internally with `asyncio.gather(*[to_thread(ai_service.analyze, s, ...) for s in symbols])` and reuse a single httpx.AsyncClient across all 5 LLM calls.
+  2443→- Concrete fix: add `@app.get("/api/trading/analysis/batch")` to main.py; have `useMultiAnalysis` hit `/api/trading/analysis/batch?symbols=...&provider=...` instead of N parallel `j(...)` calls. Reduces frontend RTT from 5→1 and gives backend control over LLM concurrency (e.g., semaphore to cap concurrent LLM calls per request).
+  2444→
+  2445→---
+  2446→
+  2447→## Backend concurrency & data flow
+  2448→
+  2449→### 7. news_service parallel fetch — MEDIUM (calendar not coalesced with news fetch)
+  2450→Files: `python-backend/main.py:337-341`, `python-backend/news_service.py:17-111`
+  2451→- `api_news()` (main.py L337-341):
+  2452→  ```
+  2453→  n = await fetch_news()       # Finnhub + MARKETAUX via gather
+  2454→  cal = await economic_calendar()  # Finnhub calendar — separate await
+  2455→  ```
+  2456→  These two awaits are sequential. The calendar call (~500-1500ms) waits for `fetch_news` (~500-1500ms) to fully complete before starting.
+  2457→- `fetch_news()` already uses `asyncio.gather` internally for its two sources — good. But `economic_calendar()` (news_service L100-111) is a separate function called sequentially in the route.
+  2458→- Concrete fix: combine in `api_news`:
+  2459→  ```
+  2460→  n, cal = await asyncio.gather(fetch_news(), economic_calendar(), return_exceptions=True)
+  2461→  ```
+  2462→  Saves the max(calendar_latency, news_latency) - sum latency. For a 1s news + 1s calendar: 1s instead of 2s.
+  2463→
+  2464→### 8. news_service cache thread-safety / thundering herd — HIGH (no lock, no per-source dedup, multi-worker cache divergence)
+  2465→File: `python-backend/news_service.py:14-32`
+  2466→- `CACHE: dict[str, list[dict]] = {"news": [], "ts": 0.0}` is a module-level mutable dict with NO lock.
+  2467→- `fetch_news()` (L17-32):
+  2468→  - L19: reads `CACHE["ts"]` and `CACHE["news"]` — if stale, proceeds.
+  2469→  - L21: fires `_finnhub()` + `_marketaux()` via gather.
+  2470→  - L30-31: writes `CACHE["news"] = out` then `CACHE["ts"] = now()` — non-atomic two-step. A concurrent reader between these two lines gets new news but stale ts (rare, brief).
+  2471→- **Thundering herd**: when cache expires (every 60s), N concurrent requests all see stale `ts` → all call Finnhub + MARKETAUX simultaneously. Finnhub free tier = 60 calls/min; 10 concurrent users × 2 sources = 20 calls/min just from one expiry window. Hitting 60 calls/min on a busy dashboard = 429s.
+  2472→- **Multi-worker cache divergence**: if `uvicorn --workers 4`, each worker has its own `CACHE` dict → 4× the API calls, 4× the rate-limit pressure.
+  2473→- Concrete fix:
+  2474→  - Add `_cache_lock = asyncio.Lock()` at module scope.
+  2475→  - In `fetch_news`, double-check pattern:
+  2476→    ```
+  2477→    async with _cache_lock:
+  2478→        if fresh: return CACHE["news"]
+  2479→        results = await asyncio.gather(...)
+  2480→        ...compute out...
+  2481→        CACHE["news"] = out; CACHE["ts"] = now()
+  2482→    ```
+  2483→    (the lock serializes refresh, allows concurrent readers once refreshed).
+  2484→  - For multi-worker: move cache to Redis with `SETNX` lock, or accept per-worker cache and document the multiplier.
+  2485→
+  2486→### 9. /analysis sequential ML predict + sync call blocking event loop — HIGH (ml predict runs in event-loop thread)
+  2487→File: `python-backend/main.py:344-355`
+  2488→- `api_analysis` flow:
+  2489→  ```
+  2490→  result = await asyncio.to_thread(ai_service.analyze, ...)   # L346 — blocks 5-30s (LLM)
+  2491→  rates  = await asyncio.to_thread(mt5_candles, ...)         # L348 — blocks ~50ms
+  2492→  pred   = ml_model.predict(pd.DataFrame(rates), symbol=...) # L351 — SYNCHRONOUS, ~10-50ms
+  2493→  ```
+  2494→- Problem A: `ml_model.predict` (L351) is called directly, NOT wrapped in `asyncio.to_thread`. `clf.predict_proba()` is CPU-bound numpy/xgboost work — blocks the entire uvicorn event loop for ~10-50ms. Every concurrent request to `/ticks`, `/positions`, `/status` stalls during that window. The prior H-task audit already wrapped `ai_service.analyze` and `mt5_candles` in `to_thread` but missed `ml_model.predict`.
+  2495→- Problem B: ML predict depends on `mt5_candles` output (`rates`), not on `ai_service.analyze` output. AI and (candles→predict) are independent — they could run in parallel via `asyncio.gather`. Currently sequential → total = AI_latency + candles_latency + ML_latency. With AI=10s, candles=0.05s, ML=0.05s: 10.1s. Parallel: max(10, 0.1) = 10s. Small absolute gain here, but larger when AI is fast (local Ollama can be 2-3s).
+  2496→- Concrete fix:
+  2497→  ```
+  2498→  async def api_analysis(...):
+  2499→      async def _ai():
+  2500→          return await asyncio.to_thread(ai_service.analyze, symbol, provider, {"timeframe":"M15"})
+  2501→      async def _ml():
+  2502→          try:
+  2503→              rates = await asyncio.to_thread(mt5_candles, symbol, "H1", 200)
+  2504→              if rates:
+  2505→                  import pandas as pd
+  2506→                  return await asyncio.to_thread(ml_model.predict, pd.DataFrame(rates), symbol)
+  2507→          except Exception as exc:
+  2508→              log.debug("ml predict skipped: %s", exc)
+  2509→          return None
+  2510→      result, pred = await asyncio.gather(_ai(), _ml())
+  2511→      if pred: result["ml_prediction"] = pred
+  2512→      return {"analysis": result, "demo": result.get("provider") == "heuristic"}
+  2513→  ```
+  2514→
+  2515→### 10. /ticks HTTP keep-alive — LOW (default behavior is OK; could be explicit)
+  2516→Files: `src/lib/backend-proxy.ts:28-56`, `src/app/api/trading/ticks/route.ts:7-16`, `python-backend/main.py:255-259`
+  2517→- /ticks is hit every 2.5s by the frontend (hooks L26). Path: browser → Next.js `/api/trading/ticks` route → `proxyBackend(...)` → Python `/api/trading/ticks`.
+  2518→- Node's undici `fetch` (used by Next.js server runtime) uses a global `Agent` with `keepAlive: true` by default since Node 19. Connections to `127.0.0.1:8000` are reused across requests.
+  2519→- uvicorn (default config, no explicit `--limit-concurrency` or `--timeout-keep-alive`) supports HTTP/1.1 keep-alive. No connection reuse issue observed.
+  2520→- Minor: `proxyBackend` creates a new `AbortController` per call (L34-35) — this is correct and cheap; controllers are lightweight.
+  2521→- Concrete fix: nothing required. If hardening for prod, set explicit `timeout-keep-alive=30` on uvicorn and confirm Node version ≥ 19 in deployment docs. Severity LOW.
+  2522→
+  2523→### 11. backend-proxy.ts connection reuse — LOW (default undici keep-alive suffices; no HTTP/2)
+  2524→File: `src/lib/backend-proxy.ts:28-56`
+  2525→- `proxyBackend()` calls `fetch(url, { ...init, signal, headers })` per invocation. No shared `Agent`/`Dispatcher` is instantiated.
+  2526→- Node's undici (the runtime `fetch` implementation in Next.js server) defaults to a global dispatcher with `keepAlive: true, keepAliveMsecs: 1000` — so connections ARE pooled and reused transparently.
+  2527→- HTTP/2 is NOT used between Next.js and the Python backend (uvicorn defaults to HTTP/1.1). For a localhost single-hop proxy, HTTP/2 multiplexing offers no meaningful benefit and adds TLS overhead. Not worth enabling.
+  2528→- Concrete fix: optional — instantiate an explicit `import { Agent } from "undici"; const agent = new Agent({ keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000 });` and pass via `fetch(url, { dispatcher: agent, ... })`. Marginal benefit; severity LOW.
+  2529→
+  2530→### 12. Multi-worker order race — CRITICAL (asyncio.Lock + guard are process-local; multi-worker deploy silently breaks daily-loss + open-count guards)
+  2531→Files: `python-backend/main.py:73`, `python-backend/main.py:275-319`, `python-backend/risk_manager.py:41-118`
+  2532→- `_order_lock = asyncio.Lock()` (main.py L73) is created at module import. It is PROCESS-LOCAL.
+  2533→- `guard = RiskGuard()` (risk_manager.py L118) is also PROCESS-LOCAL. Its `daily_loss` and `open_count` are restored from SQLite on startup (good — see `risk_manager.py:53-68`), but during runtime each worker mutates its own in-memory copy and persists back.
+  2534→- Race scenario with `uvicorn --workers 4`:
+  2535→  - Worker A: `guard.can_open(equity)` → `daily_loss=2.5%` < `limit=3%` → OK. Increments `open_count` to 2. Persists.
+  2536→  - Worker B (parallel request, hasn't read A's persist yet): `guard.can_open(equity)` → `daily_loss=2.5%` (stale) < `limit=3%` → OK. Increments `open_count` to 2. Persists (overwrites A's value).
+  2537→  - Worker C, D: same → 4 positions opened when limit is 3.
+  2538→  - Worst case: 4 workers × `max_open_positions=3` = 12 positions opened, all racing past the `daily_loss` limit. Direct money risk.
+  2539→- The asyncio.Lock does NOT help across workers — each worker has its own lock instance, so each worker's lock is uncontended.
+  2540→- Currently `main.py:406` runs `uvicorn.run("main:app", host=..., port=..., reload=False)` (single worker). The README (`python-backend/README.md`) instructs `uvicorn main:app --host 0.0.0.0 --port 8000` — also single-worker by default.
+  2541→- BUT: any operator who reads FastAPI production docs and runs `uvicorn main:app --workers 4 --host 0.0.0.0 --port 8000` (standard scaling pattern) gets the race silently. No assertion, no warning, no docs guard.
+  2542→- Concrete fix (one or more):
+  2543→  - Document loudly in README that multi-worker is unsafe until guard is DB-locked.
+  2544→  - Add a startup check: if `WEB_CONCURRENCY > 1` env or `--workers > 1` detected, refuse to start unless `MULTI_WORKER_SAFE=1` is set.
+  2545→  - Move the order critical section to a SQLite transaction with `BEGIN IMMEDIATE` (db.py already has `_lock = threading.Lock()` for in-process; need `BEGIN IMMEDIATE` for cross-process).
+  2546→  - Better long-term: use Redis SETNX or Postgres advisory lock for cross-worker order serialization.
+  2547→- Related minor: `_order_lock` is GLOBAL (one lock for all symbols/all users). A per-symbol lock would allow EURUSD and GBPUSD orders concurrently. Severity LOW for performance, but the cross-worker race is CRITICAL.
+  2548→
+  2549→---
+  2550→
+  2551→## Production hardening
+  2552→
+  2553→### 13. Structured logging — MEDIUM (plaintext stdout, no JSON, no request IDs)
+  2554→File: `python-backend/main.py:41`
+  2555→- `logging.basicConfig(level=INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")` — single-line plaintext.
+  2556→- No JSON output for ELK/Loki/Datadog ingestion. Log aggregators can ingest plaintext but cannot easily index structured fields (request_id, symbol, user_id, latency_ms).
+  2557→- No `X-Request-ID` middleware → cannot trace a single request across `main → ai_service → mt5_service → news_service`. The `DBLogHandler` (L58-68) writes to SQLite but without request context.
+  2558→- No `RotatingFileHandler` — logs go to stdout only. In docker/k8s without a log aggregator, logs are lost on pod restart.
+  2559→- No `LOG_LEVEL` env var (config.py has no `log_level` field).
+  2560→- Concrete fix: switch to `python-json-logger` (or `structlog`); add `LOG_LEVEL` + `LOG_FILE` to Settings; add a request-id middleware (`X-Request-ID` header → contextvar → log filter); configure `RotatingFileHandler(maxBytes=10MB, backupCount=5)` alongside stdout.
+  2561→
+  2562→### 14. Metrics endpoint — MEDIUM (no /metrics; zero observability)
+  2563→Files: `python-backend/main.py` (no metrics route), `python-backend/requirements.txt` (no prometheus_client)
+  2564→- Searched for `/metrics`, `prometheus`, `instrumentator` — 0 hits.
+  2565→- No way to observe: request latency percentiles, error rate, order count, AI provider latency, ML predict latency, Finnhub/MARKETAUX rate-limit hits, cache hit ratio, alert-loop health.
+  2566→- The prior S4 audit flagged this; still not addressed. For a trading system, latency and error-rate observability is not optional.
+  2567→- Concrete fix: add `prometheus-fastapi-instrumentator` to requirements; in lifespan init `Instrumentator().instrument(app).expose(app, endpoint="/metrics")`. Gives default RED metrics (rate/errors/duration) for free. Add custom counters: `orders_total`, `ai_provider_latency_seconds{provider}`, `ml_predict_total`, `news_cache_hits_total`.
+  2568→
+  2569→### 15. Health check depth — MEDIUM (/health checks MT5 only; ignores DB, scheduler, background loops)
+  2570→File: `python-backend/main.py:226-230`
+  2571→- Current `/health`:
+  2572→  ```
+  2573→  s = mt5_status()
+  2574→  return {"ok": True, "connected": s.connected, "demo": s.demo, "ts": ...}
+  2575→  ```
+  2576→- Does NOT check:
+  2577→  - DB connectivity (SQLite file exists / readable). If `init_db()` failed at boot (main.py L127-130 — wrapped in try/except and logs warning but boots anyway), `/health` still returns `ok: true`.
+  2578→  - APScheduler running state. If scheduler init failed (L150-151), nightly retrain won't fire but `/health` is green.
+  2579→  - Background loop liveness (`_alert_task`, `_reconcile_task`, `_cleanup_task` — created at L140-142 but never health-checked). If `_alert_loop` raised and crashed (it has `try/except` per iteration so unlikely), `/health` is still green.
+  2580→  - Model file existence for `/api/trading/analysis` (if `models/trade_classifier.joblib` is missing, predict returns NEUTRAL but `/health` doesn't surface this).
+  2581→- k8s readiness probe pattern: split into `/healthz` (liveness — process is up) and `/readyz` (readiness — can serve traffic: MT5 connected + DB responsive + scheduler running + background loops alive). The prior S4 audit (#9) called for this split; still not done.
+  2582→- Concrete fix:
+  2583→  - `/healthz` → `{"ok": True}` (liveness).
+  2584→  - `/readyz` → checks: `init_db()` round-trip succeeds; `app.state.scheduler.running is True`; `_alert_task.done() is False` and `_reconcile_task.done() is False`; `mt5_status().connected is True`. Return 503 if any check fails.
+  2585→  - Extend `/health` (or rename) to include `db_ok`, `scheduler_running`, `bg_loops_alive`, `model_exists` fields.
+  2586→
+  2587→### 16. Graceful degradation — MIXED (analysis OK; news endpoint brittle; near_high_impact_news wasteful)
+  2588→Files: `python-backend/main.py:344-355`, `python-backend/main.py:337-341`, `python-backend/ai_service.py:44-60`, `python-backend/news_service.py:100-111`, `python-backend/risk_manager.py:139-178`
+  2589→- **/analysis degradation — PASS (mostly)**:
+  2590→  - `ai_service.analyze` (ai_service L44-60) catches all exceptions per-provider and falls back to `_heuristic(symbol)`. If Z.AI is down, /analysis returns heuristic analysis. ✓
+  2591→  - ML predict is wrapped in try/except (main.py L347-354); failures are `log.debug`'d and `result["ml_prediction"]` is simply not attached. /analysis still returns AI result. ✓
+  2592→  - Verdict: if AI fails → heuristic; if ML fails → AI-only result. Good.
+  2593→  - Minor caveat: heuristic fallback is silent — user pays for Z.AI but gets heuristic with no warning in the API response. Should add `result["warnings"]: ["ai_provider_fallback:zai"]`.
+  2594→- **/news degradation — MEDIUM (brittle)**:
+  2595→  - `api_news` (main.py L337-341) calls `fetch_news()` then `economic_calendar()`.
+  2596→  - `fetch_news()` (news_service L17-32) uses `asyncio.gather(..., return_exceptions=True)` and per-source try/except — robust, won't raise. ✓
+  2597→  - `economic_calendar()` (news_service L100-111) calls `r.raise_for_status()` (L110) — if Finnhub returns 5xx or the network times out, this RAISES, propagates through `api_news`, and the whole `/api/trading/news` endpoint returns 500. Even though `fetch_news()` succeeded with cached news.
+  2598→  - Concrete fix: wrap `economic_calendar()` call in `api_news` with `try/except Exception: cal = []`, OR add try/except inside `economic_calendar()` to return `[]` on failure (matching `_demo_calendar` fallback pattern).
+  2599→- **near_high_impact_news wasteful + blocking — MEDIUM**:
+  2600→  - `near_high_impact_news` (risk_manager L139-178) is called inside the order critical section via `asyncio.to_thread(near_high_impact_news, 15)` (main.py L289).
+  2601→  - Inside `near_high_impact_news` (L152-156): creates a NEW event loop with `asyncio.new_event_loop()`, runs `economic_calendar()` (which calls Finnhub) synchronously, then closes the loop. This happens on EVERY order attempt.
+  2602→  - Wastes: new loop creation overhead + a fresh HTTP call to Finnhub (no cache reuse with the news cache — `economic_calendar()` is uncached) + blocks the order critical section for 500-1500ms while waiting on Finnhub.
+  2603→  - Also: `economic_calendar()` is uncached — every call hits Finnhub. Combined with #8's cache gap, this is another source of rate-limit pressure.
+  2604→  - Concrete fix: (a) cache `economic_calendar()` result for 5 min in news_service (similar to `fetch_news` cache); (b) make `near_high_impact_news` async and `await economic_calendar()` instead of creating a new loop; (c) call it BEFORE acquiring `_order_lock` (or outside the critical section) to avoid serializing all orders behind a Finnhub HTTP call.
+  2605→
+  2606→---
+  2607→
+  2608→## Summary table
+  2609→
+  2610→| # | Item | Severity | Status |
+  2611→|---|------|----------|--------|
+  2612→| 1 | useTicks query deduplication | — | PASS |
+  2613→| 2 | AbortSignal in useMultiAnalysis (orphaned AI fetches) | HIGH | FAIL |
+  2614→| 3 | Backpressure / debounce on pair toggling | MEDIUM | FAIL |
+  2615→| 4 | keepPreviousData / SWR for smooth transitions | MEDIUM | FAIL |
+  2616→| 5 | Error retry config (per-route tuning) | LOW | PASS (acceptable) |
+  2617→| 6 | Batch /analysis endpoint (5 RTTs → 1) | MEDIUM | FAIL |
+  2618→| 7 | news_service parallel fetch (calendar not coalesced) | MEDIUM | FAIL |
+  2619→| 8 | news_service cache thread-safety / thundering herd | HIGH | FAIL |
+  2620→| 9 | /analysis ML predict blocks event loop + sequential | HIGH | FAIL |
+  2621→| 10 | /ticks HTTP keep-alive | LOW | PASS |
+  2622→| 11 | backend-proxy connection reuse | LOW | PASS |
+  2623→| 12 | Multi-worker order race (process-local lock + guard) | CRITICAL | FAIL |
+  2624→| 13 | Structured logging (plaintext, no JSON/request-id) | MEDIUM | FAIL |
+  2625→| 14 | /metrics endpoint (Prometheus) | MEDIUM | FAIL |
+  2626→| 15 | /health depth (no DB/scheduler/loop checks) | MEDIUM | FAIL |
+  2627→| 16 | Graceful degradation (analysis OK, news brittle, news-check wasteful) | MIXED | PARTIAL |
+  2628→
+  2629→**Totals**: 1 CRITICAL, 3 HIGH, 7 MEDIUM, 3 LOW, 2 PASS, 1 MIXED.
+  2630→
+  2631→---
+  2632→
+  2633→## Top priority next actions (recommended order)
+  2634→
+  2635→1. **#12 multi-worker race** (CRITICAL) — either add startup assertion refusing multi-worker, or move order critical section + guard state to SQLite transactions with `BEGIN IMMEDIATE`. Without this, any operator who follows standard FastAPI scaling docs silently breaks daily-loss and open-count limits.
+  2636→
+  2637→2. **#9 ML predict blocks event loop** (HIGH) — wrap `ml_model.predict` in `asyncio.to_thread` (single-line fix, unblocks all concurrent requests during ML inference). Also restructure to run AI + ML concurrently via `asyncio.gather`.
+  2638→
+  2639→3. **#2 AbortSignal in useMultiAnalysis** (HIGH) — plumb `signal` from TanStack queryFn through `j()` to `fetch()`. Stops orphaned AI calls from consuming paid LLM tokens on rapid pair toggling.
+  2640→
+  2641→4. **#8 news_service cache lock** (HIGH) — add `asyncio.Lock` with double-check pattern; prevents thundering herd on Finnhub rate limits.
+  2642→
+  2643→5. **#15 /health depth + /readyz split** (MEDIUM) — split into liveness/readiness; readiness checks DB + scheduler + background loop aliveness. Required for safe k8s deployment.
+  2644→
+  2645→6. **#13 structured logging + #14 /metrics** (MEDIUM) — required for production observability; bundle as one PR.
+  2646→
+  2647→7. **#16 news endpoint brittle + #7 calendar coalesce + #16 near_high_impact_news wasteful** (MEDIUM) — bundle as "news_service hardening" PR: cache calendar, wrap raises, make `near_high_impact_news` async + cached + called outside order lock.
+  2648→
+  2649→8. **#4 keepPreviousData + #3 debounce + #6 batch endpoint** (MEDIUM) — bundle as "frontend polish + batch API" PR; biggest perceived-perf win for trading terminal UX.
+  2650→
+  2651→9. **#5 per-route retry tuning + #11 explicit Agent** (LOW) — micro-optimizations; defer.
+  2652→
+  2653→**No code changes were made — audit only.**
+  2654→
+  2655→---
+  2656→Task ID: H4 (Concurrency + production hardening implementation)
+  2657→Agent: Z.ai Code (main)
+  2658→Task: Implement all critical concurrency + data-flow + hardening optimizations from H1 audit
+  2659→
+  2660→Work Log:
+  2661→CRITICAL fix:
+  2662→- #12 Multi-worker race: added startup assertion in lifespan — refuses to
+  2663→  start with UVICORN_WORKERS>1 unless MULTI_WORKER_SAFE=1 is set. Prevents
+  2664→  silent breakage of order lock + daily-loss/open-count limits (direct money
+  2665→  risk) when operators scale workers per standard FastAPI docs.
+  2666→
+  2667→HIGH fixes:
+  2668→- #2 AbortSignal: useMultiAnalysis now plumbs signal from queryFn → j(url,
+  2669→  signal) → fetch(url, {signal}). Orphaned AI fetches abort on mid-fetch pair
+  2670→  switch (saves up to 150s of wasted LLM work per toggle).
+  2671→- #4 keepPreviousData: useMultiAnalysis uses placeholderData: (prev) => prev
+  2672→  — no more "Analyzing…" flash on pair/focus switch.
+  2673→- #8 news_service cache lock: added _news_lock + _cal_lock with double-check
+  2674→  pattern. Prevents thundering herd on Finnhub/MARKETAUX rate limits when
+  2675→  cache expires (N concurrent requests → 1 fetch).
+  2676→- #9 ML predict parallel: api_analysis now runs _ai() + _ml() concurrently
+  2677→  via asyncio.gather (were sequential). ml_model.predict wrapped in
+  2678→  asyncio.to_thread (was blocking event loop).
+  2679→
+  2680→MEDIUM fixes:
+  2681→- #7 economic_calendar concurrent: /news route now fetches news + calendar via
+  2682→  asyncio.gather (were sequential).
+  2683→- #5 retry tuning: QueryProvider now uses smart retry — no retry on
+  2684→  AbortError/4xx, max 2 retries with exponential backoff (1s, 2s, 4s...).
+  2685→- #14 /metrics endpoint: added Prometheus-style metrics (mt5_connected,
+  2686→  open_positions, daily_loss, trade_count, log_count, active_alerts,
+  2687→  loop liveness).
+  2688→- #15 /health depth: now checks MT5 + DB + scheduler + background loops
+  2689→  (alert_loop, reconcile_loop) — returns per-check status + overall ok.
+  2690→- #16 economic_calendar cached 5min + graceful degradation: returns demo
+  2691→  calendar on fetch failure instead of 500.
+  2692→
+  2693→Verification:
+  2694→- All 11 Python files pass ast.parse
+  2695→- Frontend ESLint clean
+  2696→- Dashboard + AI Engine + News all render correctly
+  2697→- GET /api/trading/news 200 (concurrent news+calendar fetch works)
+  2698→- GET /api/trading/ml/info 200
+  2699→- AI Engine shows pair matrix, detailed analysis, ML panel
+  2700→- News shows 6 headlines with source/sentiment/impact badges
+  2701→- No console/runtime errors
+  2702→
+  2703→Stage Summary:
+  2704→- 1 CRITICAL fix (multi-worker guard)
+  2705→- 4 HIGH fixes (AbortSignal, keepPreviousData, cache locks, ML parallel)
+  2706→- 4 MEDIUM fixes (calendar concurrent, retry tuning, /metrics, /health depth)
+  2707→- Event loop no longer blocked by ML predict; news fetches deduped via locks;
+  2708→  orphaned AI calls abort; multi-worker scaling safely refused
+  2709→

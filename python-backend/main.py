@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -195,7 +196,11 @@ app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def _rate_handler(request: Request, exc: RateLimitExceeded):
-    return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc.detail))
+    # Must return a Response, not raise HTTPException (which would 500)
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"ok": False, "error": f"Rate limit exceeded: {exc.detail}"},
+    )
 
 
 # ---- auth dependency ----------------------------------------------------

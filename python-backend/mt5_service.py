@@ -159,6 +159,34 @@ def _filling_mode(info) -> int:
     return 1
 
 
+# ---- daily open cache (for changePct computation, refreshed once/day) ----
+_daily_open_cache: dict[str, float] = {}
+_daily_open_date: str = ""
+
+
+def _get_daily_open(symbol: str) -> float | None:
+    """Get today's open price for a symbol (cached per UTC day)."""
+    global _daily_open_date
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    if today != _daily_open_date:
+        _daily_open_cache.clear()
+        _daily_open_date = today
+    if symbol in _daily_open_cache:
+        return _daily_open_cache[symbol]
+    if not MT5_AVAILABLE:
+        return None
+    try:
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 1)  # type: ignore
+        if rates and len(rates) > 0:
+            open_price = float(rates[0]["open"])
+            _daily_open_cache[symbol] = open_price
+            return open_price
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def ticks(symbols: list[str] | None = None) -> list[dict]:
     if not _state["connected"]:
         return []
@@ -169,9 +197,13 @@ def ticks(symbols: list[str] | None = None) -> list[dict]:
         if not t or not info:
             continue
         pip = _pip_for_digits(info.digits)
+        # compute changePct vs daily open
+        daily_open = _get_daily_open(sym)
+        change_pct = ((t.bid - daily_open) / daily_open * 100) if daily_open else 0.0
         out.append({
             "symbol": sym, "bid": t.bid, "ask": t.ask,
             "spreadPips": (t.ask - t.bid) / pip,
+            "changePct": round(change_pct, 3),
             "digits": info.digits, "ts": int(t.time_msc),
         })
     return out
