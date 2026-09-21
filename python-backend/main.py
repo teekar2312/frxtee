@@ -123,6 +123,19 @@ async def _cleanup_loop():
 async def lifespan(app: FastAPI):
     global _alert_task, _reconcile_task, _cleanup_task
     log.info("ZeniTrade AI backend starting — FINEX / MT5 / AI")
+    # CRITICAL: guard against multi-worker deployment that would break
+    # the in-process _order_lock + guard state (daily_loss, open_count).
+    # SQLite risk_state is per-worker unless using a shared DB on disk —
+    # but the in-memory guard is NOT shared. Refuse to start unless ack.
+    import os as _os
+    workers = int(_os.environ.get("UVICORN_WORKERS", "1"))
+    if workers > 1 and _os.environ.get("MULTI_WORKER_SAFE") != "1":
+        raise RuntimeError(
+            f"Refusing to start with {workers} workers — the order lock + risk "
+            "guard are process-local. Running >1 worker silently breaks "
+            "daily-loss and open-count limits (direct money risk). To override, "
+            "set MULTI_WORKER_SAFE=1 (not recommended for real-money trading)."
+        )
     # initialize persistence layer FIRST (risk state restore depends on it)
     try:
         init_db()
@@ -225,9 +238,52 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health probe for container orchestrators."""
+    """Deep health probe: MT5 + DB + scheduler + background loops."""
     s = mt5_status()
-    return {"ok": True, "connected": s.connected, "demo": s.demo, "ts": datetime.now(timezone.utc).isoformat()}
+    checks = {"mt5_connected": s.connected, "demo": s.demo}
+    # DB health
+    try:
+        from db import _conn
+        with _conn() as c:
+            c.execute("SELECT 1")
+        checks["db"] = True
+    except Exception:  # noqa: BLE001
+        checks["db"] = False
+    # scheduler health
+    checks["scheduler"] = hasattr(app.state, "scheduler") and app.state.scheduler.running
+    # background loops alive
+    checks["alert_loop"] = _alert_task is not None and not _alert_task.done()
+    checks["reconcile_loop"] = _reconcile_task is not None and not _reconcile_task.done()
+    all_ok = all(v for k, v in checks.items() if k != "demo")
+    return {
+        "ok": all_ok,
+        "checks": checks,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-style metrics for observability."""
+    s = mt5_status()
+    try:
+        from db import _conn
+        with _conn() as c:
+            trades = c.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            logs = c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+            alerts = c.execute("SELECT COUNT(*) FROM alerts WHERE active=1").fetchone()[0]
+    except Exception:  # noqa: BLE001
+        trades = logs = alerts = 0
+    return {
+        "mt5_connected": int(s.connected),
+        "open_positions": guard.open_count,
+        "daily_loss": guard.daily_loss,
+        "trade_count": trades,
+        "log_count": logs,
+        "active_alerts": alerts,
+        "alert_loop_alive": int(_alert_task is not None and not _alert_task.done()),
+        "reconcile_loop_alive": int(_reconcile_task is not None and not _reconcile_task.done()),
+    }
 
 
 @app.get("/api/trading/status")
@@ -336,22 +392,35 @@ async def api_close(ticket: int, request: Request, _auth=Depends(require_token))
 
 @app.get("/api/trading/news")
 async def api_news():
-    n = await fetch_news()
-    cal = await economic_calendar()
+    # fetch news + calendar concurrently (were sequential)
+    n, cal = await asyncio.gather(fetch_news(), economic_calendar())
     return {"news": n, "calendar": cal, "demo": not n}
 
 
 @app.get("/api/trading/analysis")
 async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
-    result = await asyncio.to_thread(ai_service.analyze, symbol, provider, {"timeframe": "M15"})
-    try:
-        rates = await asyncio.to_thread(mt5_candles, symbol, "H1", 200)
-        if rates:
-            import pandas as pd
-            pred = ml_model.predict(pd.DataFrame(rates), symbol=symbol)
-            result["ml_prediction"] = pred
-    except Exception as exc:  # noqa: BLE001
-        log.debug("ml predict skipped: %s", exc)
+    # Run AI analysis + ML prediction concurrently (independent computations)
+    async def _ai():
+        return await asyncio.to_thread(
+            ai_service.analyze, symbol, provider, {"timeframe": "M15"}
+        )
+
+    async def _ml():
+        try:
+            rates = await asyncio.to_thread(mt5_candles, symbol, "H1", 200)
+            if rates:
+                import pandas as pd
+                # predict() is CPU-bound — run in thread
+                return await asyncio.to_thread(
+                    ml_model.predict, pd.DataFrame(rates), symbol
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ml predict skipped: %s", exc)
+        return None
+
+    result, ml_pred = await asyncio.gather(_ai(), _ml())
+    if ml_pred:
+        result["ml_prediction"] = ml_pred
     return {"analysis": result, "demo": result.get("provider") == "heuristic"}
 
 

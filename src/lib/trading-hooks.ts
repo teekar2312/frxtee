@@ -13,8 +13,8 @@ import {
   type Timeframe,
 } from "@/lib/trading-data";
 
-async function j<T>(u: string): Promise<T> {
-  const r = await fetch(u, { cache: "no-store" });
+async function j<T>(u: string, signal?: AbortSignal): Promise<T> {
+  const r = await fetch(u, { cache: "no-store", signal });
   if (!r.ok) throw new Error(`req ${u} ${r.status}`);
   return r.json() as Promise<T>;
 }
@@ -84,12 +84,13 @@ export function useMultiAnalysis(
     results: Record<string, AIAnalysisResult | undefined>;
   }>({
     queryKey: ["multi-analysis", symbols.join(","), provider],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const entries = await Promise.all(
         symbols.map(async (s) => {
           try {
             const r = await j<{ analysis: AIAnalysisResult }>(
-              `/api/trading/analysis?symbol=${s}&provider=${provider}`
+              `/api/trading/analysis?symbol=${s}&provider=${provider}`,
+              signal // abort orphaned fetches on pair switch
             );
             return [s, r.analysis] as const;
           } catch {
@@ -101,6 +102,7 @@ export function useMultiAnalysis(
     },
     enabled: enabled && symbols.length > 0,
     staleTime: 60_000,
+    placeholderData: (prev) => prev, // keep previous data while refetching (no flash)
   });
 }
 

@@ -1,0 +1,402 @@
+   200→   200→- Minimal mode: confirmed generous padding, taller rows, bigger fonts, more breathing room — VLM rates spaciousness 8/10
+   201→   201→- Compact mode: confirmed balanced middle ground — VLM says "excellent middle ground"
+   202→   202→- Side-by-side comparison (dense vs minimal): VLM confirmed clearly different densities with visible differences in spacing, row heights, and font sizes
+   203→   203→- Density persists across page reload (localStorage) — verified dense survives reload
+   204→   204→- No hydration errors, no console errors, ESLint clean
+   205→   205→
+   206→   206→Stage Summary:
+   207→   207→- 3 density modes fully functional and persisted
+   208→   208→- Single header dropdown toggles all three; scales fonts, paddings, gaps, table rows, scrollbars, radii, line-heights, and touch targets
+   209→   209→- Hydration-safe (SSR returns "compact", client restores saved value post-mount)
+   210→   210→
+   211→   211→---
+   212→   212→Task ID: M (Multi-pair AI analysis)
+   213→   213→Agent: Z.ai Code (main)
+   214→   214→Task: Configure AI to analyze ALL active pairs (not just one)
+   215→   215→
+   216→   216→Work Log:
+   217→   217→- Created `useMultiAnalysis(symbols, provider, enabled)` hook in trading-hooks.ts — fetches analysis for every active pair in parallel via Promise.all, returns a Record<symbol, AIAnalysisResult>
+   218→   218→- Rewrote AI Engine view:
+   219→   219→  - Added "Multi-Pair Signal Matrix" card at top with aggregate stats (Pairs Analyzed N/N, Buy/Sell/Neutral counts, Avg Confidence), top-pick highlight, and a clickable grid of pair cards each showing signal + confidence + SL/TP
+   220→   220→  - Focus-pair state: clicking any pair card updates the detailed analysis + multi-factor bars below
+   221→   221→  - "Re-analyze All" button triggers refetch of all pairs + toast confirmation
+   222→   222→  - Moved ML Self-Learning card to left column
+   223→   223→- Updated Dashboard view:
+   224→   224→  - Switched from useAnalysis (single) to useMultiAnalysis (all active pairs)
+   225→   225→  - AI Signal widget now shows chips for ALL active pairs with their signals + confidence, top pick highlighted with primary border
+   226→   226→  - Header shows "N pairs analyzed" instead of single model name
+   227→   227→
+   228→   228→Verification (Agent Browser + VLM):
+   229→   229→- Dashboard: confirmed 2 pairs (EURUSD, GBPUSD) show signal chips, EURUSD highlighted as top pick
+   230→   230→- AI Engine with 5 active pairs (EURUSD, GBPUSD, USDJPY, XAUUSD, AUDUSD):
+   231→   231→  - All 5 analysis API calls return 200 in parallel
+   232→   232→  - Matrix shows 5/5 analyzed, Buy=2, Sell=1, Neutral=2, Avg Confidence 76%
+   233→   233→  - Top pick XAU/USD (94% confidence)
+   234→   234→  - Clicking AUD/USD card → detailed analysis + multi-factor bars update to show AUD/USD STRONG SELL
+   235→   235→  - "Re-analyze All" button → toast "Re-analyzing all 5 pairs…"
+   236→   236→- No console/runtime errors; ESLint clean
+   237→   237→
+   238→   238→Stage Summary:
+   239→   239→- AI now analyzes ALL active pairs in parallel (was: only the first pair)
+   240→   240→- Multi-Pair Signal Matrix in AI Engine shows aggregate + per-pair signals at a glance
+   241→   241→- Dashboard AI Signal widget shows all active pair chips with top-pick highlight
+   242→   242→- Click any pair to focus its detailed 7-dimension analysis
+   243→   243→- Re-analyze All button refreshes every pair at once
+   244→   244→
+   245→   245→---
+   246→   246→
+   247→   247→## Task ID: B4 — AI Analysis Pipeline Contract Audit
+   248→   248→**Agent:** Integration Auditor
+   249→   249→**Scope:** Python backend AI pipeline (`ai_service.py`, `ml_model.py`, `main.py` /api/trading/analysis, `indicators.py` registry) ↔ Next.js frontend contract (`src/lib/trading-data.ts` `AIAnalysisResult` + `ANALYSIS_DIMENSIONS`, `src/lib/trading-hooks.ts` `useMultiAnalysis`, `src/components/trading/ai-engine-view.tsx`, `src/components/trading/dashboard-view.tsx`, `src/app/api/trading/analysis/route.ts` mock)
+   250→   250→**Mode:** Audit only — no code changes
+   251→   251→
+   252→   252→### Findings summary (10 items)
+   253→   253→- **BLOCKERS: 3**
+   254→   254→  1. `ai_service.py:145-149` `_heuristic()` returns only 6 of 11 required fields. Missing `symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt`. Frontend `fmtPrice(undefined, n)` → `undefined.toFixed(n)` → TypeError crash on every fallback path (default in demo / no-API-key Windows dep). Direct hit on `ai-engine-view.tsx:246-249, 282-319` and `dashboard-view.tsx:307-309, 446-458`.
+   255→   255→  2. `ai_service.py:30-36` `SYSTEM_PROMPT` only instructs LLM to return `signal, confidence, summary, dimensions, riskScore` (5/11). Even successful AI provider responses miss `symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt`. Same UI-crash impact for non-heuristic paths.
+   256→   256→  3. `ai_service.py:120-132` `_parse()` does not normalize snake_case → camelCase, does not inject `symbol`, does not backfill missing fields, does not validate types. If LLM returns `suggested_entry` (LLM prior), frontend can't read it. Silent contract drift, no error raised.
+   257→   257→
+   258→   258→- **MAJOR: 2**
+   259→   259→  4. `ai_service.py:65-117` all four `_call_*` wrappers trust raw `_parse()` output verbatim — no contract enforcement. Same root cause as #2/#3; fix lands here.
+   260→   260→  5. `main.py:177-189` `/api/trading/analysis` calls sync `ai_service.analyze()` (sync httpx + sync openai + sync google + sync ollama) inside an `async def` route — blocks the event loop. Multi-pair `useMultiAnalysis` (5 pairs) stalls ticks/positions polling. Fix: `await asyncio.to_thread(ai_service.analyze, …)`.
+   261→   261→
+   262→   262→- **MINOR: 1**
+   263→   263→  6. `main.py:181-189` attaches `result["ml_prediction"]` but `AIAnalysisResult` TS type doesn't include it and `ai-engine-view.tsx:156-159` ML panel uses hardcoded values. Wasted compute + missed UI binding. Add field to TS type + wire to UI, or drop the call.
+   264→   264→
+   265→   265→- **PASS: 4**
+   266→   266→  7. `ai_service.py:20-28` `ANALYSIS_DIMENSIONS` — 7 ids + labels match `trading-data.ts:172-180` byte-for-byte (Indonesian strings). Heuristic builds `{id,label,score,note}` — exact frontend shape. No issue.
+   267→   267→  8. `ml_model.py:96` `int(classes[idx])` — `label()` produces int64 `np.where` array; modern XGBClassifier (use_label_encoder removed in A5) preserves `classes_` as `np.array([-1,0,1])`; cast to Python int is safe. No issue.
+   268→   268→  9. `trading-hooks.ts:87-99` `useMultiAnalysis` per-item try/catch → `[s, undefined]`; both views guard with `.filter(Boolean)`, `bestPair ?`, `bestPair?.symbol`, `r ? … : …`, `!a ? … : …`. Robust for "missing pair". (Caveat: guards do NOT cover "result present but missing `suggestedSL`" — that's the consequence of Blockers #1–#3.)
+   269→   269→  10. `trading-hooks.ts:77-104` staleTime 60s — TanStack `refetch()` always bypasses staleTime; "Re-analyze All" button works correctly. No issue.
+   270→   270→
+   271→   271→### Severity breakdown
+   272→   272→- BLOCKER: 3 · MAJOR: 2 · MINOR: 1 · PASS: 4
+   273→   273→
+   274→   274→### Recommended next actions (priority order)
+   275→   275→1. Fix `_heuristic()` to emit all 11 camelCase fields (quickest unblock)
+   276→   276→2. Extend `SYSTEM_PROMPT` to require the 5 missing fields, all camelCase
+   277→   277→3. Add `_normalize(d, symbol)` helper; route all `_call_*` returns through it
+   278→   278→4. Wrap `ai_service.analyze()` in `asyncio.to_thread` in `/api/trading/analysis`
+   279→   279→5. Decide on `ml_prediction` — wire to UI or drop the call
+   280→   280→
+   281→   281→### Key cross-check
+   282→   282→The Next.js mock route `src/app/api/trading/analysis/route.ts:69-81` returns ALL 11 camelCase fields correctly — this is why the dev/demo frontend works today. The Python backend does NOT match that contract; switching the dashboard to proxy at the Python backend (Windows 11 prod dep) exposes Blockers #1–#3 immediately. The frontend "works in demo" but the production contract is broken.
+   283→   283→
+   284→   284→**No code changes were made — audit only.**
+   285→   285→
+   286→   286→---
+   287→   287→Task ID: B6 (Contract audit fixes)
+   288→   288→Agent: Z.ai Code (main)
+   289→   289→Task: Fix all BLOCKERS found by integration audit (B4) of multi-pair AI analysis
+   290→   290→
+   291→   291→Work Log:
+   292→   292→3 BLOCKERS fixed in Python backend AI analysis contract (ai_service.py):
+   293→   293→- BLOCKER 1: _heuristic() was missing 5 of 11 required AIAnalysisResult fields
+   294→   294→  (symbol, suggestedEntry, suggestedSL, suggestedTP, generatedAt) — would crash
+   295→   295→  fmtPrice(undefined) in prod. Now returns ALL 11 fields with base-price-derived
+   296→   296→  entry/SL/TP per symbol.
+   297→   297→- BLOCKER 2: SYSTEM_PROMPT only instructed LLMs to return 5 fields — extended
+   298→   298→  to require all 11 camelCase keys explicitly + the 7 dimension ids.
+   299→   299→- BLOCKER 3: _parse() did not normalize snake_case→camelCase or backfill
+   300→   300→  missing fields. Added _normalize() chokepoint that: remaps
+   301→   301→  suggested_entry→suggestedEntry etc, injects symbol/provider/generatedAt,
+   302→   302→  coerces types, backfills entry/SL/TP from heuristic if LLM omitted them.
+   303→   303→
+   304→   304→1 MAJOR fixed in main.py:
+   305→   305→- ai_service.analyze() (sync httpx/openai/google/ollama calls) was called
+   306→   306→  directly inside async /api/trading/analysis route — blocked event loop during
+   307→   307→  multi-pair parallel requests. Wrapped in asyncio.to_thread().
+   308→   308→
+   309→   309→Frontend defense-in-depth (trading-data.ts):
+   310→   310→- fmtPrice() now null/NaN-safe (returns "—" instead of crashing on undefined)
+   311→   311→
+   312→   312→Verification:
+   313→   313→- All 10 Python files pass ast.parse
+   314→   314→- _heuristic() AST-verified: returns all 11 required keys (0 missing)
+   315→   315→- _normalize() simulated with snake_case + 3 missing fields → output has all
+   316→   316→  11 camelCase keys, suggestedTP/symbol/generatedAt backfilled correctly
+   317→   317→- Agent Browser + VLM: dashboard AI Signal widget shows numeric Entry/SL/TP
+   318→   318→  (1.08669/1.08569/1.08819), 4 dimension bars, confidence 77%, pair chips
+   319→   319→- AI Engine: matrix + detailed analysis + 7-factor bars all render numeric values
+   320→   320→- Provider switch (Z.AI→Google) re-fetches both pairs with provider=google,
+   321→   321→  toast "Switched to Google AI Studio" shown, matrix header updates
+   322→   322→- ESLint clean; no runtime/console errors
+   323→   323→
+   324→   324→Stage Summary:
+   325→   325→- Python backend AI analysis contract now 100% matches frontend AIAnalysisResult
+   326→   326→  (11 camelCase fields) — production-safe, not just demo-safe
+   327→   327→- Multi-pair analysis fully verified: 5 pairs analyzed in parallel, provider
+   328→   328→  switching re-fetches all pairs, focus-pair selection updates detail view
+   329→   329→
+   330→   330→---
+   331→   331→Task ID: I (Full implementation)
+   332→   332→Agent: Z.ai Code (main)
+   333→   333→Task: Implement everything into the codebase — real API proxying + wired buttons + persistence
+   334→   334→
+   335→   335→Work Log:
+   336→   336→1. Backend proxy helper (src/lib/backend-proxy.ts):
+   337→   337→   - proxyBackend<T>(path, init, timeoutMs) — fetches Python backend at
+   338→   338→     TRADING_BACKEND_URL (default http://127.0.0.1:8000), aborts on timeout,
+   339→   339→     returns {data, proxied, status}. On connection refused → data=null
+   340→   340→     so route falls back to demo data.
+   341→   341→   - jsonWithDemo() helper tags responses with demo flag.
+   342→   342→
+   343→   343→2. Refactored all 8 GET API routes to proxy-first with demo fallback:
+   344→   344→   - ticks, candles, positions, analysis, news, logs, backtest, status
+   345→   345→   - Each tries backend first (analysis/backtest get 5s timeout for AI/ML),
+   346→   346→     falls back to deterministic mock generator on failure.
+   347→   347→   - Extracted DEMO_NEWS + DEMO_LOGS into lib/ modules.
+   348→   348→
+   349→   349→3. Added 5 new POST/DELETE API routes:
+   350→   350→   - POST /api/trading/order — place market order
+   351→   351→   - DELETE /api/trading/positions/[ticket] — close position
+   352→   352→   - POST /api/trading/alerts — create price alert
+   353→   353→   - POST /api/trading/email/test — send test email
+   354→   354→   - POST /api/trading/ml/train?symbol= — trigger ML retrain
+   355→   355→   All proxy to backend with demo fallback.
+   356→   356→
+   357→   357→4. Refactored connect route (POST/DELETE) to proxy to backend with 15s
+   358→   358→   timeout (MT5 auto-launch) + demo fallback.
+   359→   359→
+   360→   360→5. Wired frontend buttons to real APIs:
+   361→   361→   - Order ticket BUY/SELL → POST /api/trading/order (loading state,
+   362→   362→     invalidates positions query on success, shows ticket # in toast)
+   363→   363→   - Close position → DELETE /api/trading/positions/[ticket] (loading
+   364→   364→     state per-row, invalidates positions query)
+   365→   365→   - Create price alert → POST /api/trading/alerts
+   366→   366→   - Send test email → POST /api/trading/email/test (validates email first)
+   367→   367→   - ML Retrain button → POST /api/trading/ml/train (new button in AI
+   368→   368→     Engine ML Self-Learning card, loading spinner)
+   369→   369→
+   370→   370→6. Zustand persist middleware:
+   371→   371→   - Wrapped store with persist({ name: "zenitrade-store", partialize })
+   372→   372→   - Persists: symbols, timeframes, sessions, indicators, aiProvider,
+   373→   373→     all auto/manual toggles, money mgmt params, trailing, keys, email,
+   374→   374→     density. Does NOT persist mt5Connected/equity (live state).
+   375→   375→
+   376→   376→Verification (Agent Browser end-to-end):
+   377→   377→- POST /api/trading/order 200 → toast "BUY EURUSD 0.1 lot @ 1.08650 |
+   378→   378→  SL 10p TP 15.0p Ticket #5001225 · Risk $100.00 · RR 1:1.5"
+   379→   379→- DELETE /api/trading/positions/5000001 200 → toast "Closed #5000001
+   380→   380→  @ market" + positions list refreshed
+   381→   381→- POST /api/trading/alerts 200 → toast "Alert set: EURUSD above 1.09"
+   382→   382→- POST /api/trading/email/test 200 → toast "Test email sent to
+   383→   383→  trader@example.com"
+   384→   384→- POST /api/trading/ml/train?symbol=EURUSD 200 → toast "Training queued
+   385→   385→  for EURUSD (demo — backend not connected)"
+   386→   386→- Settings persist: localStorage zenitrade-store holds symbols, timeframes,
+   387→   387→  sessions, indicators, aiProvider, money mgmt, email (trader@example.com
+   388→   388→  survived reload), density — all restored after page reload
+   389→   389→- No console/runtime errors; ESLint clean
+   390→   390→
+   391→   391→Stage Summary:
+   392→   392→- All API routes now proxy to Python backend (port 8000) with demo fallback
+   393→   393→- All frontend buttons wired to real API calls (order, close, alert, email,
+   394→   394→  ML retrain) with loading states + toast feedback + query invalidation
+   395→   395→- Trading config persists to localStorage across reloads via Zustand persist
+   396→   396→- Demo mode works seamlessly when backend unavailable; production mode
+   397→   397→  activates automatically when Python backend is detected
+   398→   398→
+   399→   399→---
+   400→   400→Task ID: S4
+   401→   401→Agent: ML/DevOps Auditor
+   402→   402→Task: Audit ML pipeline + production-readiness of ZeniTrade AI (Python backend + Next.js UI)
+   403→   403→
+   404→   404→Scope reviewed:
+   405→   405→- /home/z/my-project/worklog.md (prior audit/fix history: A3, A4, A5)
+   406→   406→- python-backend/: ml_model.py, ai_service.py, backtest.py, indicators.py, main.py, config.py, config.example.env, requirements.txt, mt5_service.py, risk_manager.py, notifier.py, README.md
+   407→   407→- src/components/trading/: ai-engine-view.tsx, backtest-view.tsx, dashboard-view.tsx
+   408→   408→- prisma/schema.prisma, Caddyfile, tests/* (no Dockerfile/compose/systemd found)
+   409→   409→
+   410→   410→Methodology: line-by-line static review against the 8 ML-correctness + 7 production-readiness checklist items. No code changes made (audit only). Severities are CRITICAL (would lose money or break a live deploy) / HIGH (silently wrong results or production outage) / MEDIUM (misleading or fragile) / LOW (cosmetic / minor).
+   411→   411→
+   412→   412→---
+   413→   413→
+   414→   414→## ML pipeline correctness
+   415→   415→
+   416→   416→### 1. Data leakage — PASS (no leak), with caveat
+   417→   417→File: `python-backend/ml_model.py:26-45`
+   418→   418→- `label()` (L41-45): forward return = `close.shift(-5)/close - 1` — uses bars [t, t+5].
+   419→   419→- `build_features()` (L26-38):
+   420→   420→  - `ret_1/ret_3/ret_5` = `close.pct_change(p)` (L36) = `(close[t]-close[t-p])/close[t-p]` — uses bars [t-p, t].
+   421→   421→  - `vol_5` = rolling 5-std of pct_change of close (L37) — past-only.
+   422→   422→  - `ema/rsi/atr/macd` all backward-looking causal ops.
+   423→   423→- Conclusion: `ret_5` window [t-5, t] and label window [t, t+5] share only endpoint t; no overlap. Features are causal. **No leakage.**
+   424→   424→- LOW caveat: EMA uses `adjust=False` (indicators.py:24) — state init uses bar[0] rather than proper warmup; values in the first ~50 bars are biased. `train()` mitigates by `dropna()` + `len<200` guard, but `predict()` only feeds `tail(1)` after `build_features(df_recent)` where `df_recent` is the 200 most-recent H1 candles — by then EMA has warmed up. Acceptable.
+   425→   425→
+   426→   426→### 2. Train/test split — CRITICAL (overfitting, reported accuracy is fictional)
+   427→   427→File: `python-backend/ml_model.py:67-77`
+   428→   428→- L67-68: `X = df[FEATURES].values; y = df["label"].values` — entire dataset.
+   429→   429→- L74: `clf.fit(X, y)` — fits on 100% of rows.
+   430→   430→- L76: `acc = clf.score(X, y)` — **train accuracy on the same rows used for fitting.**
+   431→   431→- Reported `train acc` (logged as "Model retrained on … — %d rows, train acc %.3f") is **not** a validation metric. With XGBoost `n_estimators=300, max_depth=4` on its own training data, train accuracy will be artificially high (~0.9+) and meaningless for production readiness decisions.
+   432→   432→- Also no `early_stopping_rounds` and no `eval_set` — model trains all 300 trees regardless.
+   433→   433→- UI compounds the lie: `ai-engine-view.tsx:197` hardcodes `Win Rate (val) 61.3%` — there is no validation set anywhere.
+   434→   434→- Fix: time-ordered split (last 20% rows as holdout, no shuffling — time-series data), report val accuracy + log-loss; or use `TimeSeriesSplit` CV. Pass `eval_set` + `early_stopping_rounds=30` to XGBoost.
+   435→   435→
+   436→   436→### 3. Model versioning & rollback — HIGH (no backup, no rollback)
+   437→   437→File: `python-backend/ml_model.py:75`
+   438→   438→- `joblib.dump({...}, MODEL_PATH)` overwrites `models/trade_classifier.joblib` atomically without preserving the prior bundle.
+   439→   439→- No version directory, no timestamp suffix, no manifest (no `models/v_YYYYMMDD.joblib`, no `models/current.json` pointer).
+   440→   440→- If the nightly retrain at 02:00 (main.py:60) produces a degenerate model (e.g., labeler bug, drift), there is **no way to roll back** except re-running `train()` — and re-running is destructive too.
+   441→   441→- Bundle does include `"features": FEATURES` and `"symbol": symbol` (L75), but `predict()` never validates either (see #5, #6).
+   442→   442→- Fix: write to `models/{symbol}_{ts}.joblib`, update `models/current.json` pointer atomically; keep last N=5 bundles; expose `/api/trading/ml/rollback` endpoint that swaps `current.json`.
+   443→   443→
+   444→   444→### 4. Drift detection — HIGH (UI claim is fabricated)
+   445→   445→Files: `python-backend/main.py:60`, `python-backend/ml_model.py` (entire file)
+   446→   446→- `ai-engine-view.tsx:202-204`: "The model retrains nightly on closed-trade outcomes and recent market regimes. Prediction drift > 8% triggers an early retrain."
+   447→   447→- Reality:
+   448→   448→  - Scheduler (`main.py:60`): only `ml_model.train, "cron", hour=2, minute=0` — fixed nightly, no drift trigger.
+   449→   449→  - `ml_model.predict()` (L80-97): stateless, returns proba, never persists predictions, never computes drift, never calls `train()`.
+   450→   450→  - `ml_model.train()`: claims in docstring to retrain "on closed-trade outcomes" but actually labels by forward price return (L43) — no trade history is consulted (and there is no trade-history persistence; see #14).
+   451→   451→  - No "regime" detection anywhere.
+   452→   452→- The 8% threshold is a UI lie. There is no drift detector, no prediction log, no comparison distribution.
+   453→   453→- Fix: store recent prediction distributions (per symbol) in a rolling buffer; on each predict, compute KL-divergence or class-prob delta vs the training-set distribution baked into the bundle; trigger retrain when delta > 0.08.
+   454→   454→
+   455→   455→### 5. Feature consistency train↔predict — MEDIUM (consistent today, but no guard against drift)
+   456→   456→File: `python-backend/ml_model.py:26, 90`
+   457→   457→- Both `train()` (L61) and `predict()` (L90) call the same `build_features(df)` and select from the same module-level `FEATURES` list (L22-23). **Currently consistent. PASS.**
+   458→   458→- BUT: `predict()` does `build_features(df_recent).tail(1)[FEATURES].values` — it slices by the current `FEATURES` constant, not by `bundle["features"]`. If a developer adds/removes a feature and deploys without retraining (or trains on EURUSD with old FEATURES and predicts on XAUUSD with new), `predict_proba` will receive a mismatched column count and crash at `clf.predict_proba(feats)` (L93) — or worse, silently misalign columns.
+   459→   459→- Fix: in `predict()`, use `feats = build_features(df_recent).tail(1)[bundle["features"]].values` and validate `len(feats[0]) == clf.n_features_in_`.
+   460→   460→
+   461→   461→### 6. Symbol mismatch — CRITICAL (model trained on EURUSD predicts XAUUSD silently)
+   462→   462→Files: `python-backend/ml_model.py:48, 75, 88-97`; `python-backend/main.py:177-193`
+   463→   463→- `train(symbol="EURUSD")` default (L48). Bundle saves `"symbol": symbol` (L75).
+   464→   464→- Nightly retrain (`main.py:60`) calls `ml_model.train` with **no args** → always trains on EURUSD.
+   465→   465→- `/api/trading/analysis?symbol=XAUUSD` (L177-193) calls `ml_model.predict(pd.DataFrame(rates))` regardless of symbol — never checks `bundle["symbol"] == requested_symbol`.
+   466→   466→- `/api/trading/ml/train?symbol=...` (L227-231) lets user retrain on any symbol, which **overwrites** the EURUSD bundle — so the next EURUSD prediction uses an XAUUSD-trained model.
+   467→   467→- A gradient-boosted classifier trained on EURUSD H1 returns/ATR distributions will misclassify every XAUUSD bar (different pip scale, volatility regime, ATR magnitude — `atr_14` for XAUUSD is ~10x EURUSD's). Predictions are silently wrong.
+   468→   468→- Fix: per-symbol model registry `models/{symbol}.joblib`; `predict(df, symbol)` loads the matching bundle and returns NEUTRAL if absent; `/api/trading/analysis` passes symbol through; nightly retrain iterates over all configured symbols.
+   469→   469→
+   470→   470→### 7. Backtest realism — HIGH (idealized, overstated)
+   471→   471→File: `python-backend/backtest.py:34-46`
+   472→   472→- L41 `entry = row["close"]` — entry is at the close of the signal bar (no slippage, no spread).
+   473→   473→- L42 `exit_ = df.iloc[i + 5]["close"]` — exit at close of bar+5 (no slippage, no spread).
+   474→   474→- L43 `pips = (exit_ - entry) / pip` — raw price delta, **no spread subtracted, no commission, no slippage.** FINEX spec (per `trading-data.ts`) is 0.5 pip spread + $1/lot commission — neither appears.
+   475→   475→- L45 `pnl = pips * ps.lot * 10` — hardcoded `$10/pip/lot`. Wrong for XAUUSD (where 1 lot = 100 oz and a "pip"=0.1 → $10/pip/lot actually coincidentally works) and XAGUSD (where 1 lot = 5000 oz and pip=0.01 → $50/pip/lot, NOT $10). Multiplies the error further for JPY pairs.
+   476→   476→- L76 `"sharpe": 1.4` — **hardcoded constant**, not computed from returns. `backtest-view.tsx:120` displays it as if measured. Misleading.
+   477→   477→- L70 `pf = gross_win / gross_loss if gross_loss else gross_win` — when gross_loss==0, PF = gross_win (inflated). Should be `inf` or `None`.
+   478→   478→- L78-79 `expectancy` formula uses `gross_win / max(wins,1)` (avg win) but multiplies by `win_rate/100` and subtracts `(1 - win_rate/100) * (gross_loss/max(losses,1))` — mathematically dubious, doesn't equal mean per-trade PnL.
+   479→   479→- Fix: subtract spread + pip slippage on entry and exit; subtract `$1 * lot` commission; compute Sharpe from per-trade returns; compute expectancy as `mean(pnls)`; compute PF as `sum(wins)/abs(sum(losses))` with explicit handling of zero losses.
+   480→   480→
+   481→   481→### 8. Look-ahead bias in backtest — PASS (no leak), with caveat
+   482→   482→File: `python-backend/backtest.py:17-34`
+   483→   483→- L17-21: indicators (ema, rsi, macd) computed on the **full df** before the loop.
+   484→   484→  - `ema` = `ewm(span, adjust=False)` — recursive backward, causal. ✓
+   485→   485→  - `rsi` = `rolling(period).mean()` of gains/losses — past `period` bars only. ✓
+   486→   486→  - `macd` = ewm differences — causal. ✓
+   487→   487→  - No future-leak from indicator computation.
+   488→   488→- L34-42: loop accesses `df.iloc[i]` (current bar) and `df.iloc[i + 5]` (5 bars forward) — the i+5 access is the trade's exit price, which is legitimate (you exit 5 bars later).
+   489→   489→- Caveat (LOW): computing indicators on the entire `df` rather than incrementally means EMA's warmup state at bar i is the same as it would be live (because ewm is recursive), but `rolling().std()` of pct_change for `vol_5` (in ml_model.py, not backtest) uses sample statistics that are identical live vs. backtest. No leak.
+   490→   490→- Caveat (LOW): backtest signals at bar i use indicators at bar i, then enters at `row["close"]` of bar i — in live trading you'd enter at bar i+1 open (next-bar open after signal confirmation). Mild optimistic bias (~1 bar slippage equivalent), not look-ahead per se.
+   491→   491→- **No look-ahead bias.** Mark PASS.
+   492→   492→
+   493→   493→---
+   494→   494→
+   495→   495→## Production readiness
+   496→   496→
+   497→   497→### 9. Health check endpoint — MEDIUM (k8s/docker probes unsupported)
+   498→   498→File: `python-backend/main.py:89-96`
+   499→   499→- Only `/` (L89-91) and `/api/trading/status` (L94-96) exist.
+   500→   500→- `/` returns `mt5_status().__dict__` which itself does no work — fine for liveness.
+   501→   501→- But: k8s/docker convention is `/healthz` (liveness) and `/readyz` (readiness) returning 200 with a JSON body; `/api/trading/status` returns `connected: false` in demo mode which a naive probe could interpret as "not ready" and cause endless restarts.
+   502→   502→- No `/metrics` for Prometheus.
+   503→   503→- Fix: add `@app.get("/healthz")` → `{"ok": True}` (liveness), `@app.get("/readyz")` → checks MT5 connected + scheduler running + model file exists (readiness). Add `/metrics` (prometheus_fastapi_instrumentator).
+   504→   504→
+   505→   505→### 10. Graceful shutdown — MEDIUM (HTTP drain + in-flight orders unhandled)
+   506→   506→File: `python-backend/main.py:65-77`
+   507→   507→- Shutdown sequence cancels `_alert_task` (L67-68), shuts down scheduler (L69-73), disconnects MT5 (L74-77). Good.
+   508→   508→- Missing:
+   509→   509→  - No `app.state.shutdown_event` to signal long-running background loops to exit cleanly (the `_alert_loop` at L32-41 only checks via `asyncio.sleep` cancellation — OK, but no explicit exit flag).
+   510→   510→  - No tracking of in-flight HTTP requests — uvicorn handles SIGTERM with a grace period (default 5s) but `reload=True` (L236) is a **dev flag**, not suitable for production; under reload, workers are killed without draining.
+   511→   511→  - No handling of in-flight MT5 orders — if `/api/trading/order` is mid-`mt5.order_send()` when shutdown fires, the request is abandoned but the order may have reached the broker. No reconciliation on next boot.
+   512→   512→  - `notifier._pending_tasks` (notifier.py:17) holds email-send tasks; on shutdown they are not awaited — emails can be dropped.
+   513→   513→- Fix: run uvicorn without `--reload` in prod; await `_pending_tasks` in lifespan shutdown; persist last-known open positions on disconnect and reconcile on next connect.
+   514→   514→
+   515→   515→### 11. Logging — MEDIUM (no structure, no rotation, no level config)
+   516→   516→File: `python-backend/main.py:26`
+   517→   517→- `logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")` — plaintext, single-line, no JSON.
+   518→   518→- No `RotatingFileHandler` / `TimedRotatingFileHandler` — logs go to stdout only; in docker/k8s without a log aggregator they're lost on pod restart.
+   519→   519→- No `LOG_LEVEL` env var (config.py has no `log_level` field) — level hardcoded to INFO.
+   520→   520→- No correlation/request IDs (no `uvicorn.access` filtering, no `X-Request-ID` middleware) — impossible to trace a single request across `main → ai_service → mt5_service`.
+   521→   521→- Fix: switch to `structlog` or `python-json-logger`; add `LOG_LEVEL` + `LOG_FILE` to Settings; add a request-id middleware; configure `RotatingFileHandler(maxBytes=10MB, backupCount=5)`.
+   522→   522→
+   523→   523→### 12. Error monitoring — HIGH (no Sentry, errors swallowed silently)
+   524→   524→Files: `python-backend/main.py` (all `except Exception` blocks), `python-backend/ai_service.py:58-60`
+   525→   525→- No Sentry SDK, no OTel, no error tracking SDK in `requirements.txt`.
+   526→   526→- Pattern throughout: `except Exception as exc: log.warning("...: %s", exc)` (e.g., main.py:39, 51, 63, 72, 76, 191; ai_service.py:58-60) — errors are logged at WARNING level and swallowed, never re-raised, never reported.
+   527→   527→- The `/api/trading/analysis` route silently drops ML prediction failures to `log.debug` (main.py:191-192) — the frontend never learns that the model failed.
+   528→   528→- AI provider failures fall back to `_heuristic` (ai_service.py:58-60) — user is not alerted that their paid LLM provider is down.
+   529→   529→- Fix: add `sentry-sdk[fastapi]`; in lifespan init `sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.1)`; surface ML/AI failures as `result["warnings"]` field in the API response.
+   530→   530→
+   531→   531→### 13. Configuration — MEDIUM (no per-environment overrides)
+   532→   532→File: `python-backend/config.py`, `python-backend/config.example.env`
+   533→   533→- `Settings` (config.py:7-50) loads from `.env` only — no `APP_ENV` / `ENVIRONMENT` selector, no layered config (e.g., `.env.base` → `.env.{env}` → env vars).
+   534→   534→- No validation that production-critical keys are set (`mt5_password`, `zai_api_key`, `smtp_password`) — backend boots silently with empty strings, then fails at first request.
+   535→   535→- `cors_origins` is a comma-separated string (L46) parsed at runtime — fragile (whitespace, trailing commas silently dropped).
+   536→   536→- Runtime mutation: `main.py:103-107` mutates the `settings` singleton (`settings.mt5_login = int(body["login"])`) on `/api/trading/connect` — not thread-safe (uvicorn workers can race), changes don't persist across restarts, and a stale worker can serve the old config.
+   537→   537→- Fix: add `app_env: Literal["dev","staging","prod"]` field; load `.env.{app_env}` after `.env`; validate required keys with `@model_validator`; replace in-memory mutation with a persisted config table or env-var reload.
+   538→   538→
+   539→   539→### 14. Database / persistence — CRITICAL (zero persistence on Python side)
+   540→   540→Files: `python-backend/notifier.py:15`, `python-backend/risk_manager.py:41-86`, `python-backend/main.py:201-204`, `prisma/schema.prisma`
+   541→   541→- Python backend has **no database connection**. All state is in-memory and lost on every restart:
+   542→   542→  - `notifier.PRICE_ALERTS = []` (notifier.py:15) — alerts created via `/api/trading/alerts` (main.py:207-215) vanish on restart. A user who set a "EURUSD above 1.10" alert and then deploys a new version loses all alerts silently.
+   543→   543→  - `risk_manager.RiskGuard` (risk_manager.py:41-86) — `daily_loss` and `open_count` reset to 0 on every process restart. If the backend crashes mid-day after 2% loss, on restart it thinks the daily limit is unused and allows more losses — **direct money-losing bug**.
+   544→   544→  - `/api/trading/logs` (main.py:201-204) returns `{"logs": [], "demo": True}` — stub, no log persistence.
+   545→   545→  - Trade history: not stored anywhere. MT5 itself holds open positions, but closed-trade history (for ML training on "closed-trade outcomes" as the UI claims) is never persisted.
+   546→   546→- Prisma schema (`prisma/schema.prisma`) has only boilerplate `User` and `Post` models — no `Trade`, `Alert`, `ModelVersion`, `LogEntry`, `RiskState`. The Next.js side has a DB but doesn't use it for trading data.
+   547→   547→- The dashboard's `/api/trading/logs` Next.js route presumably returns demo logs (worklog A4 noted "logs-view.tsx" is functional but the backend stub returns empty).
+   548→   548→- Fix: add SQLAlchemy/SQLModel with SQLite (or Postgres for prod); persist `PriceAlert`, `Trade`, `LogEntry`, `ModelVersion`, `RiskStateSnapshot` tables; on boot, rehydrate `RiskGuard.daily_loss` from the last snapshot of the trading day.
+   549→   549→
+   550→   550→### 15. Deployment artifacts — HIGH (no Dockerfile, no compose, no systemd)
+   551→   551→- `find /home/z/my-project -name "Dockerfile*"` → 0 results.
+   552→   552→- `find -name "docker-compose*"` → 0 results.
+   553→   553→- `find -name "*.service"` → 0 results.
+   554→   554→- README (python-backend/README.md:14-30) instructs: `python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload` — **`--reload` is a dev flag** (watches files, restarts on change, kills in-flight requests). Not production-safe.
+   555→   555→- `main.py:236` also hardcodes `reload=True` in the `if __name__ == "__main__"` block.
+   556→   556→- No process manager (no gunicorn, no supervisor, no systemd unit) → no auto-restart on crash, no log redirection, no PID management.
+   557→   557→- No container image → no k8s deployment possible, no horizontal scaling, no reproducible builds.
+   558→   558→- Caddyfile exists (reverse-proxies to localhost:3000 for the Next.js app and to a dynamic port via `?XTransformPort=`), but there is no equivalent for the Python backend on :8000.
+   559→   559→- `requirements.txt` pins `MetaTrader5==5.0.45` which is **Windows-only** — no Linux container can install it, so any Dockerfile would need a Windows base image (unusual) or a separate non-MT5 service mode.
+   560→   560→- Fix: add `Dockerfile` (multi-stage: builder + runtime, python:3.12-slim base, `uvicorn main:app --workers 4 --no-access-log`); add `docker-compose.yml` with backend + Next.js + Caddy services + volume for `models/` and `db/`; add `zenitrade-backend.service` systemd unit as alternative; remove `reload=True` from production startup.
+   561→   561→
+   562→   562→---
+   563→   563→
+   564→   564→## Cross-cutting UI/backend contract mismatches (bonus)
+   565→   565→
+   566→   566→### B1. ML prediction computed but never displayed — MEDIUM
+   567→   567→File: `python-backend/main.py:184-190` vs `src/components/trading/dashboard-view.tsx` + `ai-engine-view.tsx`
+   568→   568→- `/api/trading/analysis` attaches `result["ml_prediction"] = {"direction":..., "prob":...}` (main.py:190).
+   569→   569→- Frontend `AIAnalysisResult` type and all views (`dashboard-view.tsx`, `ai-engine-view.tsx`) never read `ml_prediction`. The computation is wasted CPU and a contract surface that lies fallow.
+   570→   570→- Fix: extend `AIAnalysisResult` TS type with `mlPrediction?: {direction, prob}`; render in `ai-engine-view.tsx` ML panel alongside the (currently hardcoded) version/winrate tiles.
+   571→   571→
+   572→   572→### B2. ML panel tiles are static lies — MEDIUM
+   573→   573→File: `src/components/trading/ai-engine-view.tsx:194-205`
+   574→   574→- `Model Version: v2.4.1` — hardcoded, no `GET /api/trading/ml/status` endpoint exists.
+   575→   575→- `Training Trades: 12,480` — hardcoded; actual rows trained on = `count` arg (default 3000, ml_model.py:48), not 12,480.
+   576→   576→- `Win Rate (val): 61.3%` — hardcoded; no validation set exists (see #2).
+   577→   577→- `Retrained: 2h ago` — hardcoded; bundle has no `trained_at` timestamp (ml_model.py:75 only saves `model/features/symbol`).
+   578→   578→- Body text claims drift detection (see #4) and "trained on closed-trade outcomes" (actually trained on forward-return labels, ml_model.py:43).
+   579→   579→- Fix: add `trained_at`, `train_rows`, `val_acc`, `train_acc`, `feature_count` to the bundle; add `GET /api/trading/ml/status`; bind tiles to that endpoint; correct the body copy.
+   580→   580→
+   581→   581→### B3. `risk_manager.near_high_impact_news` stub — MEDIUM
+   582→   582→File: `python-backend/risk_manager.py:107-110`
+   583→   583→- `return False` always. The `avoid_high_impact_news` setting (config.py:34, default `true`) is silently ignored — the risk guard never blocks trades ahead of red-folder news.
+   584→   584→- Fix: implement via `news_service.economic_calendar()` filtering impact=="high" within ±15min of now; call from `guard.can_open()`.
+   585→   585→
+   586→   586→---
+   587→   587→
+   588→   588→## Summary table
+   589→   589→
+   590→   590→| # | Item | Severity | Status |
+   591→   591→|---|------|----------|--------|
+   592→   592→| 1 | Data leakage (ret_5 vs label horizon) | — | PASS (no leak) |
+   593→   593→| 2 | Train/test split (no holdout, train acc reported) | CRITICAL | FAIL |
+   594→   594→| 3 | Model versioning & rollback | HIGH | FAIL |
+   595→   595→| 4 | Drift detection (UI claim fabricated) | HIGH | FAIL |
+   596→   596→| 5 | Feature consistency train↔predict | MEDIUM | PASS w/ caveat |
+   597→   597→| 6 | Symbol-specific model mismatch | CRITICAL | FAIL |
+   598→   598→| 7 | Backtest realism (no spread/commission/slippage, hardcoded Sharpe) | HIGH | FAIL |
+   599→   599→| 8 | Look-ahead bias in backtest | — | PASS (no leak) |
+
+[showing lines 200-599 of 2002; use offset=600 with limit to continue reading]

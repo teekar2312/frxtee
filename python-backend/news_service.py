@@ -11,25 +11,34 @@ from config import settings
 
 log = logging.getLogger("news")
 
-CACHE: dict[str, list[dict]] = {"news": [], "ts": 0.0}
+CACHE: dict = {"news": [], "ts": 0.0, "calendar": [], "cal_ts": 0.0}
+# prevent thundering herd on cache expiry
+_news_lock = asyncio.Lock()
+_cal_lock = asyncio.Lock()
+_CAL_CACHE_TTL = 300  # 5 min for calendar (less volatile than news)
 
 
 async def fetch_news() -> list[dict]:
-    """Aggregate headlines from Finnhub + MARKETAUX, cached 60s."""
+    """Aggregate headlines from Finnhub + MARKETAUX, cached 60s.
+    Uses a lock to prevent thundering herd on cache expiry."""
     if datetime.now(timezone.utc).timestamp() - CACHE["ts"] < 60 and CACHE["news"]:
         return CACHE["news"]
-    tasks = [_finnhub(), _marketaux()]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    out: list[dict] = []
-    for res in results:
-        if isinstance(res, Exception):
-            log.warning("news source error: %s", res)
-            continue
-        out.extend(res)
-    out.sort(key=lambda n: n.get("publishedAt", ""), reverse=True)
-    CACHE["news"] = out
-    CACHE["ts"] = datetime.now(timezone.utc).timestamp()
-    return out
+    async with _news_lock:
+        # double-check after acquiring lock (another request may have refreshed)
+        if datetime.now(timezone.utc).timestamp() - CACHE["ts"] < 60 and CACHE["news"]:
+            return CACHE["news"]
+        tasks = [_finnhub(), _marketaux()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[dict] = []
+        for res in results:
+            if isinstance(res, Exception):
+                log.warning("news source error: %s", res)
+                continue
+            out.extend(res)
+        out.sort(key=lambda n: n.get("publishedAt", ""), reverse=True)
+        CACHE["news"] = out
+        CACHE["ts"] = datetime.now(timezone.utc).timestamp()
+        return out
 
 
 async def _finnhub() -> list[dict]:
@@ -98,17 +107,33 @@ def _sentiment(entities: list) -> str:
 
 
 async def economic_calendar() -> list[dict]:
-    """High-impact upcoming events (Finnhub earnings/economic calendar)."""
-    if not settings.finnhub_api_key:
-        return _demo_calendar()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(
-            "https://finnhub.io/api/v1/calendar/economic",
-            params={"from": today, "to": today, "token": settings.finnhub_api_key},
-        )
-        r.raise_for_status()
-        return r.json().get("economicCalendar", [])[:10]
+    """High-impact upcoming events. Cached 5 min with thundering-herd lock."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"]:
+        return CACHE["calendar"]
+    async with _cal_lock:
+        # double-check after acquiring lock
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"]:
+            return CACHE["calendar"]
+        if not settings.finnhub_api_key:
+            cal = _demo_calendar()
+        else:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    r = await c.get(
+                        "https://finnhub.io/api/v1/calendar/economic",
+                        params={"from": today, "to": today, "token": settings.finnhub_api_key},
+                    )
+                    r.raise_for_status()
+                    cal = r.json().get("economicCalendar", [])[:10]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("calendar fetch failed: %s — using demo", exc)
+                cal = _demo_calendar()
+        CACHE["calendar"] = cal
+        CACHE["cal_ts"] = now_ts
+        return cal
 
 
 def _demo_calendar() -> list[dict]:
