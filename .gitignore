@@ -75,4 +75,4 @@ python-backend/.pytest_cache/
 # Screenshots / temp
 *.png
 *.jpg
-screenshot-*.png
+screenshot-*.pngtool-results/

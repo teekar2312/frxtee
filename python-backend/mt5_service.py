@@ -36,18 +36,98 @@ class MT5Status:
 
 # ---- symbol_info cache (static data — no need to refetch every tick) -------
 _symbol_info_cache: dict[str, any] = {}
+_pip_value_cache: dict[str, float] = {}
 
 
 def _get_symbol_info(symbol: str):
-    """Cached symbol_info — digits/filling_mode/etc are static per session."""
+    """Cached symbol_info — digits/filling_mode/etc are static per session.
+    Ensures the symbol is selected in Market Watch first."""
     if symbol in _symbol_info_cache:
         return _symbol_info_cache[symbol]
     if not MT5_AVAILABLE:
         return None
+    # symbol must be visible in Market Watch before symbol_info works
+    try:
+        mt5.symbol_select(symbol, True)  # type: ignore
+    except Exception:  # noqa: BLE001
+        pass
     info = mt5.symbol_info(symbol)  # type: ignore
     if info:
         _symbol_info_cache[symbol] = info
     return info
+
+
+def get_pip_value_per_lot(symbol: str) -> float:
+    """Get the monetary value of 1 pip movement for 1.0 lot.
+
+    Uses MT5's trade_tick_value (exact, broker-provided) × pip_size.
+    Falls back to a sensible default per instrument class if unavailable.
+    """
+    if symbol in _pip_value_cache:
+        return _pip_value_cache[symbol]
+    info = _get_symbol_info(symbol)
+    if info:
+        pip = _pip_for_digits(info.digits)
+        point = info.point if hasattr(info, "point") else (10 ** -info.digits)
+        tick_value = getattr(info, "trade_tick_value", None) or getattr(info, "tick_value", None)
+        if tick_value and point and pip:
+            # value per pip = (pip / point) * tick_value
+            val = (pip / point) * tick_value
+            _pip_value_cache[symbol] = val
+            return val
+    # fallback defaults by instrument class
+    if symbol.startswith("XAU"):
+        val = 10.0  # gold: ~$10/pip/lot at standard contract
+    elif symbol.startswith("XAG"):
+        val = 50.0  # silver
+    elif "JPY" in symbol:
+        val = 9.13  # approx for USDJPY at ~145
+    else:
+        val = 10.0  # standard FX pair
+    _pip_value_cache[symbol] = val
+    return val
+
+
+def get_margin_level() -> float | None:
+    """Get current margin level (equity / margin * 100). None if not connected."""
+    if not _state["connected"] or not MT5_AVAILABLE:
+        return None
+    try:
+        info = mt5.account_info()  # type: ignore
+        if info and info.margin > 0:
+            return (info.equity / info.margin) * 100
+        return 9999.0  # no margin used = very healthy
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_recent_deals(minutes: int = 10) -> list[dict]:
+    """Get deals closed in the last N minutes (for reconcile P&L tracking)."""
+    if not _state["connected"] or not MT5_AVAILABLE:
+        return []
+    try:
+        from datetime import datetime, timezone, timedelta
+        utc_to = datetime.now(timezone.utc)
+        utc_from = utc_to - timedelta(minutes=minutes)
+        deals = mt5.history_deals_get(utc_from, utc_to)  # type: ignore
+        if not deals:
+            return []
+        out = []
+        for d in deals:
+            if d.entry != 1:  # DEAL_ENTRY_OUT = position closed
+                continue
+            out.append({
+                "ticket": d.position_id,
+                "symbol": d.symbol,
+                "volume": d.volume,
+                "price": d.price,
+                "profit": d.profit,
+                "time": d.time,
+            })
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.debug("history_deals_get failed: %s", exc)
+        return []
 
 
 _state: dict[str, Any] = {"connected": False, "account": None, "terminal": None}
@@ -59,17 +139,23 @@ def _launch_terminal() -> bool:
     if not os.path.exists(path):
         log.error("MT5 terminal not found at %s", path)
         return False
+    # validate it's actually an executable (not a directory or text file)
+    if not os.path.isfile(path) or not path.lower().endswith(".exe"):
+        log.error("MT5 terminal path is not a valid .exe: %s", path)
+        return False
     log.info("Auto-launching MT5 terminal: %s", path)
     try:
         subprocess.Popen([path])
     except Exception as exc:
         log.error("Failed to launch terminal: %s", exc)
         return False
-    # wait up to 30s for the RPC to come online
-    for _ in range(30):
+    # wait up to 60s (configurable) for the RPC to come online
+    max_wait = int(os.environ.get("MT5_LAUNCH_TIMEOUT", "60"))
+    for _ in range(max_wait):
         if mt5.initialize():  # type: ignore
             return True
         time.sleep(1)
+    log.error("MT5 terminal did not come online within %ds", max_wait)
     return False
 
 

@@ -3149,3 +3149,207 @@ Stage Summary:
 - .env.example + config.example.env document all required vars
 - Prisma schema cleaned (no unused boilerplate models)
 - System is production-ready: clean, documented, Docker-deployable
+
+---
+Task ID: A1
+Agent: MT5/Risk/Money/Logging Auditor
+Task: Deep-audit MT5 connection, risk management, money management, and error logging (25 issues)
+
+Scope: Read all 7 core Python files (mt5_service.py, risk_manager.py, main.py, db.py, notifier.py, ml_model.py, config.py) + news_service.py for cross-reference. Verified hypotheses via targeted grep (symbol_select, margin_level, trade_tick_value, commission, swap, heartbeat, retry, correlation, weekend, drawdown, mt5.initialize path). NO code changes made — audit only.
+
+==================================================================
+AREA 1: MT5 CONNECTION (7 findings)
+==================================================================
+
+#1 — HIGH — No order retry after reconnect; single reconnect attempt, no cap
+  File: python-backend/mt5_service.py:243-267 (_ensure_connected), 296-297 (send_order), 337-338 (close_position)
+  Problem: `_ensure_connected()` probes `account_info()` and, if stale, calls `connect()` exactly ONCE (line 266). There is no retry loop, no exponential backoff, no max-retry cap. If that single reconnect succeeds, the caller (`send_order`/`close_position`) returns `{"ok": False, "error": "MT5 not connected"}` for the original request — the order is silently DROPPED, not retried. If MT5 terminal crashes mid-trade (between `order_send` dispatch and fill confirmation), the trade is lost with no recovery.
+  Fix: Add a bounded retry loop (e.g., 3 attempts with 1s/2s/4s backoff) inside `_ensure_connected()`. On successful reconnect, retry the original `order_send` request once (idempotency via magic+comment). Add a `max_reconnect_retries` setting to config.py. Log each retry attempt at WARNING level.
+
+#2 — MEDIUM — Terminal path only existence-checked, not validated as MT5 executable
+  File: python-backend/mt5_service.py:56-73 (_launch_terminal)
+  Problem: `os.path.exists(path)` (line 59) is the ONLY validation. No check that the path ends in `terminal64.exe`, no check that the file is executable, no verification that the launched process is actually MT5 (could be any .exe named terminal64.exe). If the path is wrong (typo, moved install), `_launch_terminal` returns False quickly — OK. But if the path points to a non-MT5 executable, `subprocess.Popen([path])` launches it and the 30s loop polls `mt5.initialize()` which will never succeed, hanging for 30s on every connect attempt.
+  Fix: Validate `path.endswith("terminal64.exe")` and `os.access(path, os.X_OK)`. After launch, verify the process name via `psutil` or check that `mt5.account_info()` returns a valid login within the timeout window. Add a startup self-test that logs the detected terminal version.
+
+#3 — HIGH — No `symbol_select()` call; non-Market-Watch symbols silently fail
+  File: python-backend/mt5_service.py:41-50 (_get_symbol_info), 298-300 (send_order), 195-198 (ticks)
+  Problem: `_get_symbol_info()` calls `mt5.symbol_info(symbol)` directly (line 47) without first calling `mt5.symbol_select(symbol, True)`. MT5 requires symbols to be in Market Watch before `symbol_info()` / `symbol_info_tick()` return valid data for non-default symbols. For default FINEX symbols (EURUSD, GBPUSD, USDJPY, XAUUSD) this works because they're in Market Watch by default. But any exotic pair (EURTRY, USDZAR) or cross not in the user's Market Watch returns None → `send_order` returns `{"ok": False, "error": "symbol {symbol} not found"}` even though the symbol is tradeable. Verified via grep: zero `symbol_select` calls in the entire codebase.
+  Fix: In `_get_symbol_info()` (or a new `_ensure_symbol_subscribed()` helper), call `mt5.symbol_select(symbol, True)` before `mt5.symbol_info(symbol)`. Cache the subscription state per symbol per session. Log first-time subscription at INFO level.
+
+#4 — MEDIUM — No heartbeat/watchdog; silent disconnects undetected until next order
+  File: python-backend/mt5_service.py (no heartbeat function), python-backend/main.py:103-112 (_alert_loop)
+  Problem: `_ensure_connected()` is pull-based — only invoked when `send_order`/`close_position` is called. There is no background heartbeat task that proactively detects silent disconnects (TCP RST, terminal crash, network drop). The `_alert_loop` polls `mt5_ticks()` every 5s and catches exceptions at `log.debug` level (line 111), but an empty tick list (disconnected) is not distinguished from "no data yet" — no reconnect is triggered. A silent disconnect at 17:00 Friday goes undetected until Monday's first order attempt.
+  Fix: Add a `_heartbeat_loop()` background task that calls `mt5.account_info()` every 30s; on 2 consecutive failures, call `_ensure_connected()` and emit a CRITICAL log + email alert. Wire it into `lifespan()` alongside `_alert_task` / `_reconcile_task`.
+
+#5 — LOW — Terminal launch timeout hardcoded at 30s, not configurable
+  File: python-backend/mt5_service.py:69 (`for _ in range(30):`)
+  Problem: The launch-wait loop is hardcoded to 30 iterations × 1s sleep = 30s. On slow disks, VMs, or when MT5 terminal needs to download updates on first launch, 30s is insufficient — `connect()` returns False and the operator must manually retry. The value is not exposed in `config.py` or `.env`.
+  Fix: Add `mt5_launch_timeout: int = 30` to `config.py` Settings and use `range(settings.mt5_launch_timeout)` in `_launch_terminal()`.
+
+#6 — MEDIUM — Timezone inconsistency: candle `time` is broker server time, `time_msc` is UTC, daily-open cache uses local date
+  File: python-backend/mt5_service.py:220 (candles return `int(r["time"])` — broker server time), 207 (ticks return `t.time_msc` — UTC ms), 170-174 (`_daily_open_cache` keyed by `date.today().isoformat()` — Python LOCAL date)
+  Problem: Three different time references coexist with no normalization: (a) `candles()` returns `r["time"]` which is MT5 broker server time (FINEX = UTC+2/3, not UTC); (b) `ticks()` returns `t.time_msc` which IS UTC milliseconds since epoch; (c) `_get_daily_open()` caches by `date.today().isoformat()` which is the server's LOCAL timezone. The daily-open cache therefore resets at the wrong boundary (local midnight, not broker server midnight, not UTC midnight). `change_pct` (line 202) mixes a UTC-ish tick bid with a broker-server-time daily open. The frontend receives candle timestamps as raw epoch seconds with no timezone metadata, so the chart renders broker-time candles as if UTC.
+  Fix: Standardize on UTC everywhere. In `candles()`, use `int(r["time_msc"]) // 1000` if available (UTC), else document that `time` is broker-local. In `_get_daily_open()`, compute "today" from `datetime.now(timezone.utc).date()` (or the broker's server TZ if daily bars must align to server sessions). Add a `timezone` field to tick/candle responses so the frontend can localize correctly.
+
+#7 — HIGH — `mt5.initialize()` called without `path=` argument; multi-broker ambiguity
+  File: python-backend/mt5_service.py:80 (`mt5.initialize()` — no path), 70 (`mt5.initialize()` in launch loop — no path)
+  Problem: `mt5.initialize()` is called WITHOUT the `path` parameter. Per the MetaTrader5 Python API docs, when `path` is omitted, the library connects to whichever MT5 terminal is currently registered as the system default — which may NOT be the FINEX terminal at `settings.mt5_terminal_path`. If the user has multiple MT5 broker terminals installed (common for multi-broker traders), `_launch_terminal()` correctly launches the FINEX terminal via `subprocess.Popen([path])`, but `mt5.initialize()` then binds to whatever terminal the OS considers default — possibly a different broker's terminal. The `mt5_login` call would then fail with "invalid account" (because the login belongs to FINEX, not the other broker), but the error message `f"MT5 login failed @ {settings.mt5_server}"` doesn't reveal the root cause.
+  Fix: Call `mt5.initialize(path=settings.mt5_terminal_path)` at both line 70 and line 80. This explicitly binds the Python API to the FINEX terminal executable, eliminating multi-broker ambiguity.
+
+==================================================================
+AREA 2: RISK MANAGEMENT (7 findings)
+==================================================================
+
+#8 — MEDIUM — Daily loss tracks GROSS losses, not NET daily P&L; winning trades don't reduce the counter
+  File: python-backend/risk_manager.py:95-98 (register_loss adds abs(amount)), 105-110 (register_close only calls register_loss when pnl < 0)
+  Problem: `register_close(pnl)` calls `register_loss(pnl)` ONLY when `pnl < 0` (line 107). Winning trades (pnl > 0) decrement `open_count` but do NOT reduce `daily_loss`. So if EURUSD loses $200 and GBPUSD wins $100, `daily_loss = $200` (not $100 net). The daily risk limit (`daily_risk_limit_pct = 3%` of equity = $300 on $10k) is consumed by gross losses. Three $100 losses + two $100 wins = `daily_loss = $300` → trading halted, even though net P&L is -$100 (1% — within the 3% limit). This is conservative-by-design but diverges from the common "net daily loss" interpretation. The frontend `/metrics` endpoint (main.py:308) reports `daily_loss` without clarifying gross-vs-net, which could mislead the operator.
+  Fix: Either (a) document explicitly that `daily_loss` is gross-loss tracking (add a comment + rename to `daily_gross_loss` for clarity), or (b) track net daily P&L (`daily_pnl += pnl` and halt when `daily_pnl <= -limit`). Option (b) matches typical prop-firm risk rules. Add a `daily_pnl` field to RiskGuard and the `/metrics` response.
+
+#9 — HIGH — No margin level check; can trigger broker stop-out by opening new orders
+  File: python-backend/risk_manager.py:86-93 (can_open — no margin check), python-backend/main.py:359-403 (api_order — no margin check)
+  Problem: `can_open(equity)` checks only `daily_loss` and `open_count`. It does NOT check `account_info().margin_level`. FINEX has a 50% margin call and 20% stop-out. If equity is near the margin-call threshold, opening a new order could push margin level below 20%, triggering a broker-side forced close of positions at market price (slippage). Verified via grep: zero `margin_level` / `margin_call` / `stop_out` references in the codebase. The reconcile loop (main.py:115-133) also doesn't monitor margin level — it only corrects `open_count` after the fact.
+  Fix: In `can_open()`, fetch `mt5.account_info().margin_level` (via a passed-in parameter or a new `_get_margin_level()` helper). Add a `min_margin_level_pct: float = 150.0` setting (FINEX stop-out is 20%, but 150% gives a safety buffer). Return `(False, "margin level too low (X% — stop-out risk)")` when below threshold. Also add a margin-level monitor to `_reconcile_loop` that emits a CRITICAL alert below 100%.
+
+#10 — CRITICAL — Reconcile loop corrects open_count but NEVER registers realized P&L for broker-side closes (SL/TP hits)
+  File: python-backend/main.py:115-133 (_reconcile_loop)
+  Problem: When a broker-side close occurs (SL hit, TP hit, margin stop-out), `register_close()` is NEVER called — only `api_close()` (manual close via API) calls it. The `_reconcile_loop` detects the drift (`guard.open_count > real_count`) and corrects `open_count = real_count` (line 130), but it does NOT iterate the missing positions, does NOT fetch their realized P&L from MT5's deal history, and does NOT call `guard.register_close(pnl)`. Consequence: `daily_loss` is massively undercounted. Example: 3 SL hits at -$100 each = -$300 realized, but `daily_loss` stays at $0 (because `register_close` was never called). The `can_open()` check then permits new entries that should be blocked by the daily risk limit. The 10s polling interval (line 133) also means up to 10s of stale `open_count` — a user could open position #4 while 3 SLs have already hit but `open_count` still reads 3.
+  Fix: In `_reconcile_loop`, when `drift > 0`, fetch closed deals via `mt5.history_deals_get(from_date, to_date)` for the last 10s, filter by magic=99001, and for each closed deal call `guard.register_close(deal.profit + deal.commission + deal.swap)`. Also reduce poll interval to 2-3s for SL/TP sensitivity, or use MT5's `OnTradeTransaction` event via a polling thread.
+
+#11 — MEDIUM — News blackout is one-sided (pre-event only); no post-release volatility window
+  File: python-backend/risk_manager.py:172 (`if 0 <= secs - now <= minutes * 60`)
+  Problem: `near_high_impact_news()` checks `0 <= secs - now <= minutes * 60` — only UPCOMING events (future timestamp, within 15 min). It does NOT block entries AFTER a high-impact release. Post-release volatility (the first 5-30 minutes after NFP/CPI/FOMC) is often MORE dangerous than the pre-release quiet — price can gap 50+ pips, spreads widen 10x, and SLs get slipped. A trade opened 1 minute after CPI release passes the news check (secs - now < 0 → not in window) but enters maximum volatility.
+  Fix: Change the window to bidirectional: `if -post_minutes*60 <= secs - now <= pre_minutes*60`. Add `news_post_blackout_min: int = 15` to config. Log the event name + direction (pre vs post) in the block reason.
+
+#12 — HIGH — No drawdown circuit breaker; floating losses don't halt trading
+  File: python-backend/risk_manager.py:86-93 (can_open only checks realized daily_loss)
+  Problem: `can_open()` checks `daily_loss` (realized gross losses only) against `daily_risk_limit_pct * equity`. There is NO equity-drawdown circuit breaker. If the account has $10k starting equity and floating losses reach -$1500 (15% drawdown) with $0 realized losses, `daily_loss = 0` → `can_open()` returns True. The system continues opening new positions into a losing streak, compounding the drawdown. There's no tracking of: day-open equity, peak equity, current drawdown from peak, or max-allowed drawdown. Verified via grep: zero `drawdown` / `circuit_breaker` / `peak_equity` references.
+  Fix: Add `day_open_equity: float` to RiskGuard (set on first `can_open` of the day). Add `max_drawdown_pct: float = 10.0` to config. In `can_open()`, compute `drawdown = (day_open_equity - equity) / day_open_equity * 100`; return `(False, "max drawdown breached: X%")` when `drawdown >= max_drawdown_pct`. Emit CRITICAL alert + email on breach.
+
+#13 — MEDIUM — No correlation check; 3 correlated positions = 3x concentrated risk
+  File: python-backend/risk_manager.py:86-93 (can_open — only checks open_count, not symbol composition)
+  Problem: `can_open()` enforces `max_open_positions = 3` but does NOT check which symbols are open. A user (or the AI) could open EURUSD-long + GBPUSD-long + EURGBP-short simultaneously — these are deeply correlated (all express USD weakness / EUR-GBP strength). The effective risk is ~3x a single EURUSD position, not 3x diversified. There's no correlation matrix, no symbol-group limit (e.g., "max 2 USD pairs", "max 1 JPY pair", "max 1 metal").
+  Fix: Add a `_symbol_exposure()` helper that maps open positions to currency exposures (EURUSD-long = +EUR / -USD). Sum exposures across positions. Reject new entries where the marginal exposure to any single currency exceeds a threshold (e.g., `max_currency_exposure = 2.0` lots). Alternatively, maintain a static correlation matrix for the 14 supported pairs and reject entries where the new position's correlation-weighted exposure exceeds the limit.
+
+#14 — MEDIUM — No weekend gap protection; positions can be held over market close
+  File: python-backend/risk_manager.py (no weekend check), python-backend/main.py (no Friday-close logic)
+  Problem: There is no logic to prevent holding positions over the weekend. FINEX closes Friday ~22:00 UTC and reopens Sunday ~22:00 UTC. A position held Friday close is exposed to weekend gap risk — price can open 50-200 pips away from Friday close on Monday open (political events, central bank surprises). The system has no "flatten before Friday close" rule, no "no new entries after Friday 20:00 UTC" rule, and no awareness of broker market hours. Verified via grep: zero `weekend` / `friday` / `sunday` references.
+  Fix: Add `_is_near_weekend_close()` helper: return True if `datetime.utcnow().weekday() == 4 and datetime.utcnow().hour >= 20` (Friday 20:00+ UTC). In `can_open()`, return `(False, "weekend gap risk — no new entries after Friday 20:00 UTC")`. Add a separate scheduled task to flatten all open positions at Friday 21:00 UTC (configurable via `flatten_before_weekend: bool = False`). Add `avoid_weekend_gap: bool = True` to config.
+
+==================================================================
+AREA 3: MONEY MANAGEMENT (6 findings)
+==================================================================
+
+#15 — HIGH — `value_per_pip_per_lot` hardcoded to $10; wrong for JPY pairs and metals
+  File: python-backend/risk_manager.py:26 (`value_per_pip_per_lot: float = 10.0`), python-backend/main.py:379 (`ps = size_position(equity, body.slPips)` — uses default)
+  Problem: `size_position()` has a default `value_per_pip_per_lot=10.0`, and `api_order` (main.py:379) calls it WITHOUT passing a symbol-specific value. $10/pip/lot is correct for standard 100k-lot USD-quote pairs (EURUSD, GBPUSD, AUDUSD). It is WRONG for: (a) JPY pairs — USDJPY 1 lot = 100k USD, 1 pip (0.01) = 1000 JPY ≈ $6.67 at USDJPY=150; (b) XAUUSD — pip definition differs (0.1 vs 0.0001); (c) cross pairs without USD quote (EURGBP, EURJPY) where pip value is in the quote currency and must be converted via the current rate. For USDJPY at $6.67/pip: `lot = risk_amount / (sl_pips * 10)` produces a lot 33% SMALLER than the risk budget allows (under-trading). For a cross pair where actual value is $15/pip: `lot = risk_amount / (sl_pips * 10)` produces a lot 50% LARGER than intended (over-trading — direct money risk).
+  Fix: Compute `value_per_pip_per_lot` dynamically from MT5's `symbol_info.trade_tick_value` and `symbol_info.trade_tick_size`: `value_per_pip = (pip / tick_size) * tick_value`. Pass it to `size_position()` from `api_order`. Cache per symbol (already have `_symbol_info_cache`).
+
+#16 — HIGH — Pip value not computed per-symbol; MT5 `trade_tick_value` unused (duplicate root cause of #15)
+  File: python-backend/mt5_service.py:41-50 (_get_symbol_info caches info but never extracts tick_value), python-backend/risk_manager.py:26 (hardcoded default)
+  Problem: The root cause of #15 is that `_get_symbol_info()` caches the `symbol_info` object but the sizing code never extracts `trade_tick_value` (USD value of one tick per lot) or `trade_tick_size` (minimum price increment). MT5 provides these exact fields specifically for position sizing, but they're unused. Verified via grep: `trade_tick_value` appears 0 times in the codebase. The `_pip_for_digits()` helper (mt5_service.py:137-147) computes pip SIZE from digits, but never pip VALUE. This means risk calculations are structurally wrong for any non-USD-quote instrument.
+  Fix: Add a `_get_pip_value_per_lot(symbol)` helper in mt5_service.py that reads `info.trade_tick_value / info.trade_tick_size * pip`. Expose it to `size_position()` via a new parameter. Unit-test against known values (EURUSD=$10, USDJPY≈$6.67, XAUUSD=$10 for pip=0.1).
+
+#17 — MEDIUM — Commission ($2/lot round-trip) not deducted from risk calculations or P&L
+  File: python-backend/risk_manager.py:30-37 (size_position: potential_loss = risk_amount, ignores commission), python-backend/mt5_service.py:366 (`pnl = getattr(p, "profit", 0.0)` — MT5 profit field EXCLUDES commission)
+  Problem: FINEX charges $1/lot/side = $2/lot round-trip (confirmed in backtest.py:33-35 which DOES model commission, but live trading does not). `size_position()` sets `potential_loss = risk_amount` without subtracting commission, so a 1% risk on $10k = $100 risk, but a 1-lot trade with 10-pip SL actually risks $100 + $2 commission = $102. `close_position()` returns `pnl = p.profit` — MT5's `profit` field EXCLUDES `commission` and `swap` (they're separate fields on the position/deal object). So realized P&L tracking undercounts losses by $2/lot every trade. Over 50 trades/day, that's $100 of untracked cost — meaningful for a system targeting 2% daily return.
+  Fix: In `size_position()`, accept a `commission_per_lot: float` parameter and compute `potential_loss = risk_amount + commission_per_lot * lot * 2` (round-trip). In `close_position()`, change `pnl = getattr(p, "profit", 0.0) + getattr(p, "commission", 0.0) + getattr(p, "swap", 0.0)`. Add `commission_per_lot_side: float = 1.0` to config (matching backtest.py:35).
+
+#18 — MEDIUM — Swap/rollover charges not included in realized P&L (same line as #17)
+  File: python-backend/mt5_service.py:366 (`pnl = getattr(p, "profit", 0.0)` — excludes `p.swap`)
+  Problem: MT5's `position.profit` field excludes swap (overnight financing). `close_position()` returns only `p.profit` as `pnl`, so overnight swap charges (which can be ±$5-15/lot/day on JPY pairs) are never tracked in `daily_loss` or the trades table. A position held 5 days with -$10/night swap = -$50 untracked cost. On Wednesday (triple-swap for weekend), the gap is 3x. The `register_close(pnl)` call in main.py:417 then registers an understated loss, allowing the daily risk limit to be breached by the untracked swap.
+  Fix: Same as #17 — include `p.swap` in the returned `pnl`. Additionally, log swap separately in the trades table (add `swap REAL` and `commission REAL` columns) for full cost attribution. Consider adding a "swap cost" warning for positions held >24h.
+
+#19 — LOW (informational) — `size_position` uses equity (correct), but no option for balance-based sizing
+  File: python-backend/main.py:379 (`size_position(equity, body.slPips)`), python-backend/risk_manager.py:26-38
+  Problem: The sizing function receives `equity` (includes floating P&L) and uses it directly. This is CORRECT for risk sizing — equity reflects true current account value. However, on a winning streak (large floating profit), equity-based sizing increases risk_amount, which can lead to over-sizing relative to realized balance. Some risk frameworks (e.g., TFTP, FTMO) mandate balance-based sizing for this reason. The code offers no toggle. This is a design choice, not a bug — flagging for awareness only.
+  Fix (optional): Add `sizing_basis: str = "equity"` setting ("equity" | "balance"). Pass the chosen value to `size_position()`. Default to equity (current behavior).
+
+#20 — MEDIUM — Partial fills: DB records REQUESTED volume, not FILLED; risk budget not adjusted
+  File: python-backend/main.py:393 (`volume=volume` — uses requested, not `r.get("volume")`), python-backend/mt5_service.py:328-333 (returns `volume: filled`, `requested_volume`, `partial` flag), python-backend/main.py:388 (`guard.register_open()` — increments count by 1 regardless of fill size)
+  Problem: `send_order()` correctly detects partial fills and returns `{"volume": filled, "requested_volume": volume, "partial": True}`. But `api_order` ignores this: (a) `save_trade(volume=volume, ...)` records the REQUESTED volume, not the filled volume — the DB is wrong for any partial fill; (b) `guard.register_open()` increments `open_count` by 1, not by `filled/requested` — the risk budget is consumed as if fully filled. Example: 0.5 lot requested, 0.3 filled. DB says 0.5 lot. Margin used is 60% of expected. Risk budget consumed is 100% of intended. If the remaining 0.2 lot is later filled (rare but possible on IOC), there's no mechanism to register the additional exposure.
+  Fix: In `api_order`, use `filled_volume = r.get("volume", volume)` for `save_trade()`. For `register_open()`, add a `volume` parameter and track `open_volume` (not just `open_count`) in RiskGuard — this also enables per-position risk tracking. Add a `partial_fill_alert` email when `r.get("partial")` is True (operator should know fills were partial).
+
+==================================================================
+AREA 4: ERROR LOGGING (5 findings)
+==================================================================
+
+#21 — HIGH — Failed orders NOT logged; full request context (req dict, retcode, result) discarded
+  File: python-backend/mt5_service.py:318-333 (send_order: no log on failure), python-backend/main.py:383-403 (api_order: no log when `r.get("ok")` is False)
+  Problem: When `order_send` fails, `send_order()` returns `{"ok": False, "error": ...}` but does NOT log the full request context (symbol, side, volume, price, sl, tp, deviation, magic, filling_mode) or the full result object (retcode, comment, volume_order, price). `api_order()` receives the failure dict and just `return r` — no `log.error()`, no `log.warning()`, no DB entry. The DBLogHandler (main.py:82-92) only captures WARNING+ from the logging system, but no warning is emitted. Failed orders are completely invisible to the operator unless they're watching the API response in real time. There is no way to post-mortem "why did this order fail?" — the retcode and request are gone.
+  Fix: In `send_order()`, on `r is None`: `log.error("order_send returned None | req=%s", req)`. On `not success`: `log.error("order rejected | req=%s retcode=%d (%s) result=%s", req, r.retcode, _retcode_msg(r.retcode), r.__dict__)`. In `api_order()`, on `not r.get("ok")`: `log.warning("order failed | symbol=%s side=%s vol=%s sl=%d error=%s", body.symbol, body.side, volume, body.slPips, r.get("error"))` + emit a CRITICAL email when retcode is in {10019 (no money), 10018 (market closed), 10016 (off-quote)}.
+
+#22 — MEDIUM — No error aggregation; recurring errors flood logs as individual rows
+  File: python-backend/main.py:82-92 (DBLogHandler: one row per log record), python-backend/db.py:186-207 (add_log/get_logs: no dedup, no count)
+  Problem: `DBLogHandler.emit()` writes one row per log record with no deduplication. If MT5 disconnects and `_reconcile_loop` polls every 10s, the same "reconcile loop: MT5 not connected" error fires every 10s = 360 rows/hour = 8640 rows/day. The `cleanup_old` function caps at 5000 logs (db.py:113), so the log table is dominated by one recurring error, pushing out genuinely unique errors. There's no "this error occurred N times in the last hour" view, no "first seen / last seen" tracking, no error-frequency alerting.
+  Fix: Add an `error_signature` column (hash of `source + message[:100]`). In `add_log`, if a row with the same signature exists within the last hour, increment a `count` column and update `last_seen` instead of inserting a new row. Add a `GET /api/trading/errors/summary` endpoint that returns aggregated error counts grouped by signature. Alert (email) when any signature's count exceeds 10 in 5 minutes.
+
+#23 — HIGH — CRITICAL failures (MT5 disconnect, risk breach, order rejection) do NOT trigger email/Slack alerts
+  File: python-backend/main.py:369-370 (risk limit breach — no email), 383-403 (order failure — no email), python-backend/mt5_service.py:260 (MT5 disconnect — no email)
+  Problem: `send_email()` is called ONLY on successful order opens (main.py:398-402) and price-alert triggers (notifier.py:100-103). CRITICAL failures emit at most a `log.warning` (which goes to DB via DBLogHandler) but do NOT page the operator: (a) MT5 disconnect (`_ensure_connected` line 260 logs warning, no email); (b) daily risk limit breached (`can_open` returns False, `api_order` returns the dict, no email — main.py:369-370); (c) order rejected by broker (retcode 10019 "not enough money", 10018 "market closed" — no email). Sentry (main.py:68-79) captures Python exceptions but NOT business-logic failures (a retcode is not an exception). The operator learns of a margin stop-out only when they next check the dashboard.
+  Fix: Add an `alert_critical(subject, body)` helper that calls `send_email` + logs CRITICAL + (optionally) posts to Slack webhook. Call it from: (a) `_ensure_connected()` when reconnect fails; (b) `can_open()` when daily limit or max-positions hit (rate-limited to 1 alert/hour to avoid spam); (c) `send_order()` on retcodes {10016, 10018, 10019, 10030}. Add `critical_alert_recipient` and `slack_webhook_url` to config.
+
+#24 — MEDIUM — Incomplete trade audit trail; no signal/risk/SL/TP/AI-link in trades table
+  File: python-backend/db.py:52-65 (trades schema: ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, comment, source), python-backend/main.py:389-396 (save_trade call — passes only basic fields)
+  Problem: The `trades` table records the WHAT (symbol, side, volume, price) but not the WHY or HOW: (a) no `sl_pips` / `tp_pips` at open (the SL/TP values are sent to MT5 but not stored — to reconstruct the original risk plan you'd have to query MT5's position, which may be closed); (b) no `risk_amount` (the intended $-at-risk, from `size_position`); (c) no `ai_confidence` / `ml_prediction` / `signal_source` (was this trade AI-triggered? what was the model's confidence?); (d) no `risk_check_passed` timestamp (when did `can_open` approve it?); (e) no `fill_latency_ms` (time from order_send to fill confirmation). There's no complete lifecycle log: signal → risk check → order send → fill → SL/TP modification → close → P&L. The `logs` table has unstructured messages but no `trade_ticket` foreign key to link logs to trades.
+  Fix: Add columns to `trades`: `sl_pips REAL, tp_pips REAL, risk_amount REAL, ai_confidence REAL, ml_direction TEXT, ml_prob REAL, signal_source TEXT, fill_latency_ms INTEGER`. Add a `trade_events` table (ticket, event_type, ts, payload_json) for the full lifecycle. In `api_order`, capture `time.time()` before/after `send_order` for fill latency. Pass AI/ML context through from the analysis that triggered the order.
+
+#25 — HIGH — Orphaned orders: if `save_trade()` fails after successful `order_send`, the trade exists in MT5 but NOT in DB — silently swallowed
+  File: python-backend/main.py:389-397 (`try: save_trade(...) except Exception: pass` — silent swallow)
+  Problem: `api_order` places the order via `send_order`, then on success calls `guard.register_open()` (line 388) and `save_trade()` (lines 391-396). The `save_trade` call is wrapped in `try/except Exception: pass` (line 396) — if the DB is locked, disk full, or schema mismatched, the exception is silently swallowed. The order is now ORPHANED: it exists in MT5 (consuming margin, exposed to market risk) but has NO record in the `trades` table. Consequences: (a) `_reconcile_loop` will detect `open_count` drift and silently correct it — but the trade's open_price, intended SL/TP, and AI signal context are LOST forever; (b) `guard.register_open()` already incremented `open_count`, but if the operator manually closes the orphaned position via MT5 terminal (not via API), `register_close` is never called; (c) on backend restart, `load_risk_state` reads `open_count` from DB — but the orphaned trade's volume isn't reflected, so margin calculations are wrong; (d) the trade's realized P&L on close goes untracked, corrupting daily loss accounting. There is NO compensation logic: no retry of `save_trade`, no fallback to a flat-file journal, no "orphan recovery" scan on startup.
+  Fix: Replace `except Exception: pass` with a recovery handler: (a) retry `save_trade` 3x with 100ms backoff; (b) if still failing, write the trade record to a JSONL file `orphans.jsonl` as a durable fallback; (c) emit CRITICAL log + email alert ("ORPHANED TRADE: ticket=X, manually verify in MT5 terminal"); (d) on startup `lifespan()`, scan `orphans.jsonl` and attempt to backfill into DB; (e) add a `_recover_orphaned_trades()` startup task that compares MT5 `positions_get()` against `SELECT ticket FROM trades WHERE close_time IS NULL` and logs discrepancies at WARNING.
+
+==================================================================
+SEVERITY SUMMARY
+==================================================================
+CRITICAL (1):
+  #10 — Reconcile loop never registers realized P&L for broker-side closes (SL/TP) → daily_loss massively undercounted → trading continues past risk limit
+
+HIGH (8):
+  #1  — No order retry after reconnect (single attempt, silent drop)
+  #3  — No symbol_select() call (non-default symbols fail silently)
+  #7  — mt5.initialize() without path= (multi-broker ambiguity)
+  #9  — No margin level check (broker stop-out risk)
+  #12 — No drawdown circuit breaker (floating losses unhalted)
+  #15 — Hardcoded value_per_pip_per_lot=10 (wrong for JPY/metals/crosses)
+  #16 — MT5 trade_tick_value unused (root cause of #15)
+  #21 — Failed orders not logged (no post-mortem possible)
+  #23 — CRITICAL failures don't trigger email/Slack
+  #25 — Orphaned orders on save_trade failure (silent swallow)
+
+MEDIUM (9):
+  #2  — Terminal path not validated as MT5 executable
+  #4  — No heartbeat/watchdog (silent disconnects)
+  #6  — Timezone inconsistency (broker time vs UTC vs local)
+  #8  — Gross-loss tracking (winning trades don't reduce daily_loss)
+  #11 — News blackout one-sided (no post-release window)
+  #13 — No correlation check (3 correlated positions = 3x risk)
+  #14 — No weekend gap protection
+  #17 — Commission not in risk/P&L
+  #18 — Swap not in realized P&L
+  #20 — Partial fills: DB records wrong volume, risk budget not adjusted
+  #22 — No error aggregation (recurring errors flood logs)
+
+LOW (2):
+  #5  — Terminal launch timeout not configurable
+  #19 — No balance-based sizing option (informational)
+
+==================================================================
+CROSS-CUTTING OBSERVATIONS
+==================================================================
+- The backtest.py module (lines 33-35, 52) DOES model commission ($1/lot/side) and computes `pnl = pips_net * ps.lot * vpp - commission_per_lot_side * 2 * ps.lot`. But live trading (risk_manager.py, mt5_service.py, main.py) does NOT use the same cost model. The backtest is more realistic than the live system — a dangerous inversion.
+- The multi-worker guard (main.py:155-162) correctly prevents >1 worker (which would break the in-process `_order_lock` and `guard` state). But if an operator sets `MULTI_WORKER_SAFE=1` and runs >1 worker, ALL the risk tracking in this audit (daily_loss, open_count, margin checks) becomes per-worker — a silent money risk.
+- `_reconcile_loop` (main.py:115-133) is the single point of failure for risk-state accuracy. It currently only corrects `open_count`. It should also: (a) register realized P&L from deal history (Finding #10), (b) check margin level (Finding #9), (c) detect orphaned DB trades (Finding #25), (d) run the drawdown check (Finding #12).
+
+==================================================================
+RECOMMENDED FIX ORDER (priority)
+==================================================================
+1. #10 (CRITICAL) — Register realized P&L in reconcile loop. Without this, the daily risk limit is non-functional.
+2. #25 (HIGH) — Orphaned-order recovery. Without this, successful orders can vanish from the DB.
+3. #21 + #23 (HIGH) — Log failed orders + alert on CRITICAL failures. Without these, failures are invisible.
+4. #15 + #16 (HIGH) — Dynamic pip value. Without this, position sizing is wrong for half the instruments.
+5. #9 + #12 (HIGH) — Margin + drawdown checks. Without these, the account can hit broker stop-out.
+6. #1 + #7 (HIGH) — Order retry + mt5.initialize(path=). Without these, orders drop on reconnect / multi-broker setups.
+7. #3 (HIGH) — symbol_select(). Quick fix, unblocks exotic pairs.
+8. Remaining MEDIUM/LOW in any order.
+
+No code changes made — audit only. End of A1.

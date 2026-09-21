@@ -31,6 +31,7 @@ from config import settings
 from mt5_service import candles as mt5_candles
 from mt5_service import close_position, connect, disconnect, positions as mt5_positions
 from mt5_service import send_order, status as mt5_status, ticks as mt5_ticks
+from mt5_service import get_pip_value_per_lot, get_recent_deals
 from news_service import economic_calendar, fetch_news
 from risk_manager import guard, size_position, near_high_impact_news
 import ai_service
@@ -112,12 +113,16 @@ async def _alert_loop():
         await asyncio.sleep(5)
 
 
+# track which deals we've already processed (avoid double-counting P&L)
+_processed_deal_tickets: set = set()
+
+
 async def _reconcile_loop():
-    """Background task: sync guard.open_count with broker every 10s.
+    """Background task: sync guard.open_count + daily_loss with broker every 10s.
 
     Broker-side closes (SL/TP hit, margin call) bypass our register_close(),
-    so open_count drifts upward. This polls real positions and corrects it,
-    also registering realized P&L as daily loss when negative.
+    so open_count drifts upward AND daily_loss is undercounted. This polls
+    real positions + recent deal history to correct both.
     """
     while True:
         try:
@@ -127,6 +132,26 @@ async def _reconcile_loop():
             if drift > 0:
                 log.info("position reconcile: guard=%d real=%d → correcting",
                          guard.open_count, real_count)
+                # fetch recently closed deals to get their P&L
+                deals = await asyncio.to_thread(get_recent_deals, 15)
+                for d in deals:
+                    ticket = d.get("ticket")
+                    if ticket and ticket not in _processed_deal_tickets:
+                        _processed_deal_tickets.add(ticket)
+                        pnl = d.get("profit", 0.0)
+                        log.info("broker-side close detected: ticket=%s pnl=%.2f",
+                                 ticket, pnl)
+                        # register realized P&L for daily risk tracking
+                        guard.register_close(pnl)
+                        # persist to trade history DB
+                        try:
+                            close_trade(ticket, d.get("price", 0), pnl,
+                                        d.get("pips", 0))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # keep set bounded
+                        if len(_processed_deal_tickets) > 200:
+                            _processed_deal_tickets.clear()
                 guard.open_count = real_count
         except Exception as exc:  # noqa: BLE001
             log.debug("reconcile loop: %s", exc)
@@ -375,8 +400,9 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
             log.warning("order blocked — news blackout: %s", reason)
             return {"ok": False, "error": f"News blackout: {reason}"}
 
-        # position-size via risk (or honor client volume, clamped to FINEX range)
-        ps = size_position(equity, body.slPips)
+        # position-size via risk with symbol-accurate pip value
+        pip_value = await asyncio.to_thread(get_pip_value_per_lot, body.symbol)
+        ps = size_position(equity, body.slPips, value_per_pip_per_lot=pip_value)
         volume = body.volume if body.volume is not None else ps.lot
         volume = round(max(0.01, min(volume, 50.0)), 2)  # FINEX: 0.01–50 lot
 
@@ -386,20 +412,49 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
         )
         if r.get("ok"):
             guard.register_open()
-            # persist trade to DB
-            try:
-                save_trade(
-                    ticket=r.get("ticket", 0), symbol=body.symbol, side=body.side,
-                    volume=volume, open_price=r.get("price", 0),
-                    comment=body.comment, source="ai" if "AI" in body.comment else "manual",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            # persist trade to DB — retry once, then log critical if still fails
+            ticket = r.get("ticket", 0)
+            db_saved = False
+            for attempt in range(2):
+                try:
+                    save_trade(
+                        ticket=ticket, symbol=body.symbol, side=body.side,
+                        volume=volume, open_price=r.get("price", 0),
+                        comment=body.comment,
+                        source="ai" if "AI" in body.comment else "manual",
+                    )
+                    db_saved = True
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == 0:
+                        log.warning("save_trade retry for ticket %s: %s", ticket, exc)
+                        await asyncio.sleep(0.5)
+                    else:
+                        # CRITICAL: order exists in MT5 but not in DB
+                        log.error("⚠ ORPHANED TRADE: ticket=%s %s %s %s lot @ %s — "
+                                  "DB save failed: %s. Trade is live but untracked!",
+                                  ticket, body.side, body.symbol, volume,
+                                  r.get("price"), exc)
+                        await send_email(
+                            f"⚠ CRITICAL: Orphaned trade #{ticket}",
+                            f"<p>Order was filled on MT5 but DB persistence failed.</p>"
+                            f"<p>Ticket: {ticket}<br>Symbol: {body.symbol}<br>"
+                            f"Side: {body.side}<br>Volume: {volume} lot<br>"
+                            f"Price: {r.get('price')}</p>"
+                            f"<p>Error: {exc}</p>"
+                            f"<p><b>Manual reconciliation required.</b></p>",
+                        )
             await send_email(
                 f"Trade opened: {body.side} {body.symbol}",
                 f"<p>{body.side} {body.symbol} {volume} lot @ {r.get('price')}</p>"
-                f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>",
+                f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>"
+                f"<p>Pip value: ${pip_value:.2f}/pip/lot</p>",
             )
+        else:
+            # structured error capture for order failures
+            log.warning("order failed: symbol=%s side=%s vol=%s sl=%dp — %s",
+                        body.symbol, body.side, volume, body.slPips,
+                        r.get("error", "unknown"))
         return r
 
 

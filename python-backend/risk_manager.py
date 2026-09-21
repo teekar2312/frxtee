@@ -23,13 +23,20 @@ class PositionSize:
     potential_profit: float
 
 
-def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float = 10.0,
+def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float | None = None,
                   risk_pct: float | None = None, rr: float | None = None) -> PositionSize:
+    """Calculate position size based on risk %.
+
+    If value_per_pip_per_lot is None, the caller should pass the symbol-specific
+    value from mt5_service.get_pip_value_per_lot(). The old default of 10.0 is
+    incorrect for JPY pairs and metals — always pass the real value in prod.
+    """
     risk_pct = settings.risk_per_trade_pct if risk_pct is None else risk_pct
     rr = settings.rr_ratio if rr is None else rr
+    vpp = value_per_pip_per_lot if value_per_pip_per_lot is not None else 10.0
     risk_amount = equity * risk_pct / 100
     # lot = risk / (sl_pips * value_per_pip)
-    lot = max(MIN_VOLUME, risk_amount / (sl_pips * value_per_pip_per_lot))
+    lot = max(MIN_VOLUME, risk_amount / (sl_pips * vpp))
     lot = round(lot, 2)
     tp_pips = sl_pips * rr
     return PositionSize(
@@ -90,6 +97,31 @@ class RiskGuard:
             return False, f"Daily risk limit reached ({settings.daily_risk_limit_pct}%)"
         if self.open_count >= settings.max_open_positions:
             return False, f"Max open positions reached ({settings.max_open_positions})"
+
+        # margin level check — halt if below FINEX margin call (50%) + buffer
+        try:
+            from mt5_service import get_margin_level
+            ml = get_margin_level()
+            if ml is not None and ml < 60:  # 50% MC + 10% buffer
+                return False, f"Margin level too low ({ml:.0f}%) — near margin call"
+        except Exception:  # noqa: BLE001
+            pass  # backend not connected, skip margin check
+
+        # drawdown circuit breaker — halt if equity dropped >10% from day open
+        day_open_equity = equity + self.daily_loss
+        drawdown_pct = ((day_open_equity - equity) / day_open_equity * 100) if day_open_equity > 0 else 0
+        if drawdown_pct > 10:
+            return False, f"Max drawdown breached ({drawdown_pct:.1f}%) — halt trading"
+
+        # weekend gap risk — prevent new entries on Friday after 21:00 UTC
+        # or Saturday/Sunday (market closed, gap risk on Monday open)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 4 and now.hour >= 21:  # Friday 21:00+ UTC
+            return False, "Weekend gap risk — no new entries after Friday 21:00 UTC"
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False, "Market closed (weekend)"
+
         return True, "ok"
 
     def register_loss(self, amount: float):
@@ -137,16 +169,16 @@ def trail_stop(position: dict, current_price: float, trail_pips: int,
 
 
 def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
-    """Check economic calendar for high-impact events within `minutes`.
+    """Check economic calendar for high-impact events within `minutes` window.
 
-    Returns (is_blackout, reason). When settings.avoid_high_impact_news is
-    False, always returns (False, "disabled"). Checks the news_service
-    economic calendar for upcoming high-impact events.
+    Returns (is_blackout, reason). Checks BOTH:
+    - Pre-event: high-impact event within next `minutes` minutes
+    - Post-event: high-impact event released within last `minutes` minutes
+      (post-release volatility can cause 30-50 pip spikes)
     """
     if not settings.avoid_high_impact_news:
         return False, "disabled"
     try:
-        # import lazily to avoid circular dependency at module load
         from news_service import economic_calendar
         import asyncio
         loop = asyncio.new_event_loop()
@@ -159,7 +191,6 @@ def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
             impact = str(event.get("impact", "")).lower()
             if impact != "high":
                 continue
-            # event time may be ISO string or epoch; parse defensively
             ev_time = event.get("time") or event.get("date") or event.get("publishedAt")
             if not ev_time:
                 continue
@@ -169,9 +200,15 @@ def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
                 secs = dt.timestamp()
             except Exception:  # noqa: BLE001
                 continue
-            if 0 <= secs - now <= minutes * 60:
+            delta = secs - now
+            # pre-event: upcoming within `minutes`
+            if 0 <= delta <= minutes * 60:
                 name = event.get("event", event.get("title", "event"))
                 return True, f"high-impact {name} in <{minutes} min"
+            # post-event: released within last `minutes` (volatility window)
+            if -minutes * 60 <= delta < 0:
+                name = event.get("event", event.get("title", "event"))
+                return True, f"high-impact {name} released {abs(int(delta/60))}m ago"
         return False, "ok"
     except Exception as exc:  # noqa: BLE001
         log.debug("news blackout check failed: %s", exc)
