@@ -3353,3 +3353,61 @@ RECOMMENDED FIX ORDER (priority)
 8. Remaining MEDIUM/LOW in any order.
 
 No code changes made — audit only. End of A1.
+
+---
+Task ID: A1-fix (MT5/Risk/Money/Logging deep audit + implementation + push)
+Agent: Z.ai Code (main)
+Task: Deep audit of 4 critical areas, implement fixes, push to GitHub
+
+Work Log:
+CRITICAL fix (#10):
+- _reconcile_loop now fetches deal history (get_recent_deals, 15min window) to
+  detect broker-side SL/TP closes. For each unprocessed deal: calls
+  register_close(pnl) to update daily_loss + calls close_trade() in DB.
+  Previously daily_loss was massively undercounted — broker-side closes (most
+  of them) never registered P&L, so daily risk limit was non-functional.
+
+HIGH fixes:
+- #15+#16: Dynamic pip value via get_pip_value_per_lot() — uses MT5's
+  trade_tick_value × pip/point ratio. Replaces hardcoded 10.0 which was
+  wrong for JPY pairs (under-traded ~33%) and metals (over-traded ~50%).
+  Order route now passes symbol-specific pip value to size_position().
+- #3: symbol_select(sym, True) called before symbol_info — symbols not in
+  Market Watch would silently return None.
+- #9: Margin level monitoring in can_open() — halts if margin < 60%
+  (FINEX margin call at 50% + 10% buffer).
+- #12: Drawdown circuit breaker — halts if equity drops >10% from day open.
+- #14: Weekend gap protection — no new entries Fri 21:00 UTC through weekend.
+- #11: Post-event news volatility blackout — near_high_impact_news now checks
+  BOTH pre-event (upcoming within 15min) AND post-event (released within 15min).
+- #2: Terminal path validation — must be .exe file, not directory/text.
+  Configurable launch timeout via MT5_LAUNCH_TIMEOUT env (default 60s, was 30s).
+- #25: save_trade orphaned trade compensation — retry once, then CRITICAL
+  email alert if DB write still fails after successful MT5 order.
+- #21: Structured order error capture — logs symbol/side/vol/sl on failure.
+- #23: Email escalation for critical order failures (orphaned trades).
+
+Cleanup:
+- Removed tool-results/ artifacts from repo
+- Updated .gitignore to exclude tool-results/
+
+Verification:
+- All 11 Python files pass ast.parse
+- Frontend ESLint clean
+- Dashboard renders correctly (VLM: "all components fully visible, no broken areas")
+- POST /api/trading/order 200, toast confirms order
+- No console/runtime errors
+
+Push:
+- Committed: "feat: deep audit fixes for MT5/Risk/Money/Logging"
+- Pushed to https://github.com/teekar2312/frxtee (16 commits total)
+- PAT removed from remote URL after push
+
+Stage Summary:
+- 1 CRITICAL + 10 HIGH issues fixed across MT5 Connection, Risk Management,
+  Money Management, Error Logging
+- Daily risk limit now functional (was non-functional for broker-side closes)
+- Pip value now accurate per instrument (was hardcoded, risking 33-50% sizing error)
+- Margin level, drawdown, weekend gap, post-news volatility protections added
+- Orphaned trade compensation + email escalation for critical failures
+- All changes pushed to GitHub
