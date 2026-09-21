@@ -39,7 +39,30 @@ import ml_model
 from notifier import add_price_alert, check_alerts, send_email
 from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade, cleanup_old
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+# ---- structured JSON logging (for production log aggregation) --------------
+import json as _json
+import os as _os
+
+class JsonFormatter(logging.Formatter):
+    """Emit log records as JSON lines for ELK/Loki/CloudWatch."""
+    def format(self, record):
+        log_entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return _json.dumps(log_entry, default=str)
+
+_log_format = "json" if _os.environ.get("LOG_FORMAT", "").lower() == "json" else "text"
+if _log_format == "json":
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[_handler])
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("zenitrade")
 
 # ---- Sentry error monitoring (optional via SENTRY_DSN) -------------------
@@ -427,6 +450,43 @@ async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
     if ml_pred:
         result["ml_prediction"] = ml_pred
     return {"analysis": result, "demo": result.get("provider") == "heuristic"}
+
+
+@app.get("/api/trading/analysis/batch")
+async def api_analysis_batch(symbols: str, provider: str = "zai"):
+    """Batch analysis for multiple symbols in one request.
+
+    Runs all pair analyses concurrently — reduces 5 round-trips to 1 for the
+    multi-pair signal matrix. Returns {results: {symbol: analysis}}.
+    """
+    sym_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]  # cap at 10
+
+    async def _analyze_one(sym: str):
+        try:
+            ai_result, ml_pred = await asyncio.gather(
+                asyncio.to_thread(ai_service.analyze, sym, provider, {"timeframe": "M15"}),
+                _ml_for_symbol(sym),
+            )
+            if ml_pred:
+                ai_result["ml_prediction"] = ml_pred
+            return sym, ai_result
+        except Exception as exc:  # noqa: BLE001
+            log.debug("batch analyze %s failed: %s", sym, exc)
+            return sym, None
+
+    async def _ml_for_symbol(sym: str):
+        try:
+            rates = await asyncio.to_thread(mt5_candles, sym, "H1", 200)
+            if rates:
+                import pandas as pd
+                return await asyncio.to_thread(ml_model.predict, pd.DataFrame(rates), sym)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    pairs = await asyncio.gather(*[_analyze_one(s) for s in sym_list])
+    results = dict(pairs)
+    return {"results": results, "provider": provider, "demo": True}
 
 
 @app.get("/api/trading/ml/info")
