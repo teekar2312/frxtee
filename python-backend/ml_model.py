@@ -68,6 +68,26 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _adaptive_threshold(symbol: str, df: pd.DataFrame) -> float:
+    """Compute label threshold based on symbol volatility.
+
+    For high-volatility instruments (XAU), 8 pips is noise; for USDJPY it's
+    significant. Uses ATR-based adaptive threshold: 0.5 * ATR(14) / price.
+    """
+    try:
+        atr_val = atr(df, 14).dropna()
+        if len(atr_val) == 0:
+            return 0.0008  # default
+        avg_atr = float(atr_val.iloc[-50:].mean()) if len(atr_val) >= 50 else float(atr_val.mean())
+        avg_price = float(df["close"].mean())
+        if avg_price > 0 and avg_atr > 0:
+            # threshold = 0.5 * (ATR / price) — half the average true range
+            return min(0.005, max(0.0003, 0.5 * avg_atr / avg_price))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0008
+
+
 def label(df: pd.DataFrame, horizon=5, threshold=0.0008) -> pd.Series:
     """Forward return label: 1 up, -1 down, 0 flat. Window [t, t+horizon]
     does not overlap with causal features (which use data <= t).
@@ -99,7 +119,7 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         return
     df = pd.DataFrame(rates)
     df = build_features(df)
-    df["label"] = label(df)
+    df["label"] = label(df, threshold=_adaptive_threshold(symbol, df))
     df = df.dropna()
     if len(df) < 200:
         log.warning("insufficient data to train (%d rows)", len(df))
@@ -162,6 +182,21 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     train_acc = clf.score(X_full, y_full)
     log.info("Model promoted on %s %s — %d rows, train_acc=%.3f test_acc=%.3f "
              "avg_fold=%.3f", symbol, tf, len(df), train_acc, test_acc, avg_acc)
+
+    # log feature importances for debugging (which features drive predictions?)
+    try:
+        importances = clf.feature_importances_
+        fi_pairs = sorted(zip(FEATURES, importances), key=lambda x: x[1], reverse=True)
+        fi_str = ", ".join(f"{f}={v:.3f}" for f, v in fi_pairs[:5])
+        log.info("Feature importances (top 5): %s", fi_str)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # overfitting detection: if train_acc >> test_acc, flag it
+    if train_acc - test_acc > 0.15:
+        log.warning("⚠ Overfitting detected: train_acc=%.3f >> test_acc=%.3f (gap=%.3f)"
+                    " — consider more data or fewer features",
+                    train_acc, test_acc, train_acc - test_acc)
 
     # ---- backup existing model before overwrite (rollback path) ----
     if MODEL_PATH.exists():

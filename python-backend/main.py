@@ -171,6 +171,7 @@ async def _cleanup_loop():
 
 # track which positions have had BE applied (avoid repeated BE moves)
 _be_applied: set[int] = set()
+_partial_applied: set[int] = set()
 # track last signal time per symbol for cooldown
 _last_signal_ts: dict[str, float] = {}
 _SIGNAL_COOLDOWN_SEC = 60  # min 60s between AI signals for same symbol
@@ -179,22 +180,31 @@ _SIGNAL_COOLDOWN_SEC = 60  # min 60s between AI signals for same symbol
 async def _manage_positions_loop():
     """Background task: manage open positions every 5s.
 
-    Implements:
-    - Trailing stop: advance SL behind price when trailingEnabled
-    - Break-even: move SL to entry + buffer when price moves +1R
-    - Partial close at +1R (scale-out 50%) if configured
+    Implements (all config-driven, not hardcoded):
+    - Break-even: move SL to entry+buffer at +break_even_r_multiple (default 1.0R)
+    - Trailing stop: fixed pips OR ATR-based dynamic (configurable)
+    - Partial close: close partial_close_ratio at +partial_close_r_multiple
+    Uses PER-POSITION SL (not global default) for R-multiple calculation.
     """
     while True:
         try:
             positions = await asyncio.to_thread(mt5_positions)
             if not positions:
                 _be_applied.clear()
+                _partial_applied.clear()
                 await asyncio.sleep(5)
                 continue
 
-            trailing_enabled = getattr(settings, "trailing_enabled", True)
-            trailing_pips = getattr(settings, "trailing_pips", 8)
-            sl_pips_setting = getattr(settings, "stop_loss_pips", 10)
+            trailing_enabled = settings.trailing_enabled
+            trailing_pips = settings.trailing_pips
+            use_atr = settings.trailing_use_atr
+            atr_mult = settings.trailing_atr_multiplier
+            be_enabled = settings.break_even_enabled
+            be_r = settings.break_even_r_multiple
+            be_buffer = settings.break_even_buffer_pips
+            pc_enabled = settings.partial_close_enabled
+            pc_r = settings.partial_close_r_multiple
+            pc_ratio = settings.partial_close_ratio
 
             for p in positions:
                 ticket = p["ticket"]
@@ -203,54 +213,101 @@ async def _manage_positions_loop():
                 current = p["currentPrice"]
                 sl = p.get("sl")
                 symbol = p["symbol"]
-                pip = await asyncio.to_thread(_pip_for_digits, _get_digits(symbol))
+                digits = _get_digits(symbol)
+                pip = _pip_for_digits(digits)
+
+                # compute PER-POSITION SL (not global default) for R-multiple
+                # SL distance from entry = |sl - open_price| / pip
+                if sl and sl > 0:
+                    pos_sl_pips = abs(sl - open_price) / pip
+                else:
+                    pos_sl_pips = settings.stop_loss_pips  # fallback
 
                 # compute R-multiple (how far price moved in our favor, in R units)
                 if pos_type == "BUY":
                     favor_pips = (current - open_price) / pip
                 else:
                     favor_pips = (open_price - current) / pip
-                r_multiple = favor_pips / sl_pips_setting if sl_pips_setting > 0 else 0
+                r_multiple = favor_pips / pos_sl_pips if pos_sl_pips > 0 else 0
 
-                # 1. Break-even: move SL to entry when price reaches +1R
-                if r_multiple >= 1.0 and ticket not in _be_applied:
-                    be_buffer = pip * 1  # 1 pip buffer above entry
+                # 1. Break-even: move SL to entry+buffer when price reaches +be_r
+                if be_enabled and r_multiple >= be_r and ticket not in _be_applied:
+                    be_buffer_price = pip * be_buffer
                     if pos_type == "BUY":
-                        new_sl = open_price + be_buffer
+                        new_sl = open_price + be_buffer_price
                     else:
-                        new_sl = open_price - be_buffer
-                    # only move if new SL is better than current
+                        new_sl = open_price - be_buffer_price
+                    # only move if new SL is strictly better than current
                     if sl is None or (pos_type == "BUY" and new_sl > sl) or (pos_type == "SELL" and new_sl < sl):
                         r = await asyncio.to_thread(modify_sl_tp, ticket, new_sl, None)
                         if r.get("ok"):
                             _be_applied.add(ticket)
-                            log.info("break-even applied: ticket=%s sl=%s (R=%.1f)",
-                                     ticket, new_sl, r_multiple)
+                            log.info("break-even: ticket=%s sl=%s (R=%.2f, pos_sl=%.1fp)",
+                                     ticket, new_sl, r_multiple, pos_sl_pips)
                             await send_email(
                                 f"Break-even: #{ticket} {symbol}",
-                                f"<p>SL moved to break-even ({new_sl}). R={r_multiple:.1f}</p>",
+                                f"<p>SL moved to break-even ({new_sl}). R={r_multiple:.1f}</p>"
+                                f"<p>Position SL: {pos_sl_pips:.1f} pips</p>",
                             )
 
-                # 2. Trailing stop: advance SL behind price
+                # 2. Trailing stop: fixed or ATR-based dynamic
                 if trailing_enabled and r_multiple > 0:
-                    trail_result = trail_stop(
-                        {"type": pos_type, "sl": sl},
-                        current, trailing_pips, pip
-                    )
-                    if trail_result:
-                        new_sl = trail_result["sl"]
+                    # ATR-based dynamic trailing (adapts to volatility)
+                    if use_atr:
+                        try:
+                            rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 50)
+                            if rates:
+                                import pandas as pd
+                                from indicators import atr as calc_atr
+                                df = pd.DataFrame(rates)
+                                atr_val = calc_atr(df, 14).dropna().iloc[-1]
+                                trail_distance = atr_val * atr_mult
+                            else:
+                                trail_distance = trailing_pips * pip
+                        except Exception:  # noqa: BLE001
+                            trail_distance = trailing_pips * pip
+                    else:
+                        trail_distance = trailing_pips * pip
+
+                    # compute candidate SL and check if it's strictly better
+                    if pos_type == "BUY":
+                        candidate = current - trail_distance
+                        should_move = sl is None or candidate > sl
+                    else:
+                        candidate = current + trail_distance
+                        should_move = sl is None or candidate < sl
+
+                    if should_move:
+                        new_sl = round(candidate, digits)
                         r = await asyncio.to_thread(modify_sl_tp, ticket, new_sl, None)
                         if r.get("ok"):
-                            log.debug("trailing: ticket=%s sl→%s", ticket, new_sl)
+                            log.debug("trailing: ticket=%s sl→%s dist=%.1fp",
+                                      ticket, new_sl, trail_distance / pip)
+                        elif r.get("retcode") == 10013:
+                            log.warning("trailing rejected (invalid stops): ticket=%s — "
+                                        "check broker stop_level", ticket)
 
-                # 3. Partial close at +1.5R (scale out 50%)
-                if r_multiple >= 1.5 and ticket not in _be_applied:
-                    # mark to avoid repeated partial closes (reuse _be_applied set)
-                    pass  # disabled by default — enable via config if needed
+                # 3. Partial close at +pc_r (scale out pc_ratio)
+                if pc_enabled and r_multiple >= pc_r and ticket not in _partial_applied:
+                    partial_vol = round(p["volume"] * pc_ratio, 2)
+                    if partial_vol >= 0.01:
+                        r = await asyncio.to_thread(partial_close, ticket, partial_vol)
+                        if r.get("ok"):
+                            _partial_applied.add(ticket)
+                            log.info("partial close: ticket=%s vol=%s pnl=%.2f remaining=%s",
+                                     ticket, partial_vol, r.get("pnl", 0),
+                                     r.get("remaining", 0))
+                            await send_email(
+                                f"Partial close: #{ticket} {symbol}",
+                                f"<p>Closed {partial_vol} lot ({pc_ratio*100:.0f}%). "
+                                f"P&L: ${r.get('pnl', 0):.2f}</p>"
+                                f"<p>Remaining: {r.get('remaining', 0)} lot</p>",
+                            )
 
-            # cleanup _be_applied for closed positions
+            # cleanup tracking sets for closed positions
             active_tickets = {p["ticket"] for p in positions}
             _be_applied &= active_tickets
+            _partial_applied &= active_tickets
 
         except Exception as exc:  # noqa: BLE001
             log.debug("manage positions loop: %s", exc)

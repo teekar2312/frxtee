@@ -4062,3 +4062,533 @@ Top 3 cross-cutting root causes:
    are looking at real data, cached data, demo data, or hallucinated LLM output.
 
 No code changes made. Findings handed off for implementation.
+
+
+---
+Task ID: T1
+Agent: Trailing/Backtest/ML Auditor
+Task: Deep-audit Auto Trailing Stop, Backtesting engine, and Self-Learning ML lifecycle (20 issues + 3 extras across 3 areas)
+
+Scope: Read 7 backend files (risk_manager.py trail_stop+guard, main.py _manage_positions_loop+_auto_trade_loop+lifespan+api_analysis/_batch, mt5_service.py modify_sl_tp+partial_close+send_order+get_pip_value_per_lot+close_position, backtest.py run(), ml_model.py train+predict+build_features+label+check_drift, indicators.py atr+compute, config.py Settings) plus 2 frontend touchpoints (trading-store.ts trailingEnabled/trailingPips setters, risk-view.tsx trailing UI controls, partial/route.ts proxy). Verified hypotheses via targeted grep: trail_stop caller (1 hit in main.py:236), partial_close caller (1 hit in main.py:712 — API endpoint only, no auto-loop caller), feature_importance/importances (0 hits — not tracked), CalibratedClassifier/platt/isotonic (0 hits — no calibration), trade_stops_level/stops_level (0 hits — no broker min-distance check), check_drift caller (ml_model.py:277, 288 — return value only logged, never retrains), scheduler.add_job (1 hit — nightly 02:00 only). NO code changes made — audit only.
+
+==================================================================
+AREA 1: AUTO TRAILING STOP (7 findings + 3 extras)
+==================================================================
+
+#1 — HIGH — Trail activation too aggressive (triggers on any 1-pip favorable move)
+  File: python-backend/main.py:235 (`if trailing_enabled and r_multiple > 0:`),
+        python-backend/risk_manager.py:153-168 (trail_stop)
+  Problem: User's hypothesis was that the trail could move SL WORSE than current SL.
+  Verified FALSE — trail_stop has a strict-improvement check (line 159 BUY: `candidate >
+  position["sl"]`; line 163 SELL: `candidate < position["sl"]`). New SL is always strictly
+  better than the SL passed in. The REAL issue is over-tightening on micro-moves:
+  `r_multiple > 0` triggers trailing when price moves just 0.1 pip favorable (favor_pips >
+  0). With trail_pips=8 and current=entry+0.1pip, candidate = entry-7.9pips. Initial SL
+  was entry-10pips. SL moves UP from -10 to -7.9 — better in risk terms, but now SL sits
+  7.9 pips below current price, well within the 5-15 pip noise band for EURUSD M1/M5.
+  Result: a single 1-pip favorable wick triggers trailing, then a 5-pip adverse noise
+  spike stops the trade out at -7.9 pips instead of letting it run to the original -10
+  pip SL. Net effect: trailing turns marginal winners into losers. Should activate only
+  after a meaningful favorable move (e.g. r_multiple >= 0.5 or r_multiple >= 1.0).
+  Fix: Change `r_multiple > 0` to `r_multiple >= 0.5` (or expose `trail_activation_r`
+  in config). This delays trailing until price moves meaningfully in favor, then trails.
+
+#2 — HIGH — No ATR-adaptive trailing distance (fixed 8 pips regardless of volatility)
+  File: python-backend/main.py:196 (`trailing_pips = getattr(settings, "trailing_pips", 8)`),
+        python-backend/risk_manager.py:153-168 (trail_stop takes `trail_pips: int`),
+        python-backend/indicators.py:173-178 (atr() function exists but is NOT imported
+        by risk_manager.py or main.py for trailing — only by ml_model.py for FEATURES)
+  Problem: Trail distance is hardcoded at `trailing_pips` (8 pips default). EURUSD ATR(H1)
+  ranges 5-30 pips depending on session (Asian calm vs London/NY overlap). An 8-pip trail
+  is too tight in volatile markets (gets stopped out by noise) and too loose in calm
+  markets (gives back too much profit). The indicators.atr() function is available and
+  already imported by ml_model.py — but the trailing pipeline doesn't use it.
+  Fix: Pass `atr_pips` to trail_stop (computed per-position from current H1 ATR × pip):
+  `trail_distance = max(settings.trailing_pips_min, atr_pips * settings.trailing_atr_mult)`
+  (e.g. mult=1.0, min=5). Update trail_stop signature to accept atr-adaptive distance.
+
+#3 — HIGH — Break-even buffer too tight for high-spread/commission pairs (1 pip hardcoded)
+  File: python-backend/main.py:217 (`be_buffer = pip * 1  # 1 pip buffer above entry`)
+  Problem: BE moves SL to `entry ± 1 pip` when r_multiple >= 1.0. The 1-pip buffer
+  doesn't cover spread + commission. For EURUSD: 0.8 pip spread + $2/lot RT commission
+  ≈ 0.2 pip equiv → closing at entry+1 pip nets 1 - 0.8 - 0.2 = 0 pips (true break-even).
+  For XAUUSD: pip = 0.1, spread typically 2-4 "pips" ($0.20-$0.40), commission ~$1/side
+  → closing at entry+1 pip (=$0.10 profit) nets 0.10 - 0.30 - 0.02 = -$0.22 = LOSS.
+  For GBPJPY: spread 2-3 pips → entry+1 pip nets -1.5 pips LOSS. A "break-even" that
+  loses money on half the instrument universe defeats its purpose (risk reduction).
+  Fix: `be_buffer = max(pip * 1, spread_pips * pip + commission_pips_equiv * pip)`.
+  Read spread from `mt5.symbol_info_tick(symbol)` (ask-bid), commission from broker
+  spec or settings. Multiply by safety factor 1.5 to ensure BE doesn't lose.
+
+#4 — MEDIUM — Partial close is dead code; "enable via config" comment is misleading
+  File: python-backend/main.py:246-249 (`if r_multiple >= 1.5 and ticket not in
+  _be_applied: pass  # disabled by default — enable via config if needed`),
+        python-backend/config.py:7-62 (Settings class — no partial_close_enabled,
+        no partial_close_r_threshold, no partial_close_volume_pct field defined),
+        python-backend/main.py:705-720 (api_partial_close endpoint exists, calls
+        mt5_service.partial_close — only callable via API, never invoked by loop),
+        python-backend/mt5_service.py:504-547 (partial_close implementation exists,
+        functional),
+        src/app/api/trading/positions/[ticket]/partial/route.ts (frontend proxy
+        route exists — but no UI component calls it; grep confirms 0 callers in src/)
+  Problem: Auto-partial-close at +1.5R is `pass` (no-op). The comment "enable via
+  config if needed" suggests setting a flag — but Settings class doesn't define any
+  partial-close config attribute, and Pydantic `extra="ignore"` (config.py:8) silently
+  drops unknown env vars. So setting `PARTIAL_CLOSE_ENABLED=true` in .env has NO effect.
+  The full pipeline (mt5_service.partial_close → api_partial_close → frontend proxy)
+  exists but is unreachable. The auto-scale-out feature advertised in the README/UI is
+  non-functional. Worse, the `_be_applied` set is reused to "avoid repeated partial
+  closes" (comment line 248) — but since the branch is `pass`, this re-use is dead
+  logic and would conflict with BE tracking if enabled later.
+  Fix: Add `partial_close_enabled: bool = False`, `partial_close_r: float = 1.5`,
+  `partial_close_pct: float = 0.5` to Settings. Replace the `pass` block with:
+  `if settings.partial_close_enabled and r_multiple >= settings.partial_close_r and
+  ticket not in _partial_closed: volume = p["volume"] * settings.partial_close_pct;
+  r = await asyncio.to_thread(partial_close, ticket, round(volume, 2)); ...` Use a
+  separate `_partial_closed: set[int]` (don't reuse `_be_applied`).
+
+#5 — HIGH — Trail frequency (5s loop) too slow for scalping; price can move SL-distance
+  in 5s during news
+  File: python-backend/main.py:257 (`await asyncio.sleep(5)`),
+        python-backend/main.py:179-187 (docstring says "every 5s")
+  Problem: With SL=10 pips (default settings.stop_loss_pips) and 1.0 lot on EURUSD,
+  a 10-pip move = $100 risk. During NFP/CPI/FOMC releases, EURUSD can move 5-15 pips
+  in <2 seconds. The 5s loop polls positions, computes r_multiple, calls modify_sl_tp
+  via `asyncio.to_thread` (50-200ms MT5 RPC). Worst case: price moves 8 pips adverse
+  between loop iterations → SL was supposed to be at +2 pips (post-BE) but loop hasn't
+  caught up → position gets stopped at original -10 pip SL instead of BE'd +2 pips.
+  Result: BE/trail promised risk reduction is not delivered during exactly the high-
+  volatility moments when it matters most.
+  Fix: Reduce poll interval to 1-2s for scalping symbols (SL<=15 pips), keep 5s for
+  swing symbols (SL>15 pips). Better: register `mt5.order_send` callback / use MT5's
+  `positions_get` poll at 1s, OR push trail logic to a tighter `_scalp_manage_loop`
+  that runs alongside the existing 5s loop. Add a `manage_loop_interval` setting.
+
+#6 — LOW — Trail for SELL positions is correct (verified)
+  File: python-backend/risk_manager.py:161-164 (SELL branch of trail_stop)
+  Problem: User asked to verify SELL direction. Verified CORRECT:
+  - SELL SL is ABOVE current price (broker convention).
+  - candidate = current_price + trail_pips * pip_value (line 162) — places candidate
+    above current price, correct for SELL SL.
+  - `if position.get("sl") is None or candidate < position["sl"]` (line 163) — only
+    moves SL DOWN (more favorable for SELL, since SELL profits when price falls).
+  As price falls (favorable for SELL), candidate = new_current + 8 pips also falls,
+  so candidate < old_sl → SL advances down. Logic is symmetric to BUY. ✓
+  No fix needed.
+
+#7 — MEDIUM — Multiple position trailing is sequential (no parallelization, no batch)
+  File: python-backend/main.py:199-249 (for p in positions: ... await asyncio.to_thread(
+  modify_sl_tp, ...))
+  Problem: For each open position, the loop does:
+  (1) `_get_digits` (cached, ~0ms after first call),
+  (2) `modify_sl_tp` via `asyncio.to_thread` (50-200ms MT5 RPC per call).
+  For 3 open positions (settings.max_open_positions=3), total = 150-600ms of blocking
+  await per loop iteration. During this 600ms window, a fast-moving market could stop
+  out a position whose SL hasn't been modified yet. No `asyncio.gather` for parallel
+  MT5 RPCs. MT5 library is thread-safe for `order_send` (separate threads OK), so
+  parallelization is feasible.
+  Fix: Collect (ticket, new_sl) tuples for all positions, then `await asyncio.gather(
+  *[asyncio.to_thread(modify_sl_tp, t, sl, None) for t, sl in updates])` — runs all
+  MT5 RPCs concurrently. Cuts 600ms → ~200ms worst-case for 3 positions.
+
+#A1-EXTRA — HIGH — Trailing/BE settings are NEVER settable via env or UI (cosmetic-only
+  controls)
+  File: python-backend/config.py:7-62 (Settings class — NO trailing_enabled,
+  trailing_pips, partial_close_enabled field defined),
+        python-backend/main.py:195-196 (`trailing_enabled = getattr(settings,
+        "trailing_enabled", True); trailing_pips = getattr(settings, "trailing_pips", 8)`),
+        python-backend/config.py:8 (`extra="ignore"` — silently drops unknown env vars),
+        src/lib/trading-store.ts:227-230 (trailingEnabled: true, trailingPips: 8 +
+  setTrailingEnabled/setTrailingPips — local-only setters, no API call),
+        src/components/trading/risk-view.tsx:209-224 (SwitchRow + SliderRow UI bound to
+  store — purely cosmetic)
+  Problem: Three independent failures compounded:
+  (a) Settings class doesn't define `trailing_enabled` or `trailing_pips` as fields.
+      `getattr(settings, "trailing_enabled", True)` always returns the default `True`.
+      Setting `TRAILING_ENABLED=false` in .env is silently dropped by Pydantic's
+      `extra="ignore"`. Backend always uses trailing=True, pips=8.
+  (b) Frontend store has `trailingEnabled`/`trailingPips` state + setters, but the
+      setters (`setTrailingEnabled`, `setTrailingPips` at trading-store.ts:228, 230)
+      only update local Zustand state — they do NOT call any backend API. There's no
+      PUT/POST /api/trading/config endpoint to push UI settings to backend.
+  (c) The risk-view.tsx SwitchRow "Enable trailing stop" and SliderRow "Trail Distance"
+      (3-20 pips) are bound to local store only — toggling them changes the UI display
+      but never reaches the backend's `_manage_positions_loop`.
+  Net effect: user thinks they're configuring trailing, but the backend always trails
+  at 8 pips regardless of UI state. Same honesty violation pattern as S2 audit #15
+  (hardcoded sentiment card) — a trading terminal UI that lies about its config.
+  Fix: (a) Add `trailing_enabled: bool = True`, `trailing_pips: int = 8` to Settings.
+  (b) Add `PUT /api/trading/config` endpoint accepting {trailingEnabled, trailingPips,
+  partialCloseEnabled, ...} that updates settings at runtime (in-memory) + persists to
+  .env or DB. (c) Frontend setters call this endpoint via fetch + invalidate.
+
+#A1-EXTRA — HIGH — r_multiple uses GLOBAL stop_loss_pips, not actual per-position SL
+  File: python-backend/main.py:197 (`sl_pips_setting = getattr(settings,
+  "stop_loss_pips", 10)`),
+        python-backend/main.py:213 (`r_multiple = favor_pips / sl_pips_setting`),
+        python-backend/main.py:491 (`slPips: int = Field(default=10, ge=1, le=200)`),
+        python-backend/main.py:620,626,671 (order route uses body.slPips per-trade)
+  Problem: Order endpoint accepts per-trade `slPips` (1-200). A user (or auto-trade)
+  can open a trade with `slPips=20` or `slPips=5`. But `_manage_positions_loop` uses
+  the GLOBAL `settings.stop_loss_pips` (default 10) as the SL denominator for
+  r_multiple. So:
+  - Trade opened with slPips=20, price moves +10 pips → r_multiple = 10/10 = 1.0 →
+    BE fires at +1R... but the trade's actual 1R is +20 pips. BE fires at 0.5R,
+    moving SL to entry+1pip while price is only +10 pips favorable — SL sits 9 pips
+    below current price (tight), gets stopped out on noise.
+  - Trade opened with slPips=5, price moves +10 pips → r_multiple = 10/10 = 1.0 →
+    BE fires at +1R... but the trade's actual 1R is +5 pips. BE fires at 2R (too
+    late — price already moved 2x the intended R, profit left on table).
+  The actual per-position SL distance should be derived from `|p["openPrice"] -
+  p["sl"]| / pip` (computed once at trade open and stored in DB) OR from the trade
+  record's `slPips` field.
+  Fix: Either (a) compute actual_sl_pips = abs(p["openPrice"] - p["sl"]) / pip per
+  iteration (but sl changes after BE/trail — need original sl stored separately), OR
+  (b) fetch from DB: `original_sl_pips = db.get_trade(ticket).sl_pips` (requires
+  save_trade to persist slPips — currently doesn't, see db.py). Use that as the
+  r_multiple denominator instead of settings.stop_loss_pips.
+
+#A1-EXTRA — HIGH — modify_sl_tp doesn't validate against broker stops_level → frequent
+  retcode 10013 rejects on tight trailing
+  File: python-backend/mt5_service.py:464-501 (modify_sl_tp — no stops_level check),
+        python-backend/mt5_service.py:482-486 (only rounds to digits, no min-distance
+        validation),
+        python-backend/mt5_service.py:364 (RETCODE_MAP: 10013 = "Invalid stops (SL/TP
+        too close)")
+  Problem: MT5 brokers enforce a minimum stop distance (`info.trade_stops_level` in
+  points) — typically 5-20 points for EURUSD (0.5-2 pips). If new_sl is closer to
+  current price than `stops_level`, the broker rejects with retcode 10013. The current
+  trailing logic computes `candidate = current - 8 pips` (BUY), which for EURUSD =
+  80 points — usually above stops_level. But for tight trailing (e.g. trail_pips=3)
+  or for high-stops_level brokers, the modify silently fails. The loop logs debug
+  only (main.py:244 `log.debug("trailing: ticket=%s sl→%s")`) — no retry, no alert.
+  User has no way to know trailing isn't working.
+  Fix: In modify_sl_tp, fetch `info.trade_stops_level` (in points) and convert to
+  price units. If `abs(new_sl - current_price) < stops_level * point`, clamp new_sl
+  outward to the minimum distance. Log a warning when clamping. Optionally surface
+  the reject in `r.get("error")` so the API caller sees it.
+
+==================================================================
+AREA 2: BACKTESTING (7 findings)
+==================================================================
+
+#8 — HIGH — Backtest doesn't validate the ML model — runs a totally different strategy
+  File: python-backend/backtest.py:17-21 (df["ema_fast"] = ema(df, 9); df["ema_slow"] =
+  ema(df, 21); df["rsi"] = rsi(df, 14); m, sig, _ = macd(df)),
+        python-backend/backtest.py:41-42 (bull = ema_fast > ema_slow AND macd > macd_signal
+  AND rsi > 50),
+        python-backend/main.py:882-885 (`api_backtest(symbol, trades)` → bt.run()),
+        python-backend/main.py:786-794 (live analysis uses ml_model.predict + ai_service
+  .analyze — DIFFERENT signal source)
+  Problem: User's hypothesis was look-ahead bias between ML training data and backtest
+  data. Verified FALSE — features in backtest (EMA/RSI/MACD) are causal (ewm with
+  adjust=False, rolling windows) and the labels aren't used in backtest at all. The
+  real issue is bigger: the backtest uses its OWN hardcoded EMA(9,21)/RSI(14)/MACD(12,26,9)
+  strategy — NOT the ML model (ml_model.predict) and NOT the AI service (ai_service
+  .analyze). So the "Backtest" panel in the dashboard gives ZERO information about
+  whether the live auto-trade signals are profitable. A user could see +30% return
+  in the backtest panel and -10% in live trading — they're backtesting different
+  strategies entirely.
+  Fix: Either (a) make backtest.run() accept a `strategy: str` parameter — "ema_rsi_macd"
+  (current) | "ml_model" (calls ml_model.predict on each bar) | "ai_service" (replays
+  the multi-provider analysis) — and let the UI choose; OR (b) rename the current
+  backtest to "Strategy Backtest (EMA/RSI/MACD)" in the UI and add a separate "ML Model
+  Backtest" panel that calls ml_model.predict on historical windows and measures
+  direction accuracy + simulated P&L.
+
+#9 — MEDIUM — No parameter sensitivity testing (single fixed EMA/RSI/MACD parameter set)
+  File: python-backend/backtest.py:17-21 (ema(df, 9), ema(df, 21), rsi(df, 14),
+  macd(df) — all hardcoded)
+  Problem: The strategy uses EMA(9,21), RSI(14), MACD(12,26,9) — one fixed parameter
+  set. A 30% return on this set could be a fluke of the chosen window. No sweep over
+  alternatives (EMA 10/20, 15/30, 20/50; RSI 7, 14, 21). No grid search, no walk-forward
+  optimization. Professional backtests report results across N parameter sets to
+  identify robust vs overfit configurations.
+  Fix: Refactor `run()` to accept `params: dict` (e.g. {ema_fast: 9, ema_slow: 21,
+  rsi: 14}). Add `run_sweep(symbol, tf, param_grid)` that iterates combinations and
+  returns a heatmap of {netProfit, winRate, maxDrawdown} per config. Surface in UI as
+  a parameter sensitivity table.
+
+#10 — HIGH — No walk-forward split — single in-sample pass over the entire dataset
+  File: python-backend/backtest.py:39-73 (single for-loop over `range(50, len(df)-6, 6)`),
+        python-backend/backtest.py:12 (`def run(symbol, tf, trades=120)` — no train/test
+  split parameter)
+  Problem: The backtest iterates the entire dataset, computing indicators + entries +
+  exits in one pass. There's no time-respecting train/test split. Compare with
+  ml_model.train() (ml_model.py:108-141) which DOES implement walk-forward (3 folds,
+  each trains on first 70%, tests on next 15%) — but the backtest does NOT. So the
+  backtest overfits: any parameters that work on this window will be reported as
+  profitable, but they may not generalize. A single in-sample test is the textbook
+  definition of curve-fitting.
+  Fix: Split df into train (e.g. first 70%) + test (last 30%) by time. Run indicators
+  + signal generation only on train, then "trade" on test using the train-derived
+  parameters. Report train metrics + test metrics separately. Even better: rolling
+  walk-forward (train on [0:300], test on [300:360], roll forward by 60 bars,
+  retrain, etc.).
+
+#11 — HIGH — Fixed 0.8 pip spread modeling (no variable spread, no per-symbol spread)
+  File: python-backend/backtest.py:34 (`spread_pips = 0.8  # average floating spread`)
+  Problem: Real EURUSD spread varies 0.5-3 pips (calm Asian session vs NFP release).
+  XAUUSD spread 2-5 pips. GBPJPY 2-4 pips. The backtest uses a constant 0.8 pips for
+  ALL symbols regardless of session, news, or instrument. This systematically
+  overestimates backtest profitability:
+  - A scalping strategy with 5-pip TP and 0.8-pip spread cost in backtest looks like
+    65% gross → ~50% net profitable. With realistic 2-pip average spread, the same
+    strategy is 5 - 2 = 3 pips net → 35% net → losing after commission.
+  - The same 0.8 is applied to XAUUSD (real spread 3-5 pips) — backtest shows
+    profitable, live loses money.
+  Fix: (a) Per-symbol spread: read `info.spread` from MT5 (current spread) or use
+  per-symbol defaults (EURUSD=0.8, GBPUSD=1.2, USDJPY=1.0, XAUUSD=3.0). (b) Variable
+  spread: simulate intrabar spread variation by sampling from a normal distribution
+  N(mean, std=0.3*mean) per trade. (c) Session-aware: spread doubles during news/
+  rollover — apply 2x multiplier when bar timestamp is near a known news event.
+
+#12 — HIGH — No slippage modeling (entry/exit fill at exact bar close)
+  File: python-backend/backtest.py:46-47 (`entry = row["close"]; exit_ = df.iloc[i+5]
+  ["close"]`)
+  Problem: Real market orders experience 0.5-2 pips slippage on entry (more during
+  volatility). The backtest fills at the exact bar's close price — unrealistic. For
+  a BUY: actual fill = bar_close + slippage_pips (you pay the ask, which is above
+  the close). For a SELL: actual fill = bar_close - slippage_pips. Over 120 trades
+  with 1-pip average slippage, that's 120 pips of phantom profit — easily the
+  difference between "profitable" and "unprofitable" for a marginal strategy.
+  send_order (mt5_service.py:380-424) has a `deviation` parameter for this — but
+  backtest doesn't model it.
+  Fix: `entry = row["close"] + slippage_pips * pip * direction_sign` where
+  slippage_pips is sampled from N(0.5, 0.3). Same for exit. Make slippage_pips a
+  parameter so users can stress-test at 0 / 0.5 / 1.0 / 2.0 to see sensitivity.
+
+#13 — LOW — Commission IS deducted correctly (verified)
+  File: python-backend/backtest.py:35 (`commission_per_lot_side = 1.0  # USD, round-trip
+  = $2/lot`),
+        python-backend/backtest.py:52 (`pnl = pips_net * ps.lot * vpp -
+  commission_per_lot_side * 2 * ps.lot`)
+  Problem: User asked if commission is deducted from EVERY trade's P&L or just
+  mentioned. Verified DEDUCTED from every trade: `pnl = pips_net * ps.lot * vpp -
+  commission_per_lot_side * 2 * ps.lot`. The `* 2` covers entry + exit (round-trip).
+  The `* ps.lot` scales by position size. ✓ Correct.
+  Minor concern: commission is $1/lot/side for FINEX — but for other brokers it
+  varies ($3-7/lot/side for some ECN brokers, $0 for commission-free market-maker
+  accounts with wider spread). Should be configurable via settings.commission_per_lot.
+  Fix (minor): Add `commission_per_lot_side: float = 1.0` to Settings, use in
+  backtest and live P&L attribution.
+
+#14 — HIGH — No margin/leverage modeling — equity curve ignores margin calls
+  File: python-backend/backtest.py:23-71 (equity = 10000; for loop adds pnl per trade;
+  no margin check, no leverage, no margin call),
+        python-backend/backtest.py:51 (`ps = size_position(equity, sl_pips)` — computes
+  lot size based on risk%, not on available margin),
+        python-backend/risk_manager.py:26-45 (size_position doesn't check margin)
+  Problem: The backtest tracks running P&L as "equity" but never checks if the
+  account has enough margin to open the position. A 50% drawdown on a 1:100 leveraged
+  account triggers a margin call at 50% (FINEX rule) — but the backtest happily
+  continues opening new trades. Worse: `size_position(equity, sl_pips)` computes lot
+  size as `risk_amount / (sl_pips * vpp)` — for a $10k account risking 1% ($100) with
+  SL=10 pips, that's 100/(10*10) = 1.0 lot. 1.0 lot of EURUSD requires ~$1k margin
+  (1:100 leverage). If equity drops to $5k and the formula still says 0.5 lot, that
+  requires $500 margin — fine. But if the user has 3 open positions (max_open_positions),
+  required margin could exceed available equity → broker auto-closes positions at
+  margin call. Backtest reports "+30% return" but reality is a margin call at -20%.
+  Fix: Track `used_margin` alongside equity. Before each trade: `required_margin =
+  lot * contract_size / leverage; if required_margin > (equity - used_margin):
+  skip_trade("insufficient margin")`. Apply FINEX margin call rule: if equity / margin
+  < 50%, force-close the worst-performing position. Surface "margin_calls" count
+  in summary.
+
+==================================================================
+AREA 3: SELF-LEARNING ML (6 findings)
+==================================================================
+
+#15 — LOW — Feature pipeline is consistent between train() and predict() (verified)
+  File: python-backend/ml_model.py:56-68 (build_features — single function called by
+  both),
+        python-backend/ml_model.py:101 (`df = build_features(df)` in train),
+        python-backend/ml_model.py:268 (`feats = build_features(df_recent).tail(1)
+  [FEATURES].values` in predict)
+  Problem: User asked if features are EXACTLY the same in train and predict. Verified
+  YES — both call the same `build_features()` function. FEATURES list (line 52-53) is
+  shared. EMA-50 with `adjust=False` (recursive) is causal — uses only past data.
+  `label()` (line 71-83) uses `df["close"].shift(-horizon)` (FUTURE data) but ONLY
+  for training labels — never used in features. The walk-forward test set
+  (ml_model.py:124-141) uses `df.iloc[test_start:test_end]` after `build_features`
+  was called on the full df — but since EMA is recursive backward-looking, the
+  features at test row t depend only on data ≤ t (no future leak). ✓ Clean.
+  Minor concern (LOW severity): train uses 3000 bars (ml_model.py:86 `count=3000`),
+  predict uses 200 bars (main.py:788 `mt5_candles(symbol, "H1", 200)`). EMA-50 needs
+  ~150 bars for warmup convergence — both have enough. But the EMA value at the tail
+  of a 3000-bar df and the tail of a 200-bar df will differ by a tiny amount
+  (exponential decay of the initialization transient). For 200-bar input the
+  transient has decayed to ~e^(-200/50) ≈ 2% of initial — negligible but non-zero.
+  Fix (minor): Increase predict df_recent to 500+ bars to fully eliminate warmup
+  variance. Or use `adjust=True` (less stable but initialization-independent).
+  Otherwise: feature pipeline is correct.
+
+#16 — HIGH — Label threshold (0.0008) is hardcoded for EURUSD — not adaptive per symbol
+  File: python-backend/ml_model.py:71 (`def label(df, horizon=5, threshold=0.0008):`),
+        python-backend/ml_model.py:79 (`labels = np.where(fwd > threshold, 1, np.where
+  (fwd < -threshold, -1, 0))`),
+        python-backend/main.py:420 (`scheduler.add_job(ml_model.train, "cron", hour=2,
+  minute=0)` — train() uses default threshold, no per-symbol override)
+  Problem: threshold=0.0008 is "8 pips for EURUSD" — but it's applied as a raw price
+  delta, not a pip-normalized threshold. So:
+  - EURUSD: 0.0008 = 8 pips (EURUSD pip = 0.0001) → reasonable
+  - USDJPY: 0.0008 = 0.08 JPY. USDJPY pip = 0.01, so 0.0008 = 0.08 pip → 8 pips
+    equivalent. Wait — actually USDJPY trades ~145, so 0.0008 JPY move is 0.00055% —
+    completely below noise. The threshold should be 0.08 (8 pips × 0.01/pip).
+    Current threshold makes EVERY bar labeled ±1 (since essentially all bars move
+    more than 0.0008 JPY).
+  - XAUUSD: 0.0008 = $0.0008 (gold trades ~$2000/oz). One "pip" for XAUUSD = 0.1
+    (per _pip_for_digits, digits=2). 8 pips = $0.80. Current threshold of 0.0008
+    makes EVERY bar labeled ±1 (a $0.0008 move is microscopic for gold).
+  - Result: For non-EURUSD symbols, the ML model trains on noise labels (almost
+    every bar gets ±1, no "flat" labels), producing a model that essentially guesses
+    direction with no real signal.
+  Fix: `def label(df, horizon=5, threshold_pips=8, pip_value=0.0001): threshold =
+  threshold_pips * pip_value`. Caller (train()) should pass pip_value from
+  `_pip_for_digits(info.digits)`. For XAUUSD (digits=2), pip_value=0.1 → threshold
+  = 0.8 (8 pips × 0.1). For USDJPY (digits=3), pip_value=0.01 → threshold = 0.08.
+
+#17 — HIGH — Drift detection doesn't trigger retrain — only logs a warning
+  File: python-backend/ml_model.py:219-247 (check_drift — computes drift, logs warning,
+  persists to DB, returns drift score),
+        python-backend/ml_model.py:277 (`drift = check_drift(model_symbol)` in predict
+  — return value used only for response, no retrain trigger),
+        python-backend/main.py:420 (scheduler only runs ml_model.train at 02:00 nightly —
+  no intraday retrain on drift)
+  Problem: `check_drift()` detects when recent prediction confidence has dropped
+  >8% below training confidence mean — a strong signal that market regime has shifted
+  and the model is stale. But:
+  (a) `predict()` calls `check_drift()` and includes the drift score in the response
+      (line 277-278) — but does NOTHING with it. No retrain, no alert, no auto-trade
+      suppression.
+  (b) The scheduler (main.py:420) only runs `ml_model.train` at 02:00 UTC nightly.
+      A regime shift at 09:00 UTC (London open) leaves the model stale for 17 hours.
+      A regime shift at 14:00 UTC (NFP) leaves it stale for 12 hours. During this
+      window, auto-trade continues executing on stale signals — direct money risk.
+  (c) check_drift only logs a warning (line 245-246) — no email alert, no Slack
+      notification. User has to actively monitor logs to notice.
+  Fix: (a) In predict(), if `drift > _DRIFT_THRESHOLD`, call `ml_model.train()`
+  via `asyncio.create_task(asyncio.to_thread(ml_model.train, model_symbol))` —
+  fire-and-forget background retrain. Throttle to once per hour. (b) Send email
+  alert via `notifier.send_email("ML drift detected", ...)` when drift crosses
+  threshold. (c) Suppress auto-trade signals for the affected symbol until retrain
+  completes (set a `_drift_retrain_in_progress` flag, checked in _auto_trade_loop).
+
+#18 — MEDIUM — Model comparison guard has no absolute floor — keeps promoting
+  chronically-bad models
+  File: python-backend/ml_model.py:149-157 (`if old_symbol == symbol and test_acc <
+  old_acc - 0.02: log.warning(...); return` — only RELATIVE regression check)
+  Problem: The guard refuses to promote a new model if `test_acc < old_acc - 0.02`
+  (2 percentage points worse than existing). But:
+  - If old model has test_acc=0.40 (bad, ~33% above random for 3-class) and new model
+    has test_acc=0.38, new is rejected — OLD (40%, still bad) stays in production.
+  - If old model has test_acc=0.35 and new model has test_acc=0.36, new is promoted
+    (slight improvement) — but both are near random; the model is providing no
+    actionable signal.
+  - There's no absolute minimum like "refuse to promote any model below 0.55
+    accuracy" — a 3-class classifier at 0.55 is barely above the 0.33 baseline. Below
+    that, the model is noise.
+  The guard prevents regressions but doesn't prevent chronic badness.
+  Fix: Add absolute floor: `MIN_ABS_ACC = 0.55`. After the relative check, add:
+  `if test_acc < MIN_ABS_ACC: log.error("new model test_acc %.3f below absolute floor
+  %.3f — refusing to promote, investigate features/labels", test_acc, MIN_ABS_ACC);
+  return` (don't promote, keep old). If old is also below floor, log CRITICAL +
+  send email alert — the model needs human attention, not silent operation.
+
+#19 — MEDIUM — Feature importances not tracked — no debugging visibility into which
+  features drive predictions
+  File: python-backend/ml_model.py:179-190 (joblib.dump bundle — saves model, features,
+  symbol, tf, train_acc, test_acc, trained_at, n_samples, train_conf_mean,
+  train_conf_std — NO feature_importances_),
+        python-backend/ml_model.py:281-299 (model_info — returns exists, version,
+  train_acc, test_acc, symbol, trained_at, n_samples, drift, drift_threshold — NO
+  feature_importances)
+  Problem: XGBoost exposes `clf.feature_importances_` (per-feature gain/contribution).
+  The bundle doesn't save this. So:
+  - When predictions go wrong (e.g. model says BUY but price falls), there's no way
+    to inspect "was it RSI driving this prediction? Was it MACD? Was it a noisy vol_5
+    feature?"
+  - When retrain produces a worse model, no way to see "feature X's importance
+    dropped from 0.30 to 0.05 — something changed in the data pipeline for X".
+  - The ML panel in the UI (model_info() endpoint) shows train_acc/test_acc/drift but
+    not "top 5 features by importance" — debugging-friendly info that competitors
+    (e.g. Trade Ideas, TrendSpider) surface prominently.
+  Fix: In train(), after `clf = best_clf`: `importances = dict(zip(FEATURES,
+  clf.feature_importances_.tolist()))`. Add to bundle: `"feature_importances":
+  importances`. Add to model_info() response: `"top_features": sorted(importances.
+  items(), key=lambda x: -x[1])[:5]`. Surface in the AI Engine panel as a "Feature
+  Importance" bar chart.
+
+#20 — HIGH — No prediction confidence calibration — auto_trade_min_confidence=75 gate
+  is meaningless
+  File: python-backend/ml_model.py:271 (`proba = clf.predict_proba(feats)[0]`),
+        python-backend/main.py:286 (`min_confidence = getattr(settings,
+  "auto_trade_min_confidence", 75)`),
+        python-backend/main.py:326 (`if signal == "NEUTRAL" or confidence < min_confidence:
+  continue`)
+  Problem: XGBoost `predict_proba` returns uncalibrated probability scores. On small
+  training sets (3000 bars / 4 folds ≈ 750 samples per fold), XGBoost is systematically
+  overconfident — a "0.85 probability" prediction often corresponds to a true
+  probability of 0.55-0.65. The auto_trade loop uses `confidence >= 75` as a binary
+  gate — but with uncalibrated probabilities, this gate is arbitrary. A user setting
+  `auto_trade_min_confidence=85` thinks they're being conservative (only trade when
+  model is 85%+ sure) — but the model's "85%" might be a true 60%, no better than
+  guessing. Conversely, a true 90% signal might be reported as 70%, getting filtered
+  out. Platt scaling (sigmoid calibration) or isotonic regression would map the raw
+  XGBoost scores to true probabilities.
+  Fix: In train(), after `clf.fit(...)`, fit a calibrator on a held-out split:
+  `from sklearn.calibration import CalibratedClassifierCV; calibrated =
+  CalibratedClassifierCV(clf, method='isotonic', cv=3); calibrated.fit(X_cal, y_cal)`.
+  Save the calibrator in the bundle. In predict(), use `calibrated.predict_proba()
+  ` instead of `clf.predict_proba()`. Log the calibration curve (raw vs calibrated
+  proba) so users can verify the calibration is sensible.
+
+==================================================================
+SUMMARY
+==================================================================
+Critical: 0 (no direct money-risk CRITICALs in this audit — but 15 HIGH findings
+  compound to systematic money risk)
+High:     15 (#1 trail too aggressive, #2 no ATR, #3 BE buffer too tight, #5 trail
+  frequency, EXTRA-A1 trailing settings cosmetic, EXTRA-A2 r_multiple wrong SL,
+  EXTRA-A3 modify no stops_level check, #8 backtest doesn't validate ML, #10 no
+  walk-forward, #11 fixed spread, #12 no slippage, #14 no margin modeling, #16 label
+  threshold not adaptive, #17 no intraday retrain, #20 no calibration)
+Medium:   5 (#4 partial close dead, #7 sequential modify, #9 no param sweep, #18
+  model guard no floor, #19 no feature importance)
+Low:      3 (#6 SELL trail correct, #13 commission correct, #15 features consistent)
+
+Top 3 cross-cutting root causes:
+1. **Config-driven features are actually hardcoded constants.** Three "configurable"
+   features (trailing_enabled, trailing_pips, partial_close_enabled) are read via
+   `getattr(settings, "X", default)` — but the Settings class doesn't define these
+   fields. Pydantic's `extra="ignore"` silently drops env vars. The frontend store
+   has trailingEnabled/trailingPips setters, but they never call any backend API.
+   Net effect: the "Enable trailing stop" toggle and "Trail Distance" slider in the
+   UI are pure decoration. The auto partial-close at +1.5R is `pass # disabled by
+   default — enable via config if needed` — but there's no config flag to enable it.
+   This is the same honesty-violation pattern flagged in S2 audit #15 (hardcoded
+   sentiment card) — a trading terminal UI that lies about its config.
+
+2. **The trailing pipeline has wrong trigger levels AND frequent broker rejects.**
+   `_manage_positions_loop` computes `r_multiple = favor_pips / settings.stop_loss_pips`
+   using the GLOBAL default SL (10 pips), not the actual per-position SL distance.
+   A trade opened with `slPips=20` gets BE triggered at +10 pips (0.5R actual) — SL
+   moves to entry+1 pip while price is only +10 pips favorable → SL sits 9 pips
+   below current price → noise stops it out. Combined with `modify_sl_tp` not
+   checking `info.trade_stops_level` (broker min stop distance), tight trailing
+   silently fails with retcode 10013 — logged at DEBUG level, no alert, user has no
+   way to know trailing isn't working. Three independent bugs (wrong r_multiple
+   denominator, no stops_level check, debug-only logging of rejects) compound into
+   "trailing is configured, enabled, and running — but does nothing useful."
+
+3. **The backtest doesn't validate the ML model.** backtest.run() uses its OWN
+   hardcoded EMA(9,21)/RSI(14)/MACD(12,26,9) strategy — NOT the ml_model.predict
+   or ai_service.analyze that the live auto-trade loop uses. So the "Backtest"
+   panel in the dashboard gives ZERO information about whether live signals are
+   profitable. A user could see +30% return in backtest and -10% in live trading
+   — they're backtesting different strategies entirely. Combined with no walk-
+   forward (#10), no variable spread (#11), no slippage (#12), no margin modeling
+   (#14), the backtest is overfit, unrealistic, and decoupled from the production
+   signal source. It's a marketing demo, not a validation tool.
+
+No code changes made. Findings handed off for implementation.

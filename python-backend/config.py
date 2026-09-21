@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     daily_target_pct: float = 2.0
     avoid_high_impact_news: bool = True
 
+    # Trailing stop / position management
+    trailing_enabled: bool = True
+    trailing_pips: int = 8
+    trailing_atr_multiplier: float = 1.5  # dynamic: trail = ATR * multiplier
+    trailing_use_atr: bool = False  # if True, use ATR-based dynamic trailing
+    break_even_enabled: bool = True
+    break_even_r_multiple: float = 1.0  # move SL to BE at +1R
+    break_even_buffer_pips: int = 2  # buffer above entry for BE
+    partial_close_enabled: bool = False
+    partial_close_r_multiple: float = 1.5  # close 50% at +1.5R
+    partial_close_ratio: float = 0.5  # fraction to close
+
     # Email
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
