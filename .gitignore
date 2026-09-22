@@ -76,3 +76,5 @@ python-backend/.pytest_cache/
 *.png
 *.jpg
 screenshot-*.pngtool-results/
+tool-results/
+upload/
