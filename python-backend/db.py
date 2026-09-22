@@ -24,8 +24,18 @@ _lock = threading.Lock()
 
 
 def _db_path() -> str:
-    p = Path(getattr(settings, "db_path", "zenitrade.db"))
-    p.parent.mkdir(parents=True, exist_ok=True)
+    """Get the SQLite DB file path. Handles Windows path issues."""
+    raw = getattr(settings, "db_path", "zenitrade.db")
+    # strip Prisma-style prefixes if accidentally set (file:./db → ./db)
+    if raw.startswith("file:"):
+        raw = raw[5:]
+    p = Path(raw)
+    # ensure parent dir exists
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DB dir create failed: %s — using current dir", exc)
+        p = Path(p.name)  # fallback to current directory
     return str(p)
 
 

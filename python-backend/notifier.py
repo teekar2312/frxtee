@@ -19,6 +19,9 @@ log = logging.getLogger("notify")
 
 _pending_tasks: set[asyncio.Task] = set()
 
+# in-memory price alerts (fallback if DB unavailable)
+PRICE_ALERTS: list[dict] = []
+
 
 def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
@@ -108,3 +111,62 @@ def notify_async(subject: str, body: str, channels: str = "email") -> None:
         _spawn(send_telegram(f"🔔 {subject}\n{plain}"))
     if "discord" in ch_list:
         _spawn(send_discord(f"🔔 **{subject}**\n{plain}"))
+
+
+def add_price_alert(symbol: str, condition: str, price: float) -> dict:
+    """Persist alert to DB and return it. Falls back to in-memory if DB unavailable."""
+    try:
+        from db import add_alert
+        return add_alert(symbol, condition, price)
+    except Exception:  # noqa: BLE001
+        alert = {
+            "id": f"pa-{len(PRICE_ALERTS)+1}", "symbol": symbol, "condition": condition,
+            "price": price, "active": True, "triggered": False,
+            "createdAt": time.time(),
+        }
+        PRICE_ALERTS.append(alert)
+        return alert
+
+
+def check_alerts(ticks: list[dict]) -> list[dict]:
+    """Check current prices against alerts; return triggered alerts."""
+    # load active alerts from DB (or fallback to in-memory)
+    try:
+        from db import get_alerts, mark_alert_triggered
+        active = get_alerts(active_only=True)
+    except Exception:  # noqa: BLE001
+        active = PRICE_ALERTS
+    triggered = []
+    for a in active:
+        # DB stores active as int 0/1; normalize
+        is_active = bool(a.get("active", a.get("active_", 0)))
+        is_triggered = bool(a.get("triggered", 0))
+        if not is_active or is_triggered:
+            continue
+        t = next((x for x in ticks if x["symbol"] == a["symbol"]), None)
+        if not t:
+            continue
+        hit = (
+            (a["condition"] == "above" and t["bid"] > a["price"])
+            or (a["condition"] == "below" and t["bid"] < a["price"])
+            or (a["condition"] == "cross_up" and t["bid"] > a["price"])
+            or (a["condition"] == "cross_down" and t["bid"] < a["price"])
+        )
+        if hit:
+            a["triggered"] = 1
+            a["active"] = 0
+            triggered.append(a)
+            # mark in DB
+            try:
+                from db import mark_alert_triggered
+                if isinstance(a.get("id"), int):
+                    mark_alert_triggered(a["id"])
+                elif isinstance(a.get("id"), str) and a["id"].startswith("pa-"):
+                    mark_alert_triggered(int(a["id"][3:]))
+            except Exception:  # noqa: BLE001
+                pass
+            _spawn(send_email(
+                f"Price alert: {a['symbol']} {a['condition']} {a['price']}",
+                f"<p>Alert triggered: <b>{a['symbol']}</b> {a['condition']} {a['price']}.</p><p>Current bid: {t['bid']}</p>",
+            ))
+    return triggered
