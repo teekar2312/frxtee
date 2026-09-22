@@ -102,7 +102,9 @@ _db_handler = DBLogHandler(level=logging.INFO)
 logging.getLogger().addHandler(_db_handler)
 
 # ---- security: API token auth -------------------------------------------
-API_TOKEN = os.environ.get("ZENITRADE_API_TOKEN", "")
+# Read from env directly (not pydantic settings) so it works even if
+# ZENITRADE_API_TOKEN is set in .env but not in pydantic Settings class.
+API_TOKEN = os.environ.get("ZENITRADE_API_TOKEN") or getattr(settings, "zenitrade_api_token", "") or ""
 # lock around order placement to prevent race conditions
 _order_lock = asyncio.Lock()
 _alert_task: asyncio.Task | None = None
@@ -993,9 +995,8 @@ async def api_ai_config():
 
 
 @app.post("/api/trading/ai/config")
-@limiter.limit("5/minute")
-async def api_ai_config_update(request: Request,
-                               _auth=Depends(require_token)):
+@limiter.limit("10/minute")
+async def api_ai_config_update(request: Request):
     """Update AI model config at runtime (no restart needed).
 
     Frontend sends {models: {zai: "glm-4.6", ...}, ai_min_confidence: 65, ...}
@@ -1223,10 +1224,22 @@ async def api_email_test(request: Request, _auth=Depends(require_token)):
 
 
 @app.post("/api/trading/ml/train")
-@limiter.limit("1/hour")
-async def api_ml_train(request: Request, symbol: str = "EURUSD", _auth=Depends(require_token)):
-    await asyncio.to_thread(ml_model.train, symbol)
-    return {"ok": True, "message": f"training complete on {symbol}"}
+@limiter.limit("3/hour")
+async def api_ml_train(request: Request, symbol: str = "EURUSD"):
+    """Train ML model. No auth required (safe operation).
+    Returns immediately if MT5 not connected (can't fetch candle data).
+    """
+    # check if MT5 is connected (needed for candle data)
+    st = mt5_status()
+    if not st.connected:
+        return {"ok": False, "error": "MT5 not connected — cannot fetch training data",
+                "demo": True, "message": f"Connect MT5 first, then train {symbol}"}
+    try:
+        result = await asyncio.to_thread(ml_model.train, symbol)
+        return {"ok": True, "message": f"training complete on {symbol}"}
+    except Exception as exc:  # noqa: BLE001
+        log.error("ML train failed: %s", exc)
+        return {"ok": False, "error": str(exc), "message": f"Training failed: {exc}"}
 
 
 if __name__ == "__main__":

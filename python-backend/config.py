@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     port: int = 8000
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # Security
+    zenitrade_api_token: str = ""  # empty = no auth (dev mode)
+
     # Persistence + monitoring
     db_path: str = "zenitrade.db"
     sentry_dsn: str = ""  # empty = disabled
