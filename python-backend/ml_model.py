@@ -125,6 +125,11 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         log.warning("insufficient data to train (%d rows)", len(df))
         return
 
+    # remap labels from [-1, 0, 1] to [0, 1, 2] (XGBoost requires 0-based)
+    label_map = {-1: 0, 0: 1, 1: 2}
+    df["label"] = df["label"].map(label_map)
+    log.info("label distribution: %s", df["label"].value_counts().to_dict())
+
     # ---- walk-forward: 3 folds, each trains on first 70%, tests on next 15% ----
     fold_accs = []
     fold_size = len(df) // 4  # 4 segments, 3 overlapping folds
@@ -306,7 +311,9 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     proba = clf.predict_proba(feats)[0]
     classes = clf.classes_
     idx = int(np.argmax(proba))
-    direction = {1: "UP", -1: "DOWN", 0: "NEUTRAL"}.get(int(classes[idx]), "NEUTRAL")
+    # remap back from [0,1,2] to [-1,0,1] = [DOWN, NEUTRAL, UP]
+    reverse_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
+    direction = reverse_map.get(int(classes[idx]), "NEUTRAL")
     max_prob = float(proba[idx])
     _track_prediction(max_prob)  # feed drift detector
     drift = check_drift(model_symbol)
