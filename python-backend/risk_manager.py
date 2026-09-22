@@ -60,9 +60,11 @@ class RiskGuard:
         self._restore()
 
     def _restore(self):
-        """Load today's state from DB. If no row for today, start fresh."""
+        """Load today's state from DB. If DB/table not ready, start fresh."""
         try:
-            from db import load_risk_state
+            from db import load_risk_state, init_db
+            # ensure tables exist before reading (init_db is safe to call multiple times)
+            init_db()
             today, loss, count = load_risk_state()
             self._date = today
             self.daily_loss = loss
@@ -71,7 +73,7 @@ class RiskGuard:
                 log.info("RiskGuard restored: date=%s loss=%.2f open=%d",
                          today, loss, count)
         except Exception as exc:  # noqa: BLE001
-            log.warning("RiskGuard restore failed (db not ready?): %s", exc)
+            log.warning("RiskGuard restore skipped (db not ready): %s", exc)
             self._date = date.today().isoformat()
 
     def _persist(self):
