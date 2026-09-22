@@ -768,10 +768,15 @@ async def api_close(ticket: int, request: Request, _auth=Depends(require_token))
 
 @app.post("/api/trading/positions/{ticket}/modify")
 @limiter.limit("20/minute")
-async def api_modify_sl_tp(ticket: int, request: Request, body: dict = None,
+async def api_modify_sl_tp(ticket: int, request: Request,
                            _auth=Depends(require_token)):
     """Modify SL/TP of an open position (trailing stop / break-even)."""
-    body = body or {}
+    import json as _json
+    try:
+        raw = await request.body()
+        body = _json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        body = {}
     sl = body.get("sl")
     tp = body.get("tp")
     r = await asyncio.to_thread(modify_sl_tp, ticket, sl, tp)
@@ -780,10 +785,15 @@ async def api_modify_sl_tp(ticket: int, request: Request, body: dict = None,
 
 @app.post("/api/trading/positions/{ticket}/partial")
 @limiter.limit("10/minute")
-async def api_partial_close(ticket: int, request: Request, body: dict = None,
+async def api_partial_close(ticket: int, request: Request,
                             _auth=Depends(require_token)):
     """Partially close a position (scale-out). Body: { volume: 0.05 }."""
-    body = body or {}
+    import json as _json
+    try:
+        raw = await request.body()
+        body = _json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        body = {}
     volume = float(body.get("volume", 0))
     if volume <= 0:
         return {"ok": False, "error": "volume must be > 0"}
@@ -984,14 +994,19 @@ async def api_ai_config():
 
 @app.post("/api/trading/ai/config")
 @limiter.limit("5/minute")
-async def api_ai_config_update(request: Request, body: dict = None,
+async def api_ai_config_update(request: Request,
                                _auth=Depends(require_token)):
     """Update AI model config at runtime (no restart needed).
 
     Frontend sends {models: {zai: "glm-4.6", ...}, ai_min_confidence: 65, ...}
     and backend applies immediately to settings singleton.
     """
-    body = body or {}
+    import json as _json
+    try:
+        raw = await request.body()
+        body = _json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        body = {}
     updated = []
     if "models" in body:
         models = body["models"]
@@ -1169,10 +1184,15 @@ async def api_tax_report(year: int | None = None):
 
 @app.post("/api/trading/accounts/switch")
 @limiter.limit("5/minute")
-async def api_switch_account(request: Request, body: dict = None,
+async def api_switch_account(request: Request,
                              _auth=Depends(require_token)):
     """Switch MT5 account (multi-account support)."""
-    body = body or {}
+    import json as _json
+    try:
+        raw = await request.body()
+        body = _json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        body = {}
     login = body.get("login")
     password = body.get("password")
     server = body.get("server")
