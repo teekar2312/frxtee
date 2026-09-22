@@ -1007,6 +1007,7 @@ async def api_ai_config_update(request: Request,
         body = _json.loads(raw) if raw else {}
     except Exception:  # noqa: BLE001
         body = {}
+    log.info("POST /ai/config received: %s", body)
     updated = []
     if "models" in body:
         models = body["models"]

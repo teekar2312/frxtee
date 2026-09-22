@@ -89,27 +89,37 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
     for p in cascade:
         try:
             if p == "zai" and settings.zai_api_key:
-                return _call_zai(symbol, user_msg)
+                result = _call_zai(symbol, user_msg)
+                result["model"] = settings.zai_model
+                return result
             if p == "groq" and settings.groq_api_key:
-                return _call_groq(symbol, user_msg)
+                result = _call_groq(symbol, user_msg)
+                result["model"] = settings.groq_model
+                return result
             if p == "google" and settings.google_api_key:
-                return _call_google(symbol, user_msg)
+                result = _call_google(symbol, user_msg)
+                result["model"] = settings.google_model
+                return result
             if p == "local":
-                return _call_ollama(symbol, user_msg)
+                result = _call_ollama(symbol, user_msg)
+                result["model"] = settings.ollama_model
+                return result
         except Exception as exc:
             log.warning("AI provider %s failed: %s — trying next in cascade", p, exc)
             continue
     log.warning("All AI providers failed — using heuristic fallback")
-    return _heuristic(symbol)
+    result = _heuristic(symbol)
+    result["model"] = "heuristic"
+    return result
 
 
 # ---------- Z.AI (z-ai-web-dev-sdk compatible HTTP) ----------
 def _call_zai(symbol: str, user_msg: str) -> dict:
-    # z-ai-web-dev-sdk exposes an OpenAI-compatible endpoint.
     base = os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4")
     key = settings.zai_api_key
     if not key:
         return _heuristic(symbol)
+    log.info("Z.AI calling model: %s", settings.zai_model)
     r = httpx.post(
         f"{base}/chat/completions",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -127,6 +137,7 @@ def _call_zai(symbol: str, user_msg: str) -> dict:
 def _call_groq(symbol: str, user_msg: str) -> dict:
     if not settings.groq_api_key:
         return _heuristic(symbol)
+    log.info("Groq calling model: %s", settings.groq_model)
     from openai import OpenAI
     client = OpenAI(api_key=settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
     resp = client.chat.completions.create(
@@ -144,6 +155,7 @@ def _call_groq(symbol: str, user_msg: str) -> dict:
 def _call_google(symbol: str, user_msg: str) -> dict:
     if not settings.google_api_key:
         return _heuristic(symbol)
+    log.info("Google calling model: %s", settings.google_model)
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
     model = genai.GenerativeModel(settings.google_model, system_instruction=SYSTEM_PROMPT)
@@ -153,6 +165,7 @@ def _call_google(symbol: str, user_msg: str) -> dict:
 
 # ---------- Local AI (Ollama) ----------
 def _call_ollama(symbol: str, user_msg: str) -> dict:
+    log.info("Ollama calling model: %s", settings.ollama_model)
     import ollama
     client = ollama.Client(host=settings.ollama_url)
     resp = client.chat(
