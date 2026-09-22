@@ -4875,3 +4875,320 @@ Top systemic issues:
   (6) Dashboard equity curve is synthetic random walk; Day P&L misses realized P&L; daily risk % doesn't match backend's authoritative guard.daily_loss (#1, #3, #7).
 
 Findings handed off for implementation. No code changes made.
+
+---
+Task ID: O2
+Agent: Final Optimization Auditor
+Task: Final sweep audit — code-quality optimization opportunities not covered by previous (T1/D1) audits. Verified via grep, tsc --noEmit, ast parsing, and direct file reads.
+
+Scope: Read all 9 Python backend files (main.py, mt5_service.py, ai_service.py, news_service.py, indicators.py, ml_model.py, risk_manager.py, backtest.py, notifier.py, db.py, config.py), all 14 src/components/trading/* files, all 19 src/app/api/trading/* routes, src/lib/* (trading-data, trading-hooks, trading-store, backend-proxy, db, utils, demo-logs, demo-news), src/app/page.tsx + layout.tsx, package.json, requirements.txt, tsconfig.json, next.config.ts, eslint.config.mjs, Dockerfiles, .gitignore, .env files. Verified hypotheses: ran `npx tsc --noEmit` (found 4 TS2300/TS2717/TS1117 duplicate-identifier errors and 5 type errors), grep for unused imports (confirmed 7 unused frontend imports + 4 unused Python imports), grep for heavy deps usage (15 package.json deps have 0 source imports). NO code changes made — audit only.
+
+==================================================================
+AREA 1: BUILD / TYPE-CHECKING CONFIGURATION (4 findings) — HIGHEST IMPACT
+==================================================================
+
+#1 — CRITICAL — `next.config.ts` disables TypeScript build errors, hiding real bugs
+  File: next.config.ts:6-8
+    typescript: {
+      ignoreBuildErrors: true,
+    },
+  Problem: Next.js is configured to silently swallow ALL TypeScript errors during `next build`. Verified by running `npx tsc --noEmit` — found 9 actual errors (see #3, #4, #5, #6, #7 below) that the production build silently ignores. The deployed bundle may contain runtime bugs that TypeScript was designed to catch. This is the root enabler of every type-safety issue in this audit.
+  Fix: Set `ignoreBuildErrors: false` (or remove the block). Fix the 9 surfaced type errors before redeploying.
+
+#2 — HIGH — `eslint.config.mjs` disables every meaningful lint rule
+  File: eslint.config.mjs:10-44
+  Problem: ALL TypeScript-strict, React-hooks, Next.js, and JS rules are turned OFF, including: `@typescript-eslint/no-explicit-any`, `@typescript-eslint/no-unused-vars`, `react-hooks/exhaustive-deps`, `no-console`, `no-debugger`, `prefer-const`, `no-unused-vars`, `no-unreachable`. ESLint is effectively a no-op. This is why the codebase has so many `any` types, unused imports, and missing deps arrays. Combined with #1, the project ships with zero static-analysis safety net.
+  Fix: Re-enable at minimum: `@typescript-eslint/no-unused-vars` (with `argsIgnorePattern: "^_"`), `@typescript-eslint/no-explicit-any` (warn), `react-hooks/exhaustive-deps` (warn), `no-console` (warn), `no-debugger` (error). Fix the surfaced issues.
+
+#3 — CRITICAL — `setAutoIndicators` declared twice in TradingState interface — runtime bug
+  File: src/lib/trading-store.ts:67 (`setAutoIndicators: (v: boolean) => void;`),
+        src/lib/trading-store.ts:83 (`setAutoIndicators: () => void;`),
+        src/lib/trading-store.ts:208 (implementation `setAutoIndicators: () => set({ indicators: TECHNICAL_INDICATORS.slice(0, 8).map((i) => i.id) })`)
+  Verified via `tsc --noEmit`: errors TS2300, TS2717, TS1117 at those lines.
+  Problem: Two interface members with the same name. The second declaration (`() => void`) replaces the first (`(v: boolean) => void`) at the type level. Worse — the implementation object literal also declares `setAutoIndicators` twice (lines 184-185 set `autoIndicators: v`, then lines 208-211 OVERWRITE it with the indicators-list-setter). At runtime, `store.setAutoIndicators(true)` is silently discarded — the arg is ignored, the indicators list is set, but the `autoIndicators` boolean flag NEVER becomes `true`. Indicators view's "Auto" toggle button appears active in UI but the underlying flag stays false forever. (Side-effect: AI Engine view's auto-configuration table at ai-engine-view.tsx:127 reads `store.autoIndicators` and always shows "Manual" for the Indicators row.)
+  Fix: Rename the indicators-setter to `setAutoIndicatorsList()` (or rename the flag-setter to `setAutoIndicatorsMode()`). Update both the interface (lines 67 + 83) and the implementation (lines 184-185 + 208-211). Update callers in indicators-view.tsx:56,57,96.
+
+#4 — MEDIUM — `reactStrictMode: false` disables React 19 strict-mode safety checks
+  File: next.config.ts:9
+  Problem: Strict Mode (intentional double-rendering in dev) catches: impure renders, missing effect cleanups, stale refs, unsafe lifecycle. Disabling it ships dev-quality code to production. Most modern Next.js projects enable it.
+  Fix: Remove the line (default is `true` in Next 16). Run the app in dev, fix any surfaced purity issues.
+
+#5 — MEDIUM — `tsconfig.json:13: "noImplicitAny": false` — disables implicit-any errors
+  File: tsconfig.json:13
+  Problem: Already set alongside `strict: true`, but `noImplicitAny: false` overrides the `strict` flag for implicit any. This is why functions like `CandleShape(props: any)` (candle-chart.tsx:15), `AnalysisMini({ a }: { a: any })` (dashboard-view.tsx:422), `Row({ k, v, tone }: ... tone?: boolean | "up" | "down")` (risk-view.tsx:321) compile without complaint.
+  Fix: Set `noImplicitAny: true`. Annotate or refactor the surfaced functions.
+
+==================================================================
+AREA 2: PYTHON BACKEND — TYPE/DEAD CODE ISSUES (8 findings)
+==================================================================
+
+#6 — CRITICAL — `auto_trade_symbols` is `str`, but `_auto_trade_loop` iterates it character-by-character
+  File: python-backend/config.py:66 (`auto_trade_symbols: str = "EURUSD,GBPUSD"`),
+        python-backend/main.py:345 (`symbols = getattr(settings, "auto_trade_symbols", [])`),
+        python-backend/main.py:353 (`for symbol in symbols:`)
+  Problem: `settings.auto_trade_symbols` is a comma-separated STRING (config.py:66). `main.py:353` does `for symbol in symbols:` — iterating a string yields characters: "E", "U", "R", "U", "S", "D", ",", "G", "B", "P", "U", "S", "D". Each "symbol" then goes to `mt5_candles(symbol, "M15", 100)` which fails (invalid symbol), caught by `except Exception: pass` at line 377. Net effect: auto-trade loop is silently broken — never executes any real symbol — even when `auto_trade_mode=True` is set.
+  Fix: `symbols = settings.auto_trade_symbols.split(",")` at line 345. Or change `auto_trade_symbols` config type to `list[str]` and parse in Settings (pydantic supports `list[str]` via comma-separated env).
+
+#7 — LOW — Unnecessary `getattr(settings, ...)` calls — settings is a typed Settings instance
+  File: python-backend/main.py:341, 345, 350, 351 (`getattr(settings, "auto_trade_mode", False)`, etc.),
+        python-backend/db.py:27 (`getattr(settings, "db_path", "zenitrade.db")`)
+  Problem: All these attributes are defined on the Settings class (config.py:61, 65, 67, 68). Using `getattr` with a default fallback suggests defensive coding for missing attributes — but they're guaranteed to exist by the pydantic BaseSettings. The defaults in `getattr` (e.g. `False`, `[]`, `"zai"`, `75`) shadow the real settings defaults if anyone removes the field from Settings — silently masking config drift.
+  Fix: Replace with direct access: `settings.auto_trade_mode`, `settings.auto_trade_symbols`, `settings.ai_provider`, `settings.auto_trade_min_confidence`, `settings.db_path`.
+
+#8 — LOW — Unused imports in Python backend (4 instances)
+  File: python-backend/backtest.py:8 — `from mt5_service import candles, _pip_for_digits` — `_pip_for_digits` imported but never called (line 31 hardcodes pip instead).
+  File: python-backend/db.py:9 — `import json` — never used (db.py uses sqlite3 directly).
+  File: python-backend/main.py:37 — `trail_stop` imported from risk_manager — never called (see #9).
+  File: python-backend/mt5_service.py:12 — `from dataclasses import asdict, dataclass` — `asdict` imported but never used (`.__dict__` is used on MT5Status instead at main.py:569, 624, etc.).
+  Fix: Remove the unused names.
+
+#9 — LOW — `risk_manager.trail_stop()` is dead code (defined, imported, never called)
+  File: python-backend/risk_manager.py:153-168 (`def trail_stop(position: dict, current_price: float, ...)`),
+        python-backend/main.py:37 (imported)
+  Verified via grep: `trail_stop` appears only at its definition (risk_manager.py:153) and the unused import in main.py:37 — zero callers. The actual trailing-stop logic is reimplemented inline in `_manage_positions_loop` (main.py:261-296) using `modify_sl_tp` directly with its own SL-candidate computation. The standalone helper is dead code that lulls readers into thinking it's the canonical trail implementation.
+  Fix: Delete `trail_stop()` from risk_manager.py:153-168 and remove its import from main.py:37. OR refactor `_manage_positions_loop` to call `trail_stop()` (DRY).
+
+#10 — MEDIUM — `backtest.py:96` returns hardcoded `"sharpe": 1.4` — fake metric
+  File: python-backend/backtest.py:96 (`"sharpe": 1.4,`)
+  Problem: BacktestSummary returns Sharpe ratio as the literal constant `1.4`, regardless of actual equity curve volatility. The frontend (backtest-view.tsx:121, 171) renders this as if it were computed. A trader comparing strategies sees identical Sharpe values for radically different equity curves. Misleading.
+  Fix: Compute `sharpe = mean(daily_returns) / std(daily_returns) * sqrt(periods_per_year)` from the per-trade returns. Or remove the field and update the frontend to display "N/A" if not computed.
+
+#11 — MEDIUM — `indicators.py` public functions lack type hints (12+ functions)
+  File: python-backend/indicators.py:23, 27, 31, 37, 55, 83, 89, 97, 107, 117, 128, 137, 145, 149, 153, 164, 173, 181, 190, 197, 201, 209, 216, 228, 233, 238, 250, 261, 268, 280
+  Problem: None of the public indicator functions (`ema`, `sma`, `vwap`, `supertrend`, `rsi`, `macd`, `atr`, etc.) have type annotations on `df`, period params, or return types. `compute()` (line 313) accepts `df: pd.DataFrame` and `indicators: list[str]` correctly, but the per-indicator functions — all of which take a DataFrame and return a Series or tuple of Series — are untyped. Caller code in main.py:829, 900, ml_model.py:58-67 has no IDE type assistance.
+  Fix: Annotate as `def ema(df: pd.DataFrame, period: int = 20, col: str = "close") -> pd.Series:` etc. For tuple-returning indicators: `def macd(df, fast=12, slow=26, signal=9) -> tuple[pd.Series, pd.Series, pd.Series]:`.
+
+#12 — LOW — `requirements.txt:26` lists `websockets==13.0.1` but never imported
+  File: python-backend/requirements.txt:26 (`websockets==13.0.1      # Finnhub websocket stream`),
+        python-backend/news_service.py (uses `httpx.AsyncClient` for HTTP, not websockets)
+  Verified via grep: zero `import websockets` or `from websockets` anywhere in python-backend/. The news service polls Finnhub's REST API (news_service.py:48-74), not a websocket stream. The comment is aspirational/misleading.
+  Fix: Remove the line from requirements.txt (saves ~50KB install + container image).
+
+#13 — LOW — `ml_model.py` mixes `__import__("time")` / `__import__("datetime")` instead of normal imports
+  File: python-backend/ml_model.py:204 (`backup = BACKUP_DIR / f"model_{symbol}_{int(__import__('time').time())}.joblib"`),
+        python-backend/ml_model.py:221, 233 (`__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()`)
+  Problem: Inlined `__import__()` is used 4 times for `time` and `datetime` instead of normal top-of-file imports. Hard to read, prevents IDE autocompletion, no perf benefit. The file already imports `logging, shutil, deque, Path, joblib, numpy, pandas` at the top — adding `import time` and `from datetime import datetime, timezone` is trivial.
+  Fix: Add `import time` and `from datetime import datetime, timezone` to the top imports; replace inline `__import__(...)` calls.
+
+==================================================================
+AREA 3: FRONTEND — TYPE ERRORS / DEAD CODE / DUPLICATES (12 findings)
+==================================================================
+
+#14 — MEDIUM — `news-view.tsx` accesses `data.sentiment` but `useNews()` hook doesn't declare it in the return type
+  File: src/components/trading/news-view.tsx:174, 180, 186, 194-203, 207 (`data?.sentiment?.bullish`, etc.),
+        src/lib/trading-hooks.ts:50-57 (useNews return type is `{ news: NewsItem[] }` — no `sentiment` field),
+        python-backend/main.py:802-805 (backend returns `{ news, calendar, sentiment, demo }` — sentiment IS present at runtime)
+  Verified via `tsc --noEmit`: 11 errors of "Property 'sentiment' does not exist on type '{ news: NewsItem[] }'".
+  Problem: The backend's /api/trading/news route returns sentiment aggregate data, and the news-view UI renders it (lines 170-209). But the TypeScript type for useNews only declares `{ news: NewsItem[] }`. At runtime, `data.sentiment` exists, but TS doesn't know. The news-view's "Sentiment Summary" card renders "—" instead of the actual data when the TS checker (or a strict refactor) is involved. Misleading type vs runtime mismatch.
+  Fix: Extend useNews return type to include `sentiment?: { score: number; summary: string; bullish: number; bearish: number; neutral: number; count: number }`. Update the Next.js api/trading/news/route.ts proxyBackend generic to include `sentiment` too.
+
+#15 — MEDIUM — `dashboard-view.tsx:272` passes `icon={Target}` to `StatTile` which doesn't accept an `icon` prop
+  File: src/components/trading/dashboard-view.tsx:272 (`<StatTile label="Risk/Reward" value="1 : 1.5" sub="configured" icon={Target} className="" />`),
+        src/components/trading/primitives.tsx:10-22 (StatTile accepts `label, value, sub, tone, className` — NO `icon`)
+  Verified via `tsc --noEmit`: error TS2322 "Property 'icon' does not exist".
+  Problem: The developer intended StatTile to show an icon next to the label, but the StatTile component doesn't support it. React silently ignores the unknown prop — no icon is rendered. (Same hardcoded tile also flagged in D1 #5 for the "1:1.5" string.)
+  Fix: Add `icon?: React.ComponentType<{ className?: string }>` to StatTile's props (and render it next to the label as SectionHeader does at primitives.tsx:175). OR remove `icon={Target}` if not needed.
+
+#16 — MEDIUM — `risk-view.tsx:286` passes `tone="warn"` to `Row` which doesn't accept `"warn"`
+  File: src/components/trading/risk-view.tsx:286 (`<Row k="Margin Call" v="50%" tone="warn" />`),
+        src/components/trading/risk-view.tsx:314-322 (`Row` accepts `tone?: boolean | "up" | "down"`)
+  Verified via `tsc --noEmit`: error TS2322 `Type '"warn"' is not assignable to type 'boolean | "up" | "down" | undefined'`.
+  Problem: The "FINEX Account Limits" card's Margin Call row should render in warning color (amber), but the Row component's tone prop only accepts `boolean | "up" | "down"`. The "warn" string is silently ignored at runtime — the row renders in default color. Inconsistent with BadgeTone/StatTile which do accept "warn".
+  Fix: Extend `Row`'s tone type to `"up" | "down" | "warn" | boolean` and add the warn class mapping.
+
+#17 — LOW — Unused imports in frontend (7 confirmed)
+  File: src/components/trading/backtest-view.tsx:28 — `BadgeTone` imported from "./primitives", never used.
+  File: src/components/trading/dashboard-view.tsx:6 — `Button` imported from "@/components/ui/button", never used.
+  File: src/components/trading/indicators-view.tsx:16 — `BadgeTone` imported from "./primitives", never used.
+  File: src/components/trading/news-view.tsx:8 — `ExternalLink` imported from "lucide-react", never used.
+  File: src/components/trading/risk-view.tsx:6 — `Button` imported from "@/components/ui/button", never used.
+  File: src/components/trading/trading-view.tsx:5 — `Input` imported from "@/components/ui/input", never used.
+  File: src/app/page.tsx:15 — `toast` imported from "sonner", never used (page.tsx has no `toast(...)` call).
+  Fix: Remove each unused import.
+
+#18 — LOW — `trading-view.tsx:27-28` redundant dual import of same lucide icon
+  File: src/components/trading/trading-view.tsx:27-28
+    Crosshair,
+    Crosshair as CrosshairIcon,
+  Problem: Both names refer to the same lucide-react icon. `Crosshair` is used at line 219, `CrosshairIcon` at line 103. They're identical. The dual-name import adds confusion (a reader might think they're different icons).
+  Fix: Use a single import `Crosshair` and update line 103 to reference `Crosshair` (or vice versa).
+
+#19 — LOW — `trading-view.tsx:88` ternary returns identical strings in both branches
+  File: src/components/trading/trading-view.tsx:88
+    title={`${p.category} · spread ${p.pip === 0.01 ? "0.5p+" : "0.5p+"}`}
+  Problem: Both branches of the ternary produce the string "0.5p+", making the conditional dead code. The intent was likely to show different spread hints based on `p.pip` (e.g. JPY pairs vs FX majors), but the implementation is broken.
+  Fix: Either remove the ternary (`title={\`${p.category} · spread 0.5p+\`}`), or differentiate the branches (e.g. `p.pip === 0.01 ? "0.5p+" : "5p+"` if metals have wider spreads).
+
+#20 — MEDIUM — `any` types in frontend mask real type contracts (10 instances)
+  File: src/components/trading/candle-chart.tsx:15 — `function CandleShape(props: any)` — recharts provides proper shape prop types.
+  File: src/components/trading/dashboard-view.tsx:73, 79 — `(t: any)` and `(a: number, t: any)` for trade items (should be `Trade` type — see #21).
+  File: src/components/trading/dashboard-view.tsx:314 — `analysis?: ReturnType<typeof Object>` — `ReturnType<typeof Object>` is `Object` = effectively `any`. Should be `AIAnalysisResult | undefined`.
+  File: src/components/trading/dashboard-view.tsx:316 — `tf as any` cast — Timeframe is a string union, should be cast properly.
+  File: src/components/trading/dashboard-view.tsx:321-323 — `(analysis as any)?.suggestedEntry/SL/TP` — three casts; the `analysis?: ReturnType<typeof Object>` (#20 above) is the root cause.
+  File: src/components/trading/dashboard-view.tsx:422 — `function AnalysisMini({ a }: { a: any })` — should be `AIAnalysisResult`.
+  File: src/components/trading/dashboard-view.tsx:430 — `(d: any)` in map callback — should be the dimension type.
+  File: src/components/trading/ai-engine-view.tsx:127, 133, 142 — `(store as any)[row.k]` and `(store as any)[row.fn](true)` — casts to access dynamic store keys. Should use typed store selectors.
+  File: src/app/page.tsx:79, 258 — `icon: any` for lucide icons — should be `LucideIcon` from "lucide-react".
+  File: src/components/query-provider.tsx:13 — `error: any` in retry fn — should be `unknown` or `Error`.
+  Fix: Replace with proper types. For dashboard-view analysis: `import { type AIAnalysisResult } from "@/lib/trading-data"` and use it. For page.tsx icons: `import type { LucideIcon } from "lucide-react"`.
+
+#21 — MEDIUM — `Trade` type missing; `useTrades()` returns `trades: any[]`
+  File: src/lib/trading-hooks.ts:140 (`return useQuery<{ trades: any[]; demo?: boolean }>`),
+        src/app/api/trading/trades/route.ts:8 (`proxyBackend<{ trades: any[] }>`),
+        src/app/api/trading/export/route.ts:8 (`proxyBackend<{ trades: any[]; csv: string }>`),
+        src/lib/trading-data.ts (no `Trade` interface — verified)
+  Problem: The backend's `trades` table schema (db.py:52-65) has: ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, comment, source. The frontend has no equivalent TypeScript interface — every consumer uses `any[]`. dashboard-view.tsx:73-79 uses `(t: any)` and accesses `t.close_time`, `t.pnl` with no type safety. If the backend renames `close_time` to `closeTime` (camelCase), the frontend breaks silently.
+  Fix: Add `interface Trade { ticket: number; symbol: string; side: "BUY"|"SELL"; volume: number; open_price: number; close_price: number | null; pnl: number | null; pips: number | null; open_time: string; close_time: string | null; comment: string | null; source: string; }` to trading-data.ts. Use it in useTrades + both api routes.
+
+#22 — MEDIUM — `seeded()` function duplicated 3× in frontend API routes
+  File: src/app/api/trading/analysis/route.ts:12-25,
+        src/app/api/trading/analysis/batch/route.ts:11-24,
+        src/app/api/trading/backtest/route.ts:12-25
+  Problem: All three files contain an IDENTICAL ~14-line `seeded(str: string)` FNV-1a + xorshift RNG function. ~42 lines of duplicated code. If one copy gets a bug fix, the others stay broken silently.
+  Fix: Extract to `src/lib/seeded.ts` exporting `export function seeded(str: string): () => number`. Import in all 3 routes.
+
+#23 — LOW — `analysis/batch/route.ts:28-33` duplicates the BASE_PRICES table already in trading-data.ts
+  File: src/app/api/trading/analysis/batch/route.ts:28-33 (inline `{ EURUSD: 1.0865, GBPUSD: 1.2710, ... }`),
+        src/lib/trading-data.ts:289-304 (`BASE_PRICES` — identical data)
+  Problem: The 14-symbol base price table is hardcoded twice. Updates must be made in two places — drift risk.
+  Fix: Import `basePriceFor` from "@/lib/trading-data" (as analysis/route.ts:46 already does) and delete the inline table.
+
+#24 — LOW — `ml/info/route.ts:7-15` inline type duplicates `MLModelInfo` from trading-hooks.ts
+  File: src/app/api/trading/ml/info/route.ts:7-15 (inline `{ exists, version, train_acc, test_acc, symbol, trained_at, n_samples }`),
+        src/lib/trading-hooks.ts:126-137 (`MLModelInfo` interface — superset including `drift`, `drift_threshold`, `demo`)
+  Problem: The route's response type is LESS rich than what the backend returns. The frontend's `useMLInfo()` hook uses `MLModelInfo` (with drift fields) — runtime works, but the route's TS type is wrong. If the backend changes a field name, only one of the two types is updated.
+  Fix: Import `type { MLModelInfo } from "@/lib/trading-hooks"` and use it in `proxyBackend<MLModelInfo>(...)`.
+
+#25 — LOW — Dead code: shadcn toast system mounted but never used (sonner is the actual toaster)
+  File: src/app/layout.tsx:4 (`import { Toaster } from "@/components/ui/toaster";` + line 55 `<Toaster />`),
+        src/components/ui/toaster.tsx (uses `useToast` from use-toast.ts),
+        src/hooks/use-toast.ts (entire file),
+        src/components/ui/toast.tsx (entire file)
+  Verified via grep: `useToast` is called only inside `ui/toaster.tsx` (line 14). Application code (8 files including page.tsx, settings-view.tsx, alerts-view.tsx, ai-engine-view.tsx, backtest-view.tsx, indicators-view.tsx, logs-view.tsx, risk-view.tsx, trading-view.tsx) all use `import { toast } from "sonner"` directly. The shadcn toast system is dead code that adds ~150 lines + 1 unnecessary mounted component to the layout.
+  Fix: Remove `<Toaster />` from layout.tsx:55, remove `import { Toaster }` from layout.tsx:4, delete `src/hooks/use-toast.ts`, `src/components/ui/toaster.tsx`, `src/components/ui/toast.tsx`. Keep only `SonnerToaster` (line 56).
+
+#26 — LOW — Boilerplate `src/app/api/route.ts` ("Hello, world!") never referenced
+  File: src/app/api/route.ts:1-5
+    import { NextResponse } from "next/server";
+    export async function GET() {
+      return NextResponse.json({ message: "Hello, world!" });
+    }
+  Problem: This is the default Next.js scaffolding API route. The application uses `/api/trading/*` exclusively. This `/api` route is never fetched by the dashboard.
+  Fix: Delete the file.
+
+==================================================================
+AREA 4: HARDCODED VALUES / MAGIC NUMBERS (6 findings)
+==================================================================
+
+#27 — MEDIUM — `risk-view.tsx:244, 248` hardcodes $10/pip and uses `10` for lot-size math (wrong for JPY/metals)
+  File: src/components/trading/risk-view.tsx:244 (`<Row k="Value per pip (1 lot)" v="$10 / pip" />`),
+        src/components/trading/risk-view.tsx:248 (`v={\`${(riskAmount / (s.stopLossPips * 10)).toFixed(2)} lot\`}`),
+        src/components/trading/trading-view.tsx:245 (`const autoLot = Math.max(0.01, +(riskAmount / (slPips * 10)).toFixed(2));`)
+  Problem: Both `risk-view` and `trading-view` compute `lotSize = riskAmount / (slPips * 10)`. The `10` is the value-per-pip-per-lot for standard FX (USD-quoted), but it's WRONG for: JPY pairs (~$9.13/pip/lot for USDJPY at 145), Gold ($10/pip/lot — OK by coincidence), Silver ($50/pip/lot). The backend's `mt5_service.get_pip_value_per_lot()` returns the correct broker-provided value, but the frontend doesn't fetch it. A trader using USDJPY sees a lot size 9.5% too large; using XAGUSD sees a lot size 5× too small.
+  Fix: Fetch `pip_value_per_lot` per symbol via a new `/api/trading/pip-value?symbol=X` endpoint (proxied to mt5_service). Pass to the lot-size calc. Display the real value in the "Value per pip" Row.
+
+#28 — LOW — `dashboard-view.tsx:65-66` falls back to hardcoded `10000` demo equity with no "DEMO" badge
+  File: src/components/trading/dashboard-view.tsx:65-66 (`?? 10000`)
+  Problem: When backend is unreachable, `accountEquity` and `accountBalance` silently fall back to `10000`. Combined with the always-green "Risk OK" badge (D1 #6), a trader in demo mode sees the same UI as a connected trader — $10k of fake capital displayed identically to real equity. Already partially flagged in D1 #2; here we flag the specific magic number `10000`.
+  Fix: Use a named constant `DEMO_EQUITY = 10000` in trading-data.ts and display a `Badge variant="warning">DEMO</Badge>` overlay on the Equity StatTile when `statusData?.demo` is true.
+
+#29 — LOW — `dashboard-view.tsx:41-49` `equityCurve()` uses hardcoded magic numbers
+  File: src/components/trading/dashboard-view.tsx:41-49
+    let v = 10000; const out: ... = [];
+    for (let i = 0; i < 48; i++) {
+      v += (Math.sin(i / 3) + (Math.random() - 0.45)) * 60;
+  Problem: 4 magic numbers: `10000` (initial equity), `48` (data points = 48h hourly), `3` (sine wave divisor), `0.45` (downward drift bias), `60` (per-tick volatility). The synthetic random-walk equity curve is already flagged in D1 #7; here we call out the magic numbers themselves. (Note: D1 audit #7 says `useMemo([])` never updates — but the function uses `Math.random()` which WOULD differ on each call. The `useMemo([])` deps array means the curve is computed once on mount and frozen — a more subtle bug than D1 stated.)
+  Fix: Replace with constants at top of file (`INITIAL_EQUITY = 10000`, `CURVE_HOURS = 48`, etc.). Once D1 #7 is fixed (real backend equity curve), these constants move to backend config.
+
+#30 — LOW — Hardcoded "Python 3.14" strings (Python 3.14 doesn't exist; Dockerfile uses 3.13)
+  File: src/app/page.tsx:239 (`Python 3.14 · MT5 · AI: Z.AI / Groq / Google / Local`),
+        src/components/trading/settings-view.tsx:226 (`<Row k="Runtime" v="Python 3.14 · Windows 11" />`),
+        python-backend/README.md:5 (`**Stack:** Python 3.14 · FastAPI · ...`),
+        python-backend/README.md:16 (`# 1. Create venv (Python 3.14)`),
+        python-backend/README.md:17 (`python -3.14 -m venv .venv`)
+  Problem: Python 3.14 was not yet released at audit time (latest stable is Python 3.13, released Oct 2024). The Dockerfile uses `python:3.13-slim` (python-backend/Dockerfile:5). Inconsistency between docs/UI claims and actual runtime.
+  Fix: Replace "Python 3.14" with "Python 3.13" in all 5 locations. Better: fetch the actual Python version dynamically (frontend reads `/api/trading/status` → add `python_version` field; README references "Python 3.x").
+
+#31 — LOW — `backtest.py` magic numbers — equity start, costs, thresholds
+  File: python-backend/backtest.py:23, 36-41, 63, 65, 96
+  Problem: Hardcoded: `equity = 10000.0` (line 23, initial capital), `spread_base = 0.5` (line 36), `spread_variable = 1.0` (line 37), `commission_per_lot_side = 1.0` (line 38), `slippage_pips = 0.5` (line 39), `vpp = 8.0`/`10.0` (line 41, value per pip — duplicates mt5_service.get_pip_value_per_lot logic), `0.5` (line 63, margin-call threshold), `* 2` (line 65, forced-liquidation penalty), `1.4` (line 96, fake Sharpe — see #10). These should come from settings or be named constants at the top of the file.
+  Fix: Move constants to a `BacktestConfig` dataclass or to `config.Settings`. For `vpp`, call `get_pip_value_per_lot(symbol)` from mt5_service (already exists).
+
+#32 — LOW — `ai_service.py:117, 138, 158, 137` hardcoded model names and AI params
+  File: python-backend/ai_service.py:117 (`"model": "glm-4.6"` for Z.AI),
+        python-backend/ai_service.py:133 (`model="llama-3.3-70b-versatile"` for Groq),
+        python-backend/ai_service.py:149 (`genai.GenerativeModel("gemini-1.5-pro", ...)` for Google),
+        python-backend/ai_service.py:159 (`model="llama3"` for Ollama),
+        python-backend/ai_service.py:137, 163 (`temperature=0.2`)
+  Problem: Each provider's model name and temperature are hardcoded inline. A user wanting to switch Z.AI from `glm-4.6` to `glm-4.5` must edit source code. The frontend's AI_PROVIDERS table (trading-data.ts:71-100) ALSO hardcodes the same model names — drift risk. (Frontend already shows the model name in the provider picker.)
+  Fix: Move model names to config.Settings as `zai_model: str = "glm-4.6"`, `groq_model: str = "llama-3.3-70b-versatile"`, etc. Read in each `_call_*` function. Optionally expose via `/api/trading/status` so frontend can sync.
+
+==================================================================
+AREA 5: DEPENDENCY HYGIENE (3 findings)
+==================================================================
+
+#33 — HIGH — `package.json` ships 15+ never-imported dependencies (bundle bloat + security surface)
+  File: package.json (lines 16-81)
+  Verified via grep across all src/**/*.{ts,tsx}: zero imports for:
+    - `next-auth` (^4.24.11) — auth library, never used
+    - `next-intl` (^4.3.4) — i18n, never used
+    - `@dnd-kit/core`, `@dnd-kit/sortable`, `@dnd-kit/utilities` — drag-and-drop, never used (3 deps)
+    - `@mdxeditor/editor` (^3.39.1) — large MDX editor, never used
+    - `@reactuses/core` (^6.0.5) — hooks collection, never used
+    - `framer-motion` (^12.23.2) — animation library, never used
+    - `react-syntax-highlighter` (^15.6.1) — large dep, never used
+    - `uuid` (^11.1.0) — UUID generation, never used (project uses `Date.now()` for IDs)
+    - `z-ai-web-dev-sdk` (^0.0.18) — AI SDK, never used (project uses httpx to call Z.AI HTTP API directly)
+    - `react-markdown` (^10.1.0) — markdown rendering, never used
+    - `@hookform/resolvers` (^5.1.1) — Zod resolver for react-hook-form, never used (paired with react-hook-form which is only used in unused ui/form.tsx)
+    - `@tanstack/react-table` (^8.21.3) — table lib, never used (project uses native `<table>`)
+    - `date-fns` (^4.1.0) — date utils, never used (project uses native `Date` + `toLocaleString`)
+  Problem: These dependencies are installed (bloated node_modules), transitive deps are pulled in, security advisories fire for code that's never executed, bundle size increases for any that aren't tree-shakeable, `bun install` is slower. `framer-motion` and `react-syntax-highlighter` are particularly heavy.
+  Fix: `bun remove next-auth next-intl @dnd-kit/core @dnd-kit/sortable @dnd-kit/utilities @mdxeditor/editor @reactuses/core framer-motion react-syntax-highlighter uuid z-ai-web-dev-sdk react-markdown @hookform/resolvers @tanstack/react-table date-fns`
+
+#34 — MEDIUM — `package.json` ships 7 shadcn-only deps whose only consumer is an unused UI primitive
+  File: package.json + src/components/ui/*
+  Verified: each of these deps is imported by exactly ONE file in src/components/ui/, and that ui/* component itself has ZERO app-level imports (verified via grep `@/components/ui/<name>"` excluding ui/ directory):
+    - `react-hook-form` → only in `ui/form.tsx` (0 app imports)
+    - `input-otp` → only in `ui/input-otp.tsx` (0 app imports)
+    - `react-day-picker` → only in `ui/calendar.tsx` (0 app imports)
+    - `embla-carousel-react` → only in `ui/carousel.tsx` (0 app imports)
+    - `react-resizable-panels` → only in `ui/resizable.tsx` (0 app imports)
+    - `cmdk` → only in `ui/command.tsx` (0 app imports)
+    - `vaul` → only in `ui/drawer.tsx` (0 app imports)
+  Also unused shadcn primitives (zero app imports): accordion, aspect-ratio, avatar, breadcrumb, calendar, carousel, checkbox, collapsible, command, context-menu, dialog, drawer, form, hover-card, input-otp, menubar, navigation-menu, pagination, popover, progress, resizable, scroll-area, sheet, sidebar, skeleton, table, tabs, toggle, toggle-group, tooltip (29 unused components).
+  Problem: The shadcn CLI was used to generate ALL components, but only ~10 are used. Each unused primitive pulls in a Radix dep and adds ~50-200 LOC of dead code. Compounds with #33.
+  Fix: Delete the 29 unused ui/* components and remove their 7 unique deps. Keep only: alert-dialog, badge, button, card, dropdown-menu, input, label, select, separator, slider, sonner, switch (12 components used by app code).
+
+#35 — LOW — `tsconfig.json:3 target: "ES2017"` — could target ES2020+
+  File: tsconfig.json:3
+  Problem: ES2017 target forces transpilation of features available natively in Node 16+ and modern browsers (Node 18+, all evergreen browsers): optional chaining (ES2020), nullish coalescing (ES2020), `Promise.allSettled` (ES2020), `BigInt` (ES2020), logical assignment operators (ES2021). Transpiling these adds bundle size for no benefit. Next.js 16 / Node 22 baseline supports ES2022+.
+  Fix: Set `"target": "ES2022"` (or `"ESNext"`). Verify build still passes.
+
+==================================================================
+AREA 6: .ENV / GITIGNORE VERIFICATION (1 finding — already correct)
+==================================================================
+
+#36 — VERIFIED OK — No secrets committed; .gitignore properly excludes .env files
+  File: .gitignore (lines 31-34: `# env files (can opt-in for committing if needed)`, `.env*`, `!.env.example`, `!python-backend/config.example.env`),
+        .env (only `DATABASE_URL=file:/home/z/my-project/db/custom.db` — no secrets),
+        .env.example (template only — `ZENITRADE_API_TOKEN=` empty, etc.),
+        python-backend/config.example.env (template only — `MT5_PASSWORD=your_password`, etc.)
+  Problem: None. Verified: `.env` contains only a non-secret DATABASE_URL pointing to a local SQLite file. `.gitignore` excludes `.env*` and only allows `.env.example` + `python-backend/config.example.env` templates through. No API keys, MT5 passwords, or SMTP credentials are committed.
+  Fix: None needed. (Worth noting that `src/lib/trading-store.ts:265` persists API keys to localStorage client-side via Zustand `partialize` — but that's a client-side concern, not a git/env concern. If desired to harden: remove `keys: s.keys` from the partialize object so keys are session-only.)
+
+==================================================================
+SUMMARY
+==================================================================
+36 findings total: 4 CRITICAL/HIGH (build config + duplicate setAutoIndicators + auto_trade_symbols str-iter bug), 14 MEDIUM (type errors, hardcoded values, missing types, duplicated code, dead deps), 18 LOW (unused imports, dead code, magic numbers, minor config).
+
+Top systemic issues NOT covered by T1/D1 audits:
+  (1) **Production build silently ignores TypeScript errors** (#1 + #2) — `ignoreBuildErrors: true` + every ESLint rule disabled. The 9 real TS errors found by `tsc --noEmit` ship to production anyway. This is the root enabler of every `any`/missing-type issue in the codebase.
+  (2) **Duplicate `setAutoIndicators` in trading-store** (#3) — the "Auto" toggle for Indicators silently fails to set the `autoIndicators` flag. Indicators view UI shows "AI" selected but `store.autoIndicators` stays false. AI Engine view's auto-config table always shows "Manual" for Indicators row.
+  (3) **`auto_trade_symbols` is a string iterated char-by-char** (#6) — even when auto-trade is enabled and configured, the loop never executes a real symbol — every iteration fails on `"E"`, `"U"`, `"R"`, ... silently caught by `except: pass`.
+  (4) **API keys persisted to localStorage** (#36 note) — Zustand `partialize` (trading-store.ts:265) saves `keys: s.keys` to `localStorage["zenitrade-store"]` as plaintext. Anyone with browser access can read all 5 API keys.
+  (5) **15+ never-imported npm dependencies** (#33) — `framer-motion`, `react-syntax-highlighter`, `@mdxeditor/editor`, `next-auth`, `next-intl`, `@dnd-kit/*`, `uuid`, `z-ai-web-dev-sdk`, `react-markdown`, `date-fns`, `@tanstack/react-table`, `@hookform/resolvers` — bundle bloat + security surface for code that's never executed.
+  (6) **`backtest.py:96` returns hardcoded `sharpe: 1.4`** (#10) — fake metric shown to traders as if computed.
+  (7) **Frontend lot-size math hardcodes `* 10` value-per-pip** (#27) — wrong for JPY pairs (~9% off) and XAGUSD (5× off). Backend already has `get_pip_value_per_lot()` — frontend doesn't use it.
+
+Findings handed off for implementation. No code changes made.

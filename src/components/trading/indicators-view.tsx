@@ -27,7 +27,7 @@ export function IndicatorsView() {
   const toggleIndicator = useTradingStore((s) => s.toggleIndicator);
   const auto = useTradingStore((s) => s.autoIndicators);
   const setAuto = useTradingStore((s) => s.setAutoIndicators);
-  const setAutoIndicators = useTradingStore((s) => s.setAutoIndicators);
+  const autoSelectIndicators = useTradingStore((s) => s.autoSelectIndicators);
   const setIndicators = useTradingStore((s) => s.setIndicators);
   const [q, setQ] = React.useState("");
 
@@ -54,7 +54,7 @@ export function IndicatorsView() {
               auto={auto}
               onAuto={() => {
                 setAuto(true);
-                setAutoIndicators();
+                autoSelectIndicators();
                 toast.success("AI selected optimal indicator set");
               }}
               onManual={() => setAuto(false)}
@@ -93,7 +93,7 @@ export function IndicatorsView() {
             className="h-8 text-xs"
             onClick={() => {
               setAuto(true);
-              setAutoIndicators();
+              autoSelectIndicators();
               toast.success("AI selected: EMA, RSI, MACD, ATR, BBands, VWAP, OBV, Supertrend");
             }}
           >

@@ -80,7 +80,7 @@ interface TradingState {
   indicators: string[];
   setIndicators: (s: string[]) => void;
   toggleIndicator: (id: string) => void;
-  setAutoIndicators: () => void;
+  autoSelectIndicators: () => void;
 
   // money management
   riskPerTrade: number;
@@ -121,7 +121,7 @@ interface TradingState {
 
 export const useTradingStore = create<TradingState>()(
   persist(
-    (set, get) => ({
+    (set) => ({
   mt5Connected: false,
   demoMode: true,
   accountEquity: 10000,
@@ -205,7 +205,7 @@ export const useTradingStore = create<TradingState>()(
           : [...s.indicators, id],
       };
     }),
-  setAutoIndicators: () =>
+  autoSelectIndicators: () =>
     set({
       indicators: TECHNICAL_INDICATORS.slice(0, 8).map((i) => i.id),
     }),

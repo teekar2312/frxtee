@@ -1,12 +1,31 @@
 """Backtesting engine — replay historical candles through a signal strategy."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from config import settings
 from indicators import ema, rsi, macd
 from mt5_service import candles, _pip_for_digits
 from risk_manager import size_position
+
+
+def _compute_sharpe(equity_curve: list[dict], periods_per_year: int = 252) -> float:
+    """Compute Sharpe ratio from equity curve.
+    Returns 0.0 if insufficient data."""
+    if len(equity_curve) < 3:
+        return 0.0
+    equities = [e["equity"] for e in equity_curve]
+    returns = np.diff(equities) / equities[:-1]
+    if len(returns) < 2:
+        return 0.0
+    mean_ret = float(np.mean(returns))
+    std_ret = float(np.std(returns))
+    if std_ret == 0:
+        return 0.0
+    # annualized Sharpe (assumes ~252 trading periods/year)
+    sharpe = (mean_ret / std_ret) * np.sqrt(periods_per_year)
+    return round(float(sharpe), 2)
 
 
 def run(symbol: str = "EURUSD", tf: str = "H1", trades: int = 120) -> dict:
@@ -93,7 +112,7 @@ def run(symbol: str = "EURUSD", tf: str = "H1", trades: int = 120) -> dict:
             "netProfit": round(equity - 10000, 2),
             "totalTrades": total, "winRate": round(win_rate, 1),
             "profitFactor": round(pf, 2), "maxDrawdown": round(max_dd * 100, 1),
-            "sharpe": 1.4, "avgWin": round(gross_win / wins, 2) if wins else 0,
+            "sharpe": _compute_sharpe(curve), "avgWin": round(gross_win / wins, 2) if wins else 0,
             "avgLoss": round(gross_loss / losses, 2) if losses else 0,
             "expectancy": round((win_rate / 100 * (gross_win / max(wins, 1))) -
                                 (1 - win_rate / 100) * (gross_loss / max(losses, 1)), 2),

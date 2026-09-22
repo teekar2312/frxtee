@@ -342,7 +342,9 @@ async def _auto_trade_loop():
                 await asyncio.sleep(30)
                 continue
 
-            symbols = getattr(settings, "auto_trade_symbols", [])
+            # auto_trade_symbols is comma-separated string — split into list
+            symbols_str = getattr(settings, "auto_trade_symbols", "")
+            symbols = [s.strip() for s in symbols_str.split(",") if s.strip()] if symbols_str else []
             if not symbols:
                 await asyncio.sleep(30)
                 continue
