@@ -957,6 +957,73 @@ async def api_ml_info():
     return ml_model.model_info()
 
 
+@app.get("/api/trading/ai/config")
+async def api_ai_config():
+    """Return current AI provider config (models + confidence thresholds).
+    Frontend reads this to sync its UI with backend state."""
+    return {
+        "models": {
+            "zai": settings.zai_model,
+            "groq": settings.groq_model,
+            "google": settings.google_model,
+            "local": settings.ollama_model,
+        },
+        "ai_min_confidence": settings.ai_min_confidence,
+        "auto_trade_min_confidence": settings.auto_trade_min_confidence,
+        "active_provider": getattr(settings, "ai_provider", "zai"),
+        "api_keys_set": {
+            "zai": bool(settings.zai_api_key),
+            "groq": bool(settings.groq_api_key),
+            "google": bool(settings.google_api_key),
+            "local": True,  # ollama doesn't need key
+        },
+    }
+
+
+@app.post("/api/trading/ai/config")
+@limiter.limit("5/minute")
+async def api_ai_config_update(request: Request, body: dict = None,
+                               _auth=Depends(require_token)):
+    """Update AI model config at runtime (no restart needed).
+
+    Frontend sends {models: {zai: "glm-4.6", ...}, ai_min_confidence: 65, ...}
+    and backend applies immediately to settings singleton.
+    """
+    body = body or {}
+    updated = []
+    if "models" in body:
+        models = body["models"]
+        if "zai" in models:
+            settings.zai_model = models["zai"]; updated.append(f"zai={models['zai']}")
+        if "groq" in models:
+            settings.groq_model = models["groq"]; updated.append(f"groq={models['groq']}")
+        if "google" in models:
+            settings.google_model = models["google"]; updated.append(f"google={models['google']}")
+        if "local" in models:
+            settings.ollama_model = models["local"]; updated.append(f"ollama={models['local']}")
+    if "ai_min_confidence" in body:
+        settings.ai_min_confidence = int(body["ai_min_confidence"])
+        updated.append(f"ai_min_confidence={settings.ai_min_confidence}")
+    if "auto_trade_min_confidence" in body:
+        settings.auto_trade_min_confidence = int(body["auto_trade_min_confidence"])
+        updated.append(f"auto_trade_min_confidence={settings.auto_trade_min_confidence}")
+    if "active_provider" in body:
+        settings.ai_provider = body["active_provider"]
+        updated.append(f"provider={body['active_provider']}")
+
+    log.info("AI config updated: %s", ", ".join(updated))
+    return {"ok": True, "updated": updated, "config": {
+        "models": {
+            "zai": settings.zai_model,
+            "groq": settings.groq_model,
+            "google": settings.google_model,
+            "local": settings.ollama_model,
+        },
+        "ai_min_confidence": settings.ai_min_confidence,
+        "auto_trade_min_confidence": settings.auto_trade_min_confidence,
+    }}
+
+
 @app.get("/api/trading/backtest")
 async def api_backtest(symbol: str = "EURUSD", trades: int = 120):
     trades = max(10, min(trades, 500))

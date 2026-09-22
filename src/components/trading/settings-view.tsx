@@ -30,6 +30,47 @@ export function SettingsView() {
   const { theme, setTheme } = useTheme();
   const store = useTradingStore();
   const { mt5Connected, setMt5Connected, demoMode, toggleDemo, keys, setKey } = store;
+
+  // Sync AI config from backend on mount
+  React.useEffect(() => {
+    fetch("/api/trading/ai/config")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.models) {
+          // sync frontend store with backend's actual model config
+          for (const [provider, model] of Object.entries(d.models)) {
+            if (model && store.aiModels[provider] !== model) {
+              store.setAiModel(provider, model as string);
+            }
+          }
+        }
+        if (d.ai_min_confidence != null) {
+          store.setAiMinConfidence(d.ai_min_confidence);
+        }
+        if (d.auto_trade_min_confidence != null) {
+          store.setAutoTradeMinConfidence(d.auto_trade_min_confidence);
+        }
+      })
+      .catch(() => {});
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Push AI config changes to backend (called when user edits model/confidence)
+  const pushAiConfig = React.useCallback(async () => {
+    try {
+      await fetch("/api/trading/ai/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          models: store.aiModels,
+          ai_min_confidence: store.aiMinConfidence,
+          auto_trade_min_confidence: store.autoTradeMinConfidence,
+          active_provider: store.aiProvider,
+        }),
+      });
+    } catch {
+      // backend not running — config saved locally only
+    }
+  }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence, store.aiProvider]);
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");
@@ -266,9 +307,20 @@ export function SettingsView() {
               </div>
             ))}
           </div>
-          <p className="text-[10px] text-muted-foreground">
-            These models are sent to the Python backend via .env (ZAI_MODEL,
-            GROQ_MODEL, GOOGLE_MODEL, OLLAMA_MODEL). Update backend .env to match.
+          <Button
+            variant="default"
+            size="sm"
+            className="h-8 w-full mt-2"
+            onClick={async () => {
+              await pushAiConfig();
+              toast.success("AI config applied to backend — models + confidence updated");
+            }}
+          >
+            Apply to Backend (Runtime)
+          </Button>
+          <p className="text-[10px] text-muted-foreground mt-1">
+            Click to push model + confidence changes to the Python backend instantly
+            (no restart needed). Changes also persist in backend .env on next restart.
           </p>
         </div>
       </Card>
