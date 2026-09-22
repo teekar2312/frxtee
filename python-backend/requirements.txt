@@ -9,26 +9,23 @@ httpx==0.27.2
 # MetaTrader 5 (Windows only)
 MetaTrader5>=5.0.5488
 
-# Data / ML
-pandas==2.2.3
-numpy==2.1.1
-scikit-learn==1.5.2
-xgboost==2.1.1
-ta==0.11.0
-joblib==1.4.2
+# Data / ML — use >= to allow prebuilt wheels (avoids Meson/VS build)
+pandas>=2.2.3
+numpy>=2.1.1
+scikit-learn>=1.5.2
+xgboost>=2.1.1
+ta>=0.11.0
+joblib>=1.4.2
 
 # AI providers
-openai==1.51.0          # Groq + Google AI use OpenAI-compatible clients
-google-generativeai==0.8.3
-ollama==0.3.3
-
-# News
-websockets==13.0.1      # Finnhub websocket stream
+openai>=1.51.0
+google-generativeai>=0.8.3
+ollama>=0.3.3
 
 # Notifications
-aiosmtplib==3.0.2       # async email
+aiosmtplib>=3.0.2
 
 # Utils
-APScheduler==3.10.4     # scheduled retrain / news polling
-slowapi==0.1.9          # rate limiting (order/email/ml-train endpoints)
-sentry-sdk==2.14.0      # error monitoring (optional via SENTRY_DSN)
+APScheduler>=3.10.4
+slowapi>=0.1.9
+sentry-sdk>=2.14.0
