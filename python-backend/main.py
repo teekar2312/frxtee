@@ -970,12 +970,14 @@ async def api_ai_config():
         },
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
+        "auto_trade_mode": settings.auto_trade_mode,
+        "auto_trade_symbols": settings.auto_trade_symbols,
         "active_provider": getattr(settings, "ai_provider", "zai"),
         "api_keys_set": {
             "zai": bool(settings.zai_api_key),
             "groq": bool(settings.groq_api_key),
             "google": bool(settings.google_api_key),
-            "local": True,  # ollama doesn't need key
+            "local": True,
         },
     }
 
@@ -1010,6 +1012,13 @@ async def api_ai_config_update(request: Request, body: dict = None,
     if "active_provider" in body:
         settings.ai_provider = body["active_provider"]
         updated.append(f"provider={body['active_provider']}")
+    if "auto_trade_mode" in body:
+        settings.auto_trade_mode = bool(body["auto_trade_mode"])
+        updated.append(f"auto_trade_mode={settings.auto_trade_mode}")
+        log.info("🤖 auto-trade %s", "ENABLED" if settings.auto_trade_mode else "DISABLED")
+    if "auto_trade_symbols" in body:
+        settings.auto_trade_symbols = body["auto_trade_symbols"]
+        updated.append(f"auto_trade_symbols={settings.auto_trade_symbols}")
 
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {

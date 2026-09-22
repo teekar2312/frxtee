@@ -130,7 +130,26 @@ export function AIEngineView() {
                 <span className="text-sm">{row.label}</span>
                 <div className="inline-flex rounded-md border bg-muted/50 p-0.5 text-[11px]">
                   <button
-                    onClick={() => (store as any)[row.fn](true)}
+                    onClick={() => {
+                      (store as any)[row.fn](true);
+                      // If toggling auto-trade, push to backend
+                      if (row.k === "autoTradeMode") {
+                        fetch("/api/trading/ai/config", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            auto_trade_mode: true,
+                            auto_trade_symbols: store.symbols.join(","),
+                            auto_trade_min_confidence: store.autoTradeMinConfidence,
+                            active_provider: store.aiProvider,
+                          }),
+                        }).then(() => {
+                          toast.success("🤖 Auto-trade ENABLED on backend");
+                        }).catch(() => {
+                          toast.error("Failed to enable auto-trade on backend");
+                        });
+                      }
+                    }}
                     className={cn(
                       "px-2 py-0.5 rounded",
                       auto ? "bg-primary text-primary-foreground" : "text-muted-foreground"
@@ -139,7 +158,17 @@ export function AIEngineView() {
                     AI
                   </button>
                   <button
-                    onClick={() => (store as any)[row.fn](false)}
+                    onClick={() => {
+                      (store as any)[row.fn](false);
+                      if (row.k === "autoTradeMode") {
+                        fetch("/api/trading/ai/config", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ auto_trade_mode: false }),
+                        });
+                        toast.info("Auto-trade disabled on backend");
+                      }
+                    }}
                     className={cn(
                       "px-2 py-0.5 rounded",
                       !auto ? "bg-primary text-primary-foreground" : "text-muted-foreground"

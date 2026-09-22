@@ -169,10 +169,29 @@ export function TradingView() {
             auto={store.autoTradeMode}
             onAuto={() => {
               store.setAutoTradeMode(true);
-              toast.success("Auto-trading enabled — AI will execute signals");
+              // Push to backend so _auto_trade_loop activates
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  auto_trade_mode: true,
+                  auto_trade_symbols: store.symbols.join(","),
+                  auto_trade_min_confidence: store.autoTradeMinConfidence,
+                  active_provider: store.aiProvider,
+                }),
+              }).then(() => {
+                toast.success("🤖 Auto-trading ENABLED — backend will execute AI signals automatically");
+              }).catch(() => {
+                toast.error("Failed to enable auto-trade on backend — check connection");
+              });
             }}
             onManual={() => {
               store.setAutoTradeMode(false);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ auto_trade_mode: false }),
+              });
               toast.info("Manual mode — you confirm each order");
             }}
           />

@@ -37,7 +37,6 @@ export function SettingsView() {
       .then((r) => r.json())
       .then((d) => {
         if (d.models) {
-          // sync frontend store with backend's actual model config
           for (const [provider, model] of Object.entries(d.models)) {
             if (model && store.aiModels[provider] !== model) {
               store.setAiModel(provider, model as string);
@@ -49,6 +48,10 @@ export function SettingsView() {
         }
         if (d.auto_trade_min_confidence != null) {
           store.setAutoTradeMinConfidence(d.auto_trade_min_confidence);
+        }
+        // sync auto-trade mode from backend
+        if (d.auto_trade_mode != null) {
+          store.setAutoTradeMode(d.auto_trade_mode);
         }
       })
       .catch(() => {});
@@ -65,12 +68,15 @@ export function SettingsView() {
           ai_min_confidence: store.aiMinConfidence,
           auto_trade_min_confidence: store.autoTradeMinConfidence,
           active_provider: store.aiProvider,
+          auto_trade_mode: store.autoTradeMode,
+          auto_trade_symbols: store.symbols.join(","),
         }),
       });
     } catch {
       // backend not running — config saved locally only
     }
-  }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence, store.aiProvider]);
+  }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence,
+      store.aiProvider, store.autoTradeMode, store.symbols]);
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");
