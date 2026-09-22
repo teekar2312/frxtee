@@ -429,9 +429,9 @@ export function AIEngineView() {
                 onClick={async () => {
                   if (!a) return;
                   // confidence threshold — refuse low-confidence signals
-                  if (a.confidence < 60) {
+                  if (a.confidence < store.aiMinConfidence) {
                     toast.error(
-                      `Confidence too low (${a.confidence}% < 60%) — signal rejected`
+                      `Confidence too low (${a.confidence}% < ${store.aiMinConfidence}%) — signal rejected`
                     );
                     return;
                   }

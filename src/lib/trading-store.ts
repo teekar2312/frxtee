@@ -61,6 +61,13 @@ interface TradingState {
   // AI
   aiProvider: AIProviderId;
   setAiProvider: (p: AIProviderId) => void;
+  aiMinConfidence: number;
+  setAiMinConfidence: (v: number) => void;
+  autoTradeMinConfidence: number;
+  setAutoTradeMinConfidence: (v: number) => void;
+  // configurable models per provider
+  aiModels: Record<string, string>;
+  setAiModel: (provider: string, model: string) => void;
   autoTradeMode: boolean;
   setAutoTradeMode: (v: boolean) => void;
   autoIndicators: boolean;
@@ -179,6 +186,18 @@ export const useTradingStore = create<TradingState>()(
 
   aiProvider: "zai",
   setAiProvider: (p) => set({ aiProvider: p }),
+  aiMinConfidence: 60,
+  setAiMinConfidence: (v) => set({ aiMinConfidence: v }),
+  autoTradeMinConfidence: 75,
+  setAutoTradeMinConfidence: (v) => set({ autoTradeMinConfidence: v }),
+  aiModels: {
+    zai: "glm-4.6",
+    groq: "llama-3.3-70b-versatile",
+    google: "gemini-1.5-pro",
+    local: "llama3",
+  },
+  setAiModel: (provider, model) =>
+    set((s) => ({ aiModels: { ...s.aiModels, [provider]: model } })),
   autoTradeMode: false,
   setAutoTradeMode: (v) => set({ autoTradeMode: v }),
   autoIndicators: false,
@@ -246,6 +265,9 @@ export const useTradingStore = create<TradingState>()(
         sessions: s.sessions,
         indicators: s.indicators,
         aiProvider: s.aiProvider,
+        aiMinConfidence: s.aiMinConfidence,
+        autoTradeMinConfidence: s.autoTradeMinConfidence,
+        aiModels: s.aiModels,
         autoTradeMode: s.autoTradeMode,
         autoIndicators: s.autoIndicators,
         autoTrailing: s.autoTrailing,

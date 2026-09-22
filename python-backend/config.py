@@ -18,11 +18,22 @@ class Settings(BaseSettings):
     finnhub_api_key: str = ""
     marketaux_api_key: str = ""
 
-    # AI
+    # AI providers — API keys
     zai_api_key: str = ""
     groq_api_key: str = ""
     google_api_key: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
+
+    # AI provider models (configurable per provider)
+    zai_model: str = "glm-4.6"
+    groq_model: str = "llama-3.3-70b-versatile"
+    google_model: str = "gemini-1.5-pro"
+    ollama_model: str = "llama3"
+
+    # AI confidence threshold (0-100) — signals below this are rejected
+    ai_min_confidence: int = 60
+    # Auto-trade confidence threshold (higher for auto-execution)
+    auto_trade_min_confidence: int = 75
 
     # Money mgmt
     risk_per_trade_pct: float = 1.0

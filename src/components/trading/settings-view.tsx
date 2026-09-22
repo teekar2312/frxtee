@@ -6,10 +6,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Slider } from "@/components/ui/slider";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
   CheckCircle2,
+  Cpu,
   KeyRound,
   Link2,
   Moon,
@@ -26,8 +28,8 @@ import { BadgeTone, SectionHeader, StatTile, SwitchRow } from "./primitives";
 
 export function SettingsView() {
   const { theme, setTheme } = useTheme();
-  const { mt5Connected, setMt5Connected, demoMode, toggleDemo, keys, setKey } =
-    useTradingStore();
+  const store = useTradingStore();
+  const { mt5Connected, setMt5Connected, demoMode, toggleDemo, keys, setKey } = store;
   const [login, setLogin] = React.useState("5012****");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");
@@ -171,6 +173,82 @@ export function SettingsView() {
           </div>
         </Card>
       </div>
+
+      {/* AI Configuration */}
+      <Card className="p-3">
+        <SectionHeader
+          title="AI Configuration"
+          desc="Confidence thresholds + model per provider"
+          icon={Cpu}
+        />
+        <div className="space-y-3">
+          {/* Confidence sliders */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <Label className="text-[11px] text-muted-foreground">
+                Manual Execute — Min Confidence
+              </Label>
+              <span className="text-xs font-semibold tnum">
+                {store.aiMinConfidence}%
+              </span>
+            </div>
+            <Slider
+              value={[store.aiMinConfidence]}
+              min={0} max={100} step={5}
+              onValueChange={(v) => store.setAiMinConfidence(v[0])}
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Signals below this confidence are rejected when clicking Execute
+            </p>
+          </div>
+          <Separator />
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <Label className="text-[11px] text-muted-foreground">
+                Auto-Trade — Min Confidence
+              </Label>
+              <span className="text-xs font-semibold tnum">
+                {store.autoTradeMinConfidence}%
+              </span>
+            </div>
+            <Slider
+              value={[store.autoTradeMinConfidence]}
+              min={50} max={100} step={5}
+              onValueChange={(v) => store.setAutoTradeMinConfidence(v[0])}
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Auto-trade engine only executes signals at or above this confidence
+            </p>
+          </div>
+          <Separator />
+          {/* Model per provider */}
+          <div className="text-[11px] text-muted-foreground font-medium">
+            Model per Provider (configurable)
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              { id: "zai", label: "Z.AI" },
+              { id: "groq", label: "Groq" },
+              { id: "google", label: "Google AI" },
+              { id: "local", label: "Local (Ollama)" },
+            ] as const).map((p) => (
+              <div key={p.id}>
+                <Label className="text-[10px] text-muted-foreground">{p.label} Model</Label>
+                <Input
+                  value={store.aiModels[p.id] ?? ""}
+                  onChange={(e) => store.setAiModel(p.id, e.target.value)}
+                  className="h-8 text-xs font-mono"
+                  placeholder={`e.g. ${p.id === "zai" ? "glm-4.6" : p.id === "groq" ? "llama-3.3-70b" : p.id === "google" ? "gemini-1.5-pro" : "llama3"}`}
+                />
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            These models are sent to the Python backend via .env (ZAI_MODEL,
+            GROQ_MODEL, GOOGLE_MODEL, OLLAMA_MODEL). Update backend .env to match.
+          </p>
+        </div>
+      </Card>
 
       {/* API keys */}
       <Card className="p-3">

@@ -113,7 +113,7 @@ def _call_zai(symbol: str, user_msg: str) -> dict:
     r = httpx.post(
         f"{base}/chat/completions",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": "glm-4.6", "messages": [
+        json={"model": settings.zai_model, "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]},
@@ -130,7 +130,7 @@ def _call_groq(symbol: str, user_msg: str) -> dict:
     from openai import OpenAI
     client = OpenAI(api_key=settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=settings.groq_model,
         messages=[{"role": "system", "content": SYSTEM_PROMPT},
                   {"role": "user", "content": user_msg}],
         response_format={"type": "json_object"},
@@ -146,7 +146,7 @@ def _call_google(symbol: str, user_msg: str) -> dict:
         return _heuristic(symbol)
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro", system_instruction=SYSTEM_PROMPT)
+    model = genai.GenerativeModel(settings.google_model, system_instruction=SYSTEM_PROMPT)
     resp = model.generate_content(user_msg + "\nReturn JSON only.")
     return _parse(resp.text, symbol)
 
@@ -156,7 +156,7 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
     import ollama
     client = ollama.Client(host=settings.ollama_url)
     resp = client.chat(
-        model="llama3",
+        model=settings.ollama_model,
         messages=[{"role": "system", "content": SYSTEM_PROMPT},
                   {"role": "user", "content": user_msg}],
         format="json",
