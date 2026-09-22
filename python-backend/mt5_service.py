@@ -417,6 +417,26 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
     if not success:
         return {"ok": False, "error": _retcode_msg(r.retcode), "retcode": r.retcode}
     filled = getattr(r, "volume_order", volume) or volume
+
+    # verify SL/TP were actually set — log for debugging
+    log.info("order filled: ticket=%s price=%s vol=%s sl=%s tp=%s retcode=%s",
+             r.order, r.price, filled, round(sl, info.digits), round(tp, info.digits), r.retcode)
+
+    # CRITICAL: sometimes MT5 accepts the order but ignores SL/TP if
+    # stops_level is too close. Check the actual position's SL/TP.
+    import time as _time
+    _time.sleep(0.3)  # small delay for position to register
+    pos_check = mt5.positions_get(ticket=r.order)  # type: ignore
+    if pos_check:
+        p = pos_check[0]
+        if p.sl == 0 or p.tp == 0:
+            log.warning("⚠ SL/TP not set on position! broker sl=%s tp=%s — re-applying",
+                        p.sl, p.tp)
+            # try to set SL/TP via modify
+            modify_sl_tp(r.order, round(sl, info.digits), round(tp, info.digits))
+        else:
+            log.info("position verified: ticket=%s sl=%s tp=%s OK",
+                     r.order, p.sl, p.tp)
     return {
         "ok": True, "ticket": r.order, "price": r.price,
         "volume": filled, "requested_volume": volume,
