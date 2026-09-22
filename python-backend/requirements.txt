@@ -1,15 +1,15 @@
-# Core
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.9.2
-pydantic-settings==2.5.2
-python-dotenv==1.0.1
-httpx==0.27.2
+# Core — use >= to get prebuilt wheels for Python 3.14
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+pydantic>=2.10.0
+pydantic-settings>=2.5.2
+python-dotenv>=1.0.1
+httpx>=0.27.2
 
 # MetaTrader 5 (Windows only)
 MetaTrader5>=5.0.5488
 
-# Data / ML — use >= to allow prebuilt wheels (avoids Meson/VS build)
+# Data / ML — use >= to allow prebuilt wheels
 pandas>=2.2.3
 numpy>=2.1.1
 scikit-learn>=1.5.2
