@@ -70,7 +70,21 @@ export function AIEngineView() {
                 key={p.id}
                 onClick={() => {
                   store.setAiProvider(p.id);
-                  toast.success(`Switched to ${p.name}`);
+                  // Push provider change to backend immediately
+                  fetch("/api/trading/ai/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      active_provider: p.id,
+                      models: store.aiModels,
+                    }),
+                  }).then(() => {
+                    toast.success(`Switched to ${p.name} — backend updated`);
+                  }).catch(() => {
+                    toast.success(`Switched to ${p.name} (local only — backend not connected)`);
+                  });
+                  // Force refetch analysis with new provider
+                  refetch();
                 }}
                 className={cn(
                   "w-full text-left rounded-lg border p-2.5 transition-colors",

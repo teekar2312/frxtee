@@ -307,6 +307,16 @@ export function SettingsView() {
                 <Input
                   value={store.aiModels[p.id] ?? ""}
                   onChange={(e) => store.setAiModel(p.id, e.target.value)}
+                  onBlur={() => {
+                    // Auto-push model change to backend when user finishes typing
+                    fetch("/api/trading/ai/config", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ models: store.aiModels }),
+                    }).then(() => {
+                      toast.success(`${p.label} model updated on backend: ${store.aiModels[p.id]}`);
+                    }).catch(() => {});
+                  }}
                   className="h-8 text-xs font-mono"
                   placeholder={`e.g. ${p.id === "zai" ? "glm-4.6" : p.id === "groq" ? "llama-3.3-70b" : p.id === "google" ? "gemini-1.5-pro" : "llama3"}`}
                 />
