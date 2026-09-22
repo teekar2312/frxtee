@@ -1006,6 +1006,109 @@ async def api_export():
         return {"csv": "", "demo": True}
 
 
+# ---- New feature endpoints ----
+from trading_analytics import (
+    compute_strength, check_correlation_risk, parameter_sweep,
+    create_journal_entry, analyze_order_flow,
+)
+
+
+@app.get("/api/trading/strength")
+async def api_strength():
+    """Currency strength meter — relative strength of 8 majors."""
+    t = await asyncio.to_thread(mt5_ticks)
+    if not t:
+        return {"currencies": [], "demo": True}
+    strengths = compute_strength(t)
+    return {"currencies": strengths, "demo": False}
+
+
+@app.get("/api/trading/correlation")
+async def api_correlation():
+    """Check correlation risk for open positions."""
+    pos = await asyncio.to_thread(mt5_positions)
+    open_symbols = [p["symbol"] for p in pos]
+    has_risk, reason = check_correlation_risk(open_symbols)
+    return {"has_risk": has_risk, "reason": reason, "open_symbols": open_symbols}
+
+
+@app.get("/api/trading/sweep")
+async def api_sweep(symbol: str = "EURUSD"):
+    """Parameter sweep / grid search for optimal indicator params."""
+    rates = await asyncio.to_thread(mt5_candles, symbol, "H1", 500)
+    if not rates:
+        return {"best_params": None, "demo": True}
+    result = await asyncio.to_thread(parameter_sweep, symbol, rates)
+    return {**result, "demo": False}
+
+
+@app.get("/api/trading/journal/{ticket}")
+async def api_journal(ticket: int):
+    """Get trade journal entries for a ticket."""
+    try:
+        logs = get_logs(limit=50, q=f"#{ticket}")
+        return {"entries": logs, "demo": False}
+    except Exception:  # noqa: BLE001
+        return {"entries": [], "demo": True}
+
+
+@app.get("/api/trading/orderflow")
+async def api_orderflow(symbol: str = "EURUSD"):
+    """Order flow / volume profile analysis."""
+    rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 100)
+    if not rates:
+        return {"demo": True}
+    result = await asyncio.to_thread(analyze_order_flow, rates, 50)
+    return {**result, "demo": False, "symbol": symbol}
+
+
+@app.get("/api/trading/tax-report")
+async def api_tax_report(year: int | None = None):
+    """Tax/performance report — summary of trades by year."""
+    import datetime as _dt
+    target_year = year or _dt.date.today().year
+    try:
+        trades = get_trades(limit=10000)
+        year_trades = [t for t in trades if t.get("close_time") and
+                       str(t.get("close_time", "")).startswith(str(target_year))]
+        closed = [t for t in year_trades if t.get("pnl") is not None]
+        total_pnl = sum(t.get("pnl", 0) for t in closed)
+        wins = [t for t in closed if t.get("pnl", 0) > 0]
+        losses = [t for t in closed if t.get("pnl", 0) < 0]
+        total_volume = sum(t.get("volume", 0) for t in closed)
+        return {
+            "year": target_year,
+            "total_trades": len(closed),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "total_pnl": round(total_pnl, 2),
+            "total_volume": round(total_volume, 2),
+            "avg_win": round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0,
+            "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0,
+            "demo": False,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "demo": True}
+
+
+@app.post("/api/trading/accounts/switch")
+@limiter.limit("5/minute")
+async def api_switch_account(request: Request, body: dict = None,
+                             _auth=Depends(require_token)):
+    """Switch MT5 account (multi-account support)."""
+    body = body or {}
+    login = body.get("login")
+    password = body.get("password")
+    server = body.get("server")
+    if not all([login, password, server]):
+        return {"ok": False, "error": "login, password, server required"}
+    settings.mt5_login = int(login)
+    settings.mt5_password = password
+    settings.mt5_server = server
+    r = connect()
+    return r.__dict__
+
+
 @app.post("/api/trading/alerts")
 async def api_add_alert(body: AlertReq, _auth=Depends(require_token)):
     a = add_price_alert(body.symbol, body.condition, body.price)

@@ -63,9 +63,18 @@ class Settings(BaseSettings):
 
     # Auto-trade engine
     auto_trade_mode: bool = False
-    auto_trade_symbols: str = "EURUSD,GBPUSD"  # comma-separated
+    auto_trade_symbols: str = "EURUSD,GBPUSD"
     auto_trade_min_confidence: int = 75
     ai_provider: str = "zai"
+
+    # Notification channels
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    discord_webhook_url: str = ""
+    notify_channels: str = "email"  # "email,telegram,discord"
+
+    # Multi-account
+    mt5_accounts: str = ""  # comma-separated "login:password:server,login2:pass2:server2"
 
     @property
     def cors_list(self) -> list[str]:

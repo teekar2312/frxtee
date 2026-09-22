@@ -23,6 +23,7 @@ import {
   Check,
   FlaskConical,
   Gauge,
+  GitBranch,
   LayoutDashboard,
   Moon,
   Newspaper,
@@ -50,6 +51,7 @@ const BacktestView = dynamic(() => import("@/components/trading/backtest-view").
 const AlertsView = dynamic(() => import("@/components/trading/alerts-view").then(m => ({ default: m.AlertsView })), { loading: () => <ViewSkeleton /> });
 const LogsView = dynamic(() => import("@/components/trading/logs-view").then(m => ({ default: m.LogsView })), { loading: () => <ViewSkeleton /> });
 const SettingsView = dynamic(() => import("@/components/trading/settings-view").then(m => ({ default: m.SettingsView })), { loading: () => <ViewSkeleton /> });
+const StrategyBuilderView = dynamic(() => import("@/components/trading/strategy-builder-view").then(m => ({ default: m.StrategyBuilderView })), { loading: () => <ViewSkeleton /> });
 
 function ViewSkeleton() {
   return (
@@ -74,6 +76,7 @@ type ViewId =
   | "backtest"
   | "alerts"
   | "logs"
+  | "strategy"
   | "settings";
 
 const NAV: { id: ViewId; label: string; icon: any }[] = [
@@ -84,6 +87,7 @@ const NAV: { id: ViewId; label: string; icon: any }[] = [
   { id: "risk", label: "Risk Mgmt", icon: Gauge },
   { id: "news", label: "News", icon: Newspaper },
   { id: "backtest", label: "Backtest", icon: FlaskConical },
+  { id: "strategy", label: "Strategy", icon: GitBranch },
   { id: "alerts", label: "Alerts", icon: Bell },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings },
@@ -348,6 +352,7 @@ function ViewTitle({ view }: { view: ViewId }) {
     backtest: { t: "Backtesting", d: "Historical strategy simulation" },
     alerts: { t: "Alerts & Notifications", d: "Price alerts · email notifications" },
     logs: { t: "Logs", d: "System · error · trade logs" },
+    strategy: { t: "Strategy Builder", d: "Build custom strategies with visual rules" },
     settings: { t: "Settings", d: "MT5 connection · broker · API keys · theme" },
   };
   const x = titles[view];
@@ -379,6 +384,8 @@ function View({ view }: { view: ViewId }) {
       return <AlertsView />;
     case "logs":
       return <LogsView />;
+    case "strategy":
+      return <StrategyBuilderView />;
     case "settings":
       return <SettingsView />;
     default:
