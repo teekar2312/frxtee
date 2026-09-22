@@ -106,6 +106,22 @@ export default function Page() {
 
   React.useEffect(() => setMounted(true), []);
 
+  // Auto-sync MT5 connection status from backend on mount
+  // Backend reads .env credentials and auto-connects on startup.
+  // This syncs the frontend badge to match backend state.
+  React.useEffect(() => {
+    fetch("/api/trading/status")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.connected) {
+          useTradingStore.setState({ mt5Connected: true, demoMode: false });
+        } else {
+          useTradingStore.setState({ mt5Connected: false, demoMode: true });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   // Apply density to <html> + persist. The store already initialises from
   // localStorage (safe for SSR), so this effect just keeps the DOM & storage
   // in sync when density changes.

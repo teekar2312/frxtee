@@ -30,7 +30,7 @@ export function SettingsView() {
   const { theme, setTheme } = useTheme();
   const store = useTradingStore();
   const { mt5Connected, setMt5Connected, demoMode, toggleDemo, keys, setKey } = store;
-  const [login, setLogin] = React.useState("5012****");
+  const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");
   const [terminal, setTerminal] = React.useState(
@@ -39,22 +39,45 @@ export function SettingsView() {
   const [connecting, setConnecting] = React.useState(false);
   const [autoLaunch, setAutoLaunch] = React.useState(true);
 
+  // Auto-fill from backend status on mount (reads .env values)
+  React.useEffect(() => {
+    fetch("/api/trading/status")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.account) {
+          setLogin(String(d.account.login ?? ""));
+          setServer(d.account.server ?? "FINEX-Real");
+        }
+        if (d.connected) {
+          setMt5Connected(true);
+          useTradingStore.setState({ demoMode: false });
+        }
+      })
+      .catch(() => {});
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
   async function connect() {
+    if (!login || !password || !server) {
+      toast.error("Login, password, dan server harus diisi");
+      return;
+    }
     setConnecting(true);
     try {
       const r = await fetch("/api/trading/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ login, server, autoLaunch, terminal }),
+        body: JSON.stringify({ login, password, server, autoLaunch, terminal }),
       });
       const d = await r.json();
       if (d.connected) {
         setMt5Connected(true);
         useTradingStore.setState({ demoMode: false });
         toast.success(d.message);
+      } else {
+        toast.error(d.message || d.error || "Connection failed");
       }
     } catch {
-      toast.error("Connection failed");
+      toast.error("Connection failed — backend not running?");
     } finally {
       setConnecting(false);
     }
