@@ -408,18 +408,24 @@ async def _auto_trade_loop():
                         equity = st.account.get("equity", 10000.0)
                     ok, msg = guard.can_open(equity)
                     if not ok:
-                        log.warning("auto-trade blocked: %s", msg)
+                        log.warning("auto-trade BLOCKED: %s", msg)
                         continue
 
                     pip_value = await asyncio.to_thread(get_pip_value_per_lot, symbol)
                     ps = size_position(equity, settings.stop_loss_pips, pip_value)
                     volume = round(max(0.01, min(ps.lot, 50.0)), 2)
 
+                    log.info("auto-trade: sending order %s %s %s lot sl=%dp tp=%.1fp",
+                             side, symbol, volume, settings.stop_loss_pips, ps.tp_pips)
+
                     r = await asyncio.to_thread(
                         send_order, symbol, side, volume,
                         settings.stop_loss_pips, ps.tp_pips, "AI:auto"
                     )
+
                     if r.get("ok"):
+                        log.info("✅ auto-trade SUCCESS: ticket=%s price=%s vol=%s",
+                                 r.get("ticket"), r.get("price"), r.get("volume"))
                         guard.register_open()
                         try:
                             save_trade(
@@ -427,8 +433,8 @@ async def _auto_trade_loop():
                                 volume=volume, open_price=r.get("price", 0),
                                 comment="AI:auto", source="ai",
                             )
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception as exc:  # noqa: BLE001
+                            log.error("save_trade failed: %s", exc)
                         notify_async(
                             f"🤖 Auto-trade: {side} {symbol}",
                             f"<p>AI signal {signal} ({confidence}% confidence)</p>"
@@ -436,6 +442,9 @@ async def _auto_trade_loop():
                             f"<p>SL {settings.stop_loss_pips}p · TP {ps.tp_pips:.1f}p</p>",
                         )
                         log.info("auto-trade executed: ticket=%s", r.get("ticket"))
+                    else:
+                        log.error("❌ auto-trade FAILED: %s | retcode=%s",
+                                  r.get("error"), r.get("retcode"))
 
         except Exception as exc:  # noqa: BLE001
             log.debug("auto-trade loop: %s", exc)
