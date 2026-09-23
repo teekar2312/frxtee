@@ -34,7 +34,7 @@ from mt5_service import send_order, status as mt5_status, ticks as mt5_ticks
 from mt5_service import get_pip_value_per_lot, get_recent_deals, modify_sl_tp
 from mt5_service import partial_close, _pip_for_digits
 from news_service import economic_calendar, fetch_news, aggregate_sentiment
-from risk_manager import guard, size_position, near_high_impact_news, trail_stop
+from risk_manager import guard, size_position, near_high_impact_news
 import ai_service
 import backtest as bt
 import ml_model
@@ -1089,6 +1089,7 @@ async def api_ai_config_update(request: Request):
             "zai": settings.zai_model,
             "groq": settings.groq_model,
             "google": settings.google_model,
+            "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
         "ai_min_confidence": settings.ai_min_confidence,

@@ -156,6 +156,8 @@ export function AIEngineView() {
                             auto_trade_symbols: store.symbols.join(","),
                             auto_trade_min_confidence: store.autoTradeMinConfidence,
                             active_provider: store.aiProvider,
+                            active_sessions: store.sessions.join(","),
+                            trading_strategy: store.tradingStrategy,
                           }),
                         }).then(() => {
                           toast.success("🤖 Auto-trade ENABLED on backend");

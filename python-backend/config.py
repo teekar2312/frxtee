@@ -85,7 +85,6 @@ class Settings(BaseSettings):
     # Auto-trade engine
     auto_trade_mode: bool = False
     auto_trade_symbols: str = "EURUSD,GBPUSD"
-    auto_trade_min_confidence: int = 75
     ai_provider: str = "zai"
 
     # Trading strategy selection

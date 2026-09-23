@@ -53,6 +53,16 @@ export function SettingsView() {
         if (d.auto_trade_mode != null) {
           store.setAutoTradeMode(d.auto_trade_mode);
         }
+        // sync sessions + strategy from backend
+        if (d.active_sessions != null) {
+          const sessions = d.active_sessions.split(",").filter((s: string) => s.trim());
+          if (sessions.length > 0) {
+            useTradingStore.setState({ sessions });
+          }
+        }
+        if (d.trading_strategy != null) {
+          store.setTradingStrategy(d.trading_strategy);
+        }
       })
       .catch(() => {});
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
@@ -403,7 +413,7 @@ export function SettingsView() {
           right={<BadgeTone tone={mt5Connected ? "up" : "warn"}>{mt5Connected ? "running" : "demo"}</BadgeTone>}
         />
         <div className="space-y-2 text-xs">
-          <Row k="Runtime" v="Python 3.14 · Windows 11" />
+          <Row k="Runtime" v="Python 3.13+ · Windows 11" />
           <Row k="IDE" v="Visual Studio Code" />
           <Row k="Broker" v="FINEX Indonesia (real account)" />
           <Row k="MT5 Library" v="MetaTrader5 (pip)" />

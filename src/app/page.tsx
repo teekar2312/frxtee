@@ -256,7 +256,7 @@ export default function Page() {
           <span className="hidden sm:inline">·</span>
           <span className="hidden sm:inline">FINEX Indonesia · 1:500 · spread from 0.5p</span>
           <span className="hidden md:inline">·</span>
-          <span className="hidden md:inline">Python 3.14 · MT5 · AI: Z.AI / Groq / Google / Local</span>
+          <span className="hidden md:inline">Python 3.13+ · MT5 · AI: Z.AI / Groq / Google / OpenRouter / Local</span>
           <span className="ml-auto">
             ⚠ Trading FX involves substantial risk — for educational/demo use.
           </span>
