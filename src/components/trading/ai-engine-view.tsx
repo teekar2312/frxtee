@@ -417,7 +417,7 @@ export function AIEngineView() {
         <Card className="p-3">
           <SectionHeader
             title={`Detailed Analysis · ${focus}`}
-            desc={`${active.name} · ${active.model} · ${active.latencyMs}ms`}
+            desc={`${active.name} · ${store.aiModels[active.id] || active.model} · ${active.latencyMs}ms`}
             icon={Brain}
             right={
               a ? <BadgeTone tone={signalTone(a.signal)}>{a.signal}</BadgeTone> : null
@@ -435,7 +435,7 @@ export function AIEngineView() {
                 <StatTile label="Confidence" value={`${a.confidence}%`} tone={a.confidence > 70 ? "up" : "warn"} />
                 <StatTile label="Risk Score" value={`${a.riskScore}%`} tone={a.riskScore > 50 ? "down" : "up"} />
                 <StatTile label="Entry" value={fmtPrice(a.suggestedEntry, focus.includes("JPY") ? 3 : 5)} />
-                <StatTile label="Provider" value={active.name} sub={a.model || active.model} />
+                <StatTile label="Provider" value={active.name} sub={a.model || store.aiModels[active.id] || active.model} />
               </div>
               <p className="text-sm leading-relaxed bg-muted/30 rounded-md p-2.5">
                 {a.summary}
