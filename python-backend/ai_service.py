@@ -101,6 +101,8 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
                 result["model"] = settings.google_model
                 return result
             if p == "local":
+                if not settings.ollama_model:
+                    continue  # skip if model name is empty (not configured)
                 result = _call_ollama(symbol, user_msg)
                 result["model"] = settings.ollama_model
                 return result
