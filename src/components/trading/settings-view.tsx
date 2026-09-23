@@ -304,6 +304,7 @@ export function SettingsView() {
               { id: "zai", label: "Z.AI" },
               { id: "groq", label: "Groq" },
               { id: "google", label: "Google AI" },
+              { id: "openrouter", label: "OpenRouter" },
               { id: "local", label: "Local (Ollama)" },
             ] as const).map((p) => (
               <div key={p.id}>
@@ -383,6 +384,12 @@ export function SettingsView() {
             value={keys.google}
             onChange={(v) => setKey("google", v)}
             placeholder="google token"
+          />
+          <KeyField
+            label="OpenRouter API Key"
+            value={keys.openrouter}
+            onChange={(v) => setKey("openrouter", v)}
+            placeholder="sk-or-v1-..."
           />
         </div>
       </Card>

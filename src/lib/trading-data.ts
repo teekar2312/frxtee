@@ -91,6 +91,13 @@ export const AI_PROVIDERS = [
     latencyMs: 980,
   },
   {
+    id: "openrouter",
+    name: "OpenRouter",
+    model: "deepseek/deepseek-chat",
+    desc: "100+ models via unified API",
+    latencyMs: 500,
+  },
+  {
     id: "local",
     name: "Local AI",
     model: "ollama / llama3",

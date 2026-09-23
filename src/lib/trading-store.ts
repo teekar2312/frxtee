@@ -118,6 +118,7 @@ interface TradingState {
     zai: string;
     groq: string;
     google: string;
+    openrouter: string;
   };
   setKey: (k: keyof TradingState["keys"], v: string) => void;
 
@@ -196,6 +197,7 @@ export const useTradingStore = create<TradingState>()(
     zai: "glm-4.6",
     groq: "llama-3.3-70b-versatile",
     google: "gemini-1.5-pro",
+    openrouter: "deepseek/deepseek-chat",
     local: "llama3",
   },
   setAiModel: (provider, model) =>
@@ -252,7 +254,7 @@ export const useTradingStore = create<TradingState>()(
   trailingPips: 8,
   setTrailingPips: (v) => set({ trailingPips: v }),
 
-  keys: { finnhub: "", marketaux: "", zai: "", groq: "", google: "" },
+  keys: { finnhub: "", marketaux: "", zai: "", groq: "", google: "", openrouter: "" },
   setKey: (k, v) => set((s) => ({ keys: { ...s.keys, [k]: v } })),
 
   emailEnabled: false,

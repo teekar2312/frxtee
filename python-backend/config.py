@@ -22,12 +22,14 @@ class Settings(BaseSettings):
     zai_api_key: str = ""
     groq_api_key: str = ""
     google_api_key: str = ""
+    openrouter_api_key: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
 
     # AI provider models (configurable per provider)
     zai_model: str = "glm-4.6"
     groq_model: str = "llama-3.3-70b-versatile"
     google_model: str = "gemini-1.5-pro"
+    openrouter_model: str = "deepseek/deepseek-chat"
     ollama_model: str = "llama3"
 
     # AI confidence threshold (0-100) — signals below this are rejected

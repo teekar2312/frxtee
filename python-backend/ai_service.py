@@ -43,10 +43,11 @@ commodities, sentiment, breaking_news."""
 
 # provider fallback order — if primary fails, try next in chain
 _PROVIDER_CASCADE = {
-    "zai": ["zai", "groq", "google", "local"],
-    "groq": ["groq", "zai", "google", "local"],
-    "google": ["google", "zai", "groq", "local"],
-    "local": ["local", "zai", "groq", "google"],
+    "zai": ["zai", "groq", "openrouter", "google", "local"],
+    "groq": ["groq", "zai", "openrouter", "google", "local"],
+    "google": ["google", "zai", "groq", "openrouter", "local"],
+    "openrouter": ["openrouter", "groq", "zai", "google", "local"],
+    "local": ["local", "zai", "groq", "openrouter", "google"],
 }
 
 
@@ -99,6 +100,10 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
             if p == "google" and settings.google_api_key:
                 result = _call_google(symbol, user_msg)
                 result["model"] = settings.google_model
+                return result
+            if p == "openrouter" and settings.openrouter_api_key:
+                result = _call_openrouter(symbol, user_msg)
+                result["model"] = settings.openrouter_model
                 return result
             if p == "local":
                 if not settings.ollama_model:
@@ -167,6 +172,38 @@ def _call_google(symbol: str, user_msg: str) -> dict:
     model = genai.GenerativeModel(model_name, system_instruction=SYSTEM_PROMPT)
     resp = model.generate_content(user_msg + "\nReturn JSON only.")
     return _parse(resp.text, symbol)
+
+
+# ---------- OpenRouter (100+ models via unified API) ----------
+def _call_openrouter(symbol: str, user_msg: str) -> dict:
+    """OpenRouter uses OpenAI-compatible API.
+    Supports 100+ models: deepseek, llama, gpt, claude, mistral, etc.
+    Get API key: https://openrouter.ai/keys
+    """
+    key = settings.openrouter_api_key
+    if not key:
+        return _heuristic(symbol)
+    log.info("OpenRouter calling model: %s", settings.openrouter_model)
+    from openai import OpenAI
+    client = OpenAI(
+        api_key=key,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://zenitrade.ai",
+            "X-Title": "ZeniTrade AI",
+        },
+    )
+    resp = client.chat.completions.create(
+        model=settings.openrouter_model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+        timeout=45,
+    )
+    return _parse(resp.choices[0].message.content, symbol)
 
 
 # ---------- Local AI (Ollama) ----------

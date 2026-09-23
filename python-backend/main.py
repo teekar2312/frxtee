@@ -1009,6 +1009,7 @@ async def api_ai_config():
             "zai": settings.zai_model,
             "groq": settings.groq_model,
             "google": settings.google_model,
+            "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
         "ai_min_confidence": settings.ai_min_confidence,
@@ -1023,6 +1024,7 @@ async def api_ai_config():
             "zai": bool(settings.zai_api_key),
             "groq": bool(settings.groq_api_key),
             "google": bool(settings.google_api_key),
+            "openrouter": bool(settings.openrouter_api_key),
             "local": True,
         },
     }
@@ -1052,6 +1054,8 @@ async def api_ai_config_update(request: Request):
             settings.groq_model = models["groq"]; updated.append(f"groq={models['groq']}")
         if "google" in models:
             settings.google_model = models["google"]; updated.append(f"google={models['google']}")
+        if "openrouter" in models:
+            settings.openrouter_model = models["openrouter"]; updated.append(f"openrouter={models['openrouter']}")
         if "local" in models:
             settings.ollama_model = models["local"]; updated.append(f"ollama={models['local']}")
     if "ai_min_confidence" in body:
