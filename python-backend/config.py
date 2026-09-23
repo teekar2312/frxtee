@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     daily_target_pct: float = 2.0
     avoid_high_impact_news: bool = True
 
+    # Trading sessions — comma-separated active sessions
+    # Options: sydney, tokyo, london, newyork
+    # Empty = trade all sessions (no session filter)
+    active_sessions: str = "london,newyork"
+
     # Trailing stop / position management
     trailing_enabled: bool = True
     trailing_pips: int = 8

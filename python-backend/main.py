@@ -993,6 +993,7 @@ async def api_ai_config():
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
         "auto_trade_mode": settings.auto_trade_mode,
         "auto_trade_symbols": settings.auto_trade_symbols,
+        "active_sessions": getattr(settings, "active_sessions", "london,newyork"),
         "active_provider": getattr(settings, "ai_provider", "zai"),
         "api_keys_set": {
             "zai": bool(settings.zai_api_key),
@@ -1045,6 +1046,10 @@ async def api_ai_config_update(request: Request):
     if "auto_trade_symbols" in body:
         settings.auto_trade_symbols = body["auto_trade_symbols"]
         updated.append(f"auto_trade_symbols={settings.auto_trade_symbols}")
+    if "active_sessions" in body:
+        settings.active_sessions = body["active_sessions"]
+        updated.append(f"active_sessions={settings.active_sessions}")
+        log.info("📅 trading sessions set to: %s", body["active_sessions"])
 
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {

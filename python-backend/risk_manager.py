@@ -13,6 +13,24 @@ log = logging.getLogger("risk")
 MIN_VOLUME = 0.01
 
 
+def _is_dst(date) -> bool:
+    """Check if date is in DST (Northern Hemisphere, US/EU rules).
+    DST: second Sunday of March to first Sunday of November."""
+    from datetime import datetime, timezone
+    if isinstance(date, datetime):
+        d = date
+    else:
+        d = date
+    year = d.year
+    march_start = datetime(year, 3, 1, tzinfo=timezone.utc)
+    march_dow = march_start.weekday()
+    second_sunday_march = march_start.replace(day=1 + ((6 - march_dow) % 7) + 7)
+    nov_start = datetime(year, 11, 1, tzinfo=timezone.utc)
+    nov_dow = nov_start.weekday()
+    first_sunday_nov = nov_start.replace(day=1 + ((6 - nov_dow) % 7))
+    return d >= second_sunday_march and d < first_sunday_nov
+
+
 @dataclass
 class PositionSize:
     lot: float
@@ -123,6 +141,48 @@ class RiskGuard:
             return False, "Weekend gap risk — no new entries after Friday 21:00 UTC"
         if now.weekday() >= 5:  # Saturday=5, Sunday=6
             return False, "Market closed (weekend)"
+
+        # trading session filter — only trade during selected sessions
+        active_sessions = getattr(settings, "active_sessions", "")
+        if active_sessions:
+            utc_h = now.hour
+            in_session = False
+            sessions = [s.strip().lower() for s in active_sessions.split(",") if s.strip()]
+
+            # DST-aware session hours (approximate UTC ranges)
+            is_dst = _is_dst(now)
+            for sess in sessions:
+                if sess == "sydney":
+                    # AEST: 22:00-07:00 local → UTC: ~21:00-06:00 (winter) / 20:00-05:00 (summer)
+                    start = 20 if is_dst else 21
+                    end = 5 if is_dst else 6
+                elif sess == "tokyo":
+                    # JST: 00:00-09:00 local → UTC: 0-9 (no DST)
+                    start, end = 0, 9
+                elif sess == "london":
+                    # GMT/BST: 08:00-17:00 local → UTC: 8-17 (winter) / 7-16 (summer)
+                    start = 7 if is_dst else 8
+                    end = 16 if is_dst else 17
+                elif sess == "newyork":
+                    # EST/EDT: 08:00-17:00 local → UTC: 13-22 (winter) / 12-21 (summer)
+                    start = 12 if is_dst else 13
+                    end = 21 if is_dst else 22
+                else:
+                    continue
+
+                # check if current hour is within session range
+                if start < end:
+                    if start <= utc_h < end:
+                        in_session = True
+                        break
+                else:
+                    # wraps midnight (e.g. Sydney)
+                    if utc_h >= start or utc_h < end:
+                        in_session = True
+                        break
+
+            if not in_session:
+                return False, f"Outside active trading sessions ({active_sessions})"
 
         return True, "ok"
 

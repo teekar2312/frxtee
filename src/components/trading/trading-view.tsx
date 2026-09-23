@@ -178,6 +178,7 @@ export function TradingView() {
                   auto_trade_symbols: store.symbols.join(","),
                   auto_trade_min_confidence: store.autoTradeMinConfidence,
                   active_provider: store.aiProvider,
+                  active_sessions: store.sessions.join(","),
                 }),
               }).then(() => {
                 toast.success("🤖 Auto-trading ENABLED — backend will execute AI signals automatically");
