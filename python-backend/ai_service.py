@@ -155,10 +155,14 @@ def _call_groq(symbol: str, user_msg: str) -> dict:
 def _call_google(symbol: str, user_msg: str) -> dict:
     if not settings.google_api_key:
         return _heuristic(symbol)
-    log.info("Google calling model: %s", settings.google_model)
+    # google-generativeai SDK requires 'models/' prefix
+    model_name = settings.google_model
+    if not model_name.startswith("models/"):
+        model_name = f"models/{model_name}"
+    log.info("Google calling model: %s", model_name)
     import google.generativeai as genai
     genai.configure(api_key=settings.google_api_key)
-    model = genai.GenerativeModel(settings.google_model, system_instruction=SYSTEM_PROMPT)
+    model = genai.GenerativeModel(model_name, system_instruction=SYSTEM_PROMPT)
     resp = model.generate_content(user_msg + "\nReturn JSON only.")
     return _parse(resp.text, symbol)
 
