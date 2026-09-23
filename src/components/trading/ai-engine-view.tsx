@@ -108,7 +108,7 @@ export function AIEngineView() {
                     <div>
                       <div className="text-sm font-medium leading-tight">{p.name}</div>
                       <div className="text-[11px] text-muted-foreground leading-tight">
-                        {p.model}
+                        {store.aiModels[p.id] || p.model}
                       </div>
                     </div>
                   </div>
