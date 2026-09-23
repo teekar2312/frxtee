@@ -95,6 +95,10 @@ export function SettingsView() {
           setLogin(String(d.account.login ?? ""));
           setServer(d.account.server ?? "FINEX-Real");
         }
+        // sync terminal path from backend (.env MT5_TERMINAL_PATH)
+        if (d.terminal) {
+          setTerminal(d.terminal);
+        }
         if (d.connected) {
           setMt5Connected(true);
           useTradingStore.setState({ demoMode: false });
