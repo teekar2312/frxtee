@@ -395,6 +395,28 @@ async def _auto_trade_loop():
                 if signal == "NEUTRAL" or confidence < min_confidence:
                     continue
 
+                # Strategy evaluation — override AI signal with strategy signal
+                strategy_id = getattr(settings, "trading_strategy", "auto")
+                if strategy_id and strategy_id != "auto":
+                    # Manual strategy selected — use strategy signal instead of AI
+                    import pandas as pd
+                    strat_result = evaluate_strategy(strategy_id, pd.DataFrame(rates), ctx.get("indicators", {}))
+                    if strat_result.get("signal") != "NEUTRAL":
+                        signal = strat_result["signal"]
+                        confidence = strat_result.get("confidence", confidence)
+                        sl_pips_override = None
+                        tp_price_override = strat_result.get("tp")
+                        sl_price_override = strat_result.get("sl")
+                        log.info("strategy %s: %s conf=%s%% (%s)",
+                                 strategy_id, signal, confidence, strat_result.get("reason", ""))
+                    else:
+                        log.info("strategy %s: NEUTRAL (%s) — skipping",
+                                 strategy_id, strat_result.get("reason", ""))
+                        continue
+                else:
+                    sl_price_override = None
+                    tp_price_override = None
+
                 # execute signal
                 side = "BUY" if "BUY" in signal else "SELL"
                 _last_signal_ts[symbol] = now
@@ -994,6 +1016,8 @@ async def api_ai_config():
         "auto_trade_mode": settings.auto_trade_mode,
         "auto_trade_symbols": settings.auto_trade_symbols,
         "active_sessions": getattr(settings, "active_sessions", "london,newyork"),
+        "trading_strategy": getattr(settings, "trading_strategy", "auto"),
+        "strategies": STRATEGY_INFO,
         "active_provider": getattr(settings, "ai_provider", "zai"),
         "api_keys_set": {
             "zai": bool(settings.zai_api_key),
@@ -1050,6 +1074,10 @@ async def api_ai_config_update(request: Request):
         settings.active_sessions = body["active_sessions"]
         updated.append(f"active_sessions={settings.active_sessions}")
         log.info("📅 trading sessions set to: %s", body["active_sessions"])
+    if "trading_strategy" in body:
+        settings.trading_strategy = body["trading_strategy"]
+        updated.append(f"trading_strategy={settings.trading_strategy}")
+        log.info("📈 strategy set to: %s", body["trading_strategy"])
 
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {
@@ -1118,6 +1146,7 @@ from trading_analytics import (
     compute_strength, check_correlation_risk, parameter_sweep,
     create_journal_entry, analyze_order_flow,
 )
+from trading_strategies import evaluate as evaluate_strategy, STRATEGY_INFO, STRATEGY_REGISTRY
 
 
 @app.get("/api/trading/strength")

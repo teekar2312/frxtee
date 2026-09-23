@@ -68,6 +68,8 @@ interface TradingState {
   // configurable models per provider
   aiModels: Record<string, string>;
   setAiModel: (provider: string, model: string) => void;
+  tradingStrategy: string;
+  setTradingStrategy: (s: string) => void;
   autoTradeMode: boolean;
   setAutoTradeMode: (v: boolean) => void;
   autoIndicators: boolean;
@@ -198,6 +200,8 @@ export const useTradingStore = create<TradingState>()(
   },
   setAiModel: (provider, model) =>
     set((s) => ({ aiModels: { ...s.aiModels, [provider]: model } })),
+  tradingStrategy: "auto",
+  setTradingStrategy: (s) => set({ tradingStrategy: s }),
   autoTradeMode: false,
   setAutoTradeMode: (v) => set({ autoTradeMode: v }),
   autoIndicators: false,
@@ -268,6 +272,7 @@ export const useTradingStore = create<TradingState>()(
         aiMinConfidence: s.aiMinConfidence,
         autoTradeMinConfidence: s.autoTradeMinConfidence,
         aiModels: s.aiModels,
+        tradingStrategy: s.tradingStrategy,
         autoTradeMode: s.autoTradeMode,
         autoIndicators: s.autoIndicators,
         autoTrailing: s.autoTrailing,

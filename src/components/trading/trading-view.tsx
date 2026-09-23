@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -179,6 +180,7 @@ export function TradingView() {
                   auto_trade_min_confidence: store.autoTradeMinConfidence,
                   active_provider: store.aiProvider,
                   active_sessions: store.sessions.join(","),
+                  trading_strategy: store.tradingStrategy,
                 }),
               }).then(() => {
                 toast.success("🤖 Auto-trading ENABLED — backend will execute AI signals automatically");
@@ -196,6 +198,64 @@ export function TradingView() {
               toast.info("Manual mode — you confirm each order");
             }}
           />
+          <Separator />
+          {/* Strategy selector */}
+          <div className="py-1.5">
+            <Label className="text-[11px] text-muted-foreground mb-1 block">
+              Trading Strategy
+            </Label>
+            <Select
+              value={store.tradingStrategy}
+              onValueChange={(v) => {
+                store.setTradingStrategy(v);
+                // Push to backend
+                fetch("/api/trading/ai/config", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ trading_strategy: v }),
+                }).then(() => {
+                  toast.success(v === "auto"
+                    ? "Strategy: AI auto-select (based on market conditions)"
+                    : `Strategy: ${v}`);
+                });
+              }}
+            >
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto" className="text-xs">
+                  🤖 Auto (AI selects based on market)
+                </SelectItem>
+                <SelectItem value="ma_ribbon" className="text-xs">
+                  📊 MA Ribbon (5-8-13 SMA)
+                </SelectItem>
+                <SelectItem value="momentum_scalp" className="text-xs">
+                  ⚡ Momentum Scalping (RSI+MACD)
+                </SelectItem>
+                <SelectItem value="pivot_bounce" className="text-xs">
+                  🎯 Pivot Point Bounce
+                </SelectItem>
+                <SelectItem value="ema_crossover" className="text-xs">
+                  📈 EMA Crossover (9/21 + ATR)
+                </SelectItem>
+                <SelectItem value="rmi_trend_sync" className="text-xs">
+                  🔄 RMI Trend Sync (RSI + Supertrend)
+                </SelectItem>
+                <SelectItem value="linreg_channel" className="text-xs">
+                  📏 Linear Regression Channel
+                </SelectItem>
+                <SelectItem value="ema_rsi_filter" className="text-xs">
+                  🔀 EMA/RSI Filter
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {store.tradingStrategy === "auto"
+                ? "AI analyzes market conditions and selects optimal strategy"
+                : "Strategy signals override AI — uses indicator-based rules only"}
+            </p>
+          </div>
           <Separator />
           <SwitchRow
             label="Avoid high-impact news"

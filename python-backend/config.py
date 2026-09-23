@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     auto_trade_min_confidence: int = 75
     ai_provider: str = "zai"
 
+    # Trading strategy selection
+    # Options: auto (AI selects), ma_ribbon, momentum_scalp, pivot_bounce,
+    # ema_crossover, rmi_trend_sync, linreg_channel, ema_rsi_filter
+    trading_strategy: str = "auto"
+
     # Notification channels
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
