@@ -40,6 +40,7 @@ import backtest as bt
 import ml_model
 from notifier import add_price_alert, check_alerts, send_email, notify_async
 from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade, cleanup_old
+from db import get_open_trade_sl_tp
 
 # ---- structured JSON logging (for production log aggregation) --------------
 import json as _json
@@ -206,8 +207,12 @@ async def _manage_positions_loop():
                 await asyncio.sleep(5)
                 continue
 
-            # Also fetch fresh ticks for accurate current price
-            fresh_ticks = await asyncio.to_thread(mt5_ticks)
+            # Fetch fresh ticks for ALL open position symbols (not just the
+            # 4 default ones). Previously mt5_ticks() was called with no args,
+            # so non-default pairs (AUDUSD, USDCAD…) had no fresh price and
+            # fell back to position.price_current which can be stale.
+            pos_symbols = list({p["symbol"] for p in positions})
+            fresh_ticks = await asyncio.to_thread(mt5_ticks, pos_symbols)
             tick_map = {t["symbol"]: t for t in fresh_ticks} if fresh_ticks else {}
 
             trailing_enabled = settings.trailing_enabled
@@ -228,8 +233,25 @@ async def _manage_positions_loop():
                 # Use FRESH tick price (position currentPrice may be stale)
                 fresh_tick = tick_map.get(p["symbol"])
                 current = fresh_tick["bid"] if fresh_tick else p["currentPrice"]
-                sl = p.get("sl")
-                tp = p.get("tp")
+                broker_sl = p.get("sl") or 0.0
+                broker_tp = p.get("tp") or 0.0
+
+                # CRITICAL: If broker SL/TP is 0 (broker silently dropped them
+                # because stops were too close to price), fall back to the
+                # INTENDED sl/tp we stored in the DB when the order was filled.
+                # This is the root-cause fix for "positions stay open at SL/TP".
+                if broker_sl == 0 or broker_tp == 0:
+                    db_sl, db_tp = await asyncio.to_thread(get_open_trade_sl_tp, ticket)
+                    if broker_sl == 0 and db_sl > 0:
+                        log.info("ticket=%s: broker SL=0, using DB fallback SL=%s",
+                                 ticket, db_sl)
+                        broker_sl = db_sl
+                    if broker_tp == 0 and db_tp > 0:
+                        log.info("ticket=%s: broker TP=0, using DB fallback TP=%s",
+                                 ticket, db_tp)
+                        broker_tp = db_tp
+                sl = broker_sl
+                tp = broker_tp
 
                 # CRITICAL: Check if price has hit SL or TP — close manually
                 # This is a backup in case broker-side SL/TP doesn't trigger
@@ -247,11 +269,14 @@ async def _manage_positions_loop():
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
                             except Exception as exc:  # noqa: BLE001
                                 log.error("close_trade DB failed: %s", exc)
-                            notify_async(
-                                f"🔴 SL hit: #{ticket} {p['symbol']}",
-                                f"<p>Stop loss triggered at {current}</p>"
-                                f"<p>P&L: ${pnl:.2f}</p>",
-                            )
+                            if r.get("already_closed"):
+                                log.info("ticket=%s already closed broker-side (SL)", ticket)
+                            else:
+                                notify_async(
+                                    f"🔴 SL hit: #{ticket} {p['symbol']}",
+                                    f"<p>Stop loss triggered at {current}</p>"
+                                    f"<p>P&L: ${pnl:.2f}</p>",
+                                )
                         else:
                             log.error("❌ SL close FAILED: ticket=%s error=%s",
                                       ticket, r.get("error"))
@@ -281,11 +306,14 @@ async def _manage_positions_loop():
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
                             except Exception as exc:  # noqa: BLE001
                                 log.error("close_trade DB failed: %s", exc)
-                            notify_async(
-                                f"🟢 TP hit: #{ticket} {p['symbol']}",
-                                f"<p>Take profit reached at {current}</p>"
-                                f"<p>P&L: ${pnl:.2f}</p>",
-                            )
+                            if r.get("already_closed"):
+                                log.info("ticket=%s already closed broker-side (TP)", ticket)
+                            else:
+                                notify_async(
+                                    f"🟢 TP hit: #{ticket} {p['symbol']}",
+                                    f"<p>Take profit reached at {current}</p>"
+                                    f"<p>P&L: ${pnl:.2f}</p>",
+                                )
                         else:
                             log.error("❌ TP close FAILED: ticket=%s error=%s",
                                       ticket, r.get("error"))
@@ -301,12 +329,13 @@ async def _manage_positions_loop():
                                           ticket, r2.get("error"))
                         continue  # skip trailing/BE — position is closed
 
-                # Log SL/TP status for debugging
-                if sl == 0 or sl is None:
-                    log.warning("⚠ Position #%s has NO SL set! (%s %s)",
+                # Log SL/TP status for debugging (only if BOTH broker and DB
+                # fallback are empty — true "no stops" situation)
+                if not sl or sl == 0:
+                    log.warning("⚠ Position #%s has NO SL (broker=0, DB=0)! (%s %s)",
                                 ticket, pos_type, p["symbol"])
-                if tp == 0 or tp is None:
-                    log.warning("⚠ Position #%s has NO TP set! (%s %s)",
+                if not tp or tp == 0:
+                    log.warning("⚠ Position #%s has NO TP (broker=0, DB=0)! (%s %s)",
                                 ticket, pos_type, p["symbol"])
                 symbol = p["symbol"]
                 digits = _get_digits(symbol)
@@ -405,9 +434,12 @@ async def _manage_positions_loop():
             _be_applied &= active_tickets
             _partial_applied &= active_tickets
 
+            # Poll faster (2s) when positions are open so SL/TP is caught
+            # quickly — the 5s default can miss fast spikes.
+            await asyncio.sleep(2)
         except Exception as exc:  # noqa: BLE001
             log.debug("manage positions loop: %s", exc)
-        await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 
 def _get_digits(symbol: str) -> int:
@@ -540,6 +572,8 @@ async def _auto_trade_loop():
                                 ticket=r.get("ticket", 0), symbol=symbol, side=side,
                                 volume=volume, open_price=r.get("price", 0),
                                 comment="AI:auto", source="ai",
+                                sl=float(r.get("sl") or 0.0),
+                                tp=float(r.get("tp") or 0.0),
                             )
                         except Exception as exc:  # noqa: BLE001
                             log.error("save_trade failed: %s", exc)
@@ -823,6 +857,8 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
                         volume=volume, open_price=r.get("price", 0),
                         comment=body.comment,
                         source="ai" if "AI" in body.comment else "manual",
+                        sl=float(r.get("sl") or 0.0),
+                        tp=float(r.get("tp") or 0.0),
                     )
                     db_saved = True
                     break

@@ -392,16 +392,33 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
     if max_spread_pips > 0 and spread_pips > max_spread_pips:
         return {"ok": False, "error": f"Spread too wide ({spread_pips:.1f}p > {max_spread_pips}p) — likely news volatility"}
     price = tick.ask if side == "BUY" else tick.bid
-    sl = price - sl_pips * pip if side == "BUY" else price + sl_pips * pip
-    tp = price + tp_pips * pip if side == "BUY" else price - tp_pips * pip
+
+    # ---- broker stops_level guard ------------------------------------------
+    # Brokers reject SL/TP closer than trade_stops_level * point. If the
+    # requested sl_pips/tp_pips are too tight, the broker silently drops them
+    # — leaving the position with NO stops. We bump to the broker minimum.
+    stops_level = getattr(info, "trade_stops_level", 0) or 0
+    min_stop_pips = (stops_level * (info.point if hasattr(info, "point") else 10 ** -info.digits)) / pip
+    eff_sl_pips = max(sl_pips, min_stop_pips + 1)
+    eff_tp_pips = max(tp_pips, min_stop_pips + 1)
+    if eff_sl_pips != sl_pips or eff_tp_pips != tp_pips:
+        log.warning("⚠ SL/TP too tight for %s (stops_level=%d points=%.1fp) — "
+                    "bumped SL %s→%sp, TP %s→%sp",
+                    symbol, stops_level, min_stop_pips,
+                    sl_pips, eff_sl_pips, tp_pips, eff_tp_pips)
+
+    sl = price - eff_sl_pips * pip if side == "BUY" else price + eff_sl_pips * pip
+    tp = price + eff_tp_pips * pip if side == "BUY" else price - eff_tp_pips * pip
+    sl_rounded = round(sl, info.digits)
+    tp_rounded = round(tp, info.digits)
     # deviation scales with instrument volatility (pips → points)
-    deviation = int(max(10, sl_pips * 5))
+    deviation = int(max(10, eff_sl_pips * 5))
     req = {
         "action": mt5.TRADE_ACTION_DEAL,  # type: ignore
         "symbol": symbol, "volume": volume, "type": (
             mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL  # type: ignore
         ),
-        "price": price, "sl": round(sl, info.digits), "tp": round(tp, info.digits),
+        "price": price, "sl": sl_rounded, "tp": tp_rounded,
         "deviation": deviation, "magic": 99001, "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,  # type: ignore
         "type_filling": _filling_mode(info),
@@ -420,27 +437,45 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
 
     # verify SL/TP were actually set — log for debugging
     log.info("order filled: ticket=%s price=%s vol=%s sl=%s tp=%s retcode=%s",
-             r.order, r.price, filled, round(sl, info.digits), round(tp, info.digits), r.retcode)
+             r.order, r.price, filled, sl_rounded, tp_rounded, r.retcode)
 
     # CRITICAL: sometimes MT5 accepts the order but ignores SL/TP if
     # stops_level is too close. Check the actual position's SL/TP.
     import time as _time
     _time.sleep(0.3)  # small delay for position to register
     pos_check = mt5.positions_get(ticket=r.order)  # type: ignore
+    broker_sl = sl_rounded
+    broker_tp = tp_rounded
     if pos_check:
         p = pos_check[0]
+        broker_sl = float(p.sl) if p.sl else 0.0
+        broker_tp = float(p.tp) if p.tp else 0.0
         if p.sl == 0 or p.tp == 0:
             log.warning("⚠ SL/TP not set on position! broker sl=%s tp=%s — re-applying",
                         p.sl, p.tp)
             # try to set SL/TP via modify
-            modify_sl_tp(r.order, round(sl, info.digits), round(tp, info.digits))
+            modify_sl_tp(r.order, sl_rounded, tp_rounded)
+            # re-read after modify attempt
+            pos_recheck = mt5.positions_get(ticket=r.order)  # type: ignore
+            if pos_recheck:
+                broker_sl = float(pos_recheck[0].sl) if pos_recheck[0].sl else 0.0
+                broker_tp = float(pos_recheck[0].tp) if pos_recheck[0].tp else 0.0
+                if pos_recheck[0].sl == 0 or pos_recheck[0].tp == 0:
+                    log.error("❌ SL/TP STILL not set on position %s after modify! "
+                              "Broker may reject stops near price. Intended SL=%s TP=%s "
+                              "will be enforced by manage loop via DB fallback.",
+                              r.order, sl_rounded, tp_rounded)
         else:
             log.info("position verified: ticket=%s sl=%s tp=%s OK",
                      r.order, p.sl, p.tp)
+    # Always return the INTENDED sl/tp so callers can persist them as a
+    # fallback for the manage loop (in case broker drops them later).
     return {
         "ok": True, "ticket": r.order, "price": r.price,
         "volume": filled, "requested_volume": volume,
         "partial": filled < volume,
+        "sl": sl_rounded, "tp": tp_rounded,
+        "broker_sl": broker_sl, "broker_tp": broker_tp,
     }
 
 
@@ -449,7 +484,12 @@ def close_position(ticket: int) -> dict:
         return {"ok": False, "error": "MT5 not connected"}
     pos = mt5.positions_get(ticket=ticket)  # type: ignore
     if not pos:
-        return {"ok": False, "error": "position not found"}
+        # Position no longer exists — broker already closed it (SL/TP hit
+        # broker-side). This is SUCCESS, not an error. Return ok=True with
+        # already_closed=True so callers don't retry pointlessly.
+        log.info("close_position: ticket=%s not found — broker already closed it", ticket)
+        return {"ok": True, "already_closed": True, "price": 0.0,
+                "pnl": 0.0, "pips": 0.0, "volume": 0.0}
     p = pos[0]
     info = _get_symbol_info(p.symbol)  # cached
     tick = mt5.symbol_info_tick(p.symbol)  # type: ignore

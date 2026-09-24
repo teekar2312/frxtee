@@ -71,7 +71,9 @@ def init_db() -> None:
                 open_time   TEXT NOT NULL,
                 close_time  TEXT,
                 comment     TEXT,
-                source      TEXT DEFAULT 'manual'
+                source      TEXT DEFAULT 'manual',
+                sl          REAL DEFAULT 0,
+                tp          REAL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS alerts (
@@ -117,6 +119,17 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active);
             """
         )
+        # --- migration: add sl/tp columns to existing trades table (idempotent) ---
+        try:
+            cols = {row["name"] for row in c.execute("PRAGMA table_info(trades)").fetchall()}
+            if "sl" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN sl REAL DEFAULT 0")
+                log.info("migration: added 'sl' column to trades")
+            if "tp" not in cols:
+                c.execute("ALTER TABLE trades ADD COLUMN tp REAL DEFAULT 0")
+                log.info("migration: added 'tp' column to trades")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trades sl/tp migration skipped: %s", exc)
     log.info("database ready at %s", _db_path())
 
 
@@ -133,14 +146,35 @@ def cleanup_old(max_logs: int = 5000, max_trades: int = 10000,
 
 # ---------- trades ----------
 def save_trade(ticket: int, symbol: str, side: str, volume: float,
-               open_price: float, comment: str, source: str = "manual") -> None:
+               open_price: float, comment: str, source: str = "manual",
+               sl: float = 0.0, tp: float = 0.0) -> None:
+    """Persist a trade. sl/tp store the INTENDED stop-loss/take-profit price
+    levels (not pip distances) so the manage loop can enforce them even if
+    the broker silently dropped them (e.g. stops_level too close)."""
     with _lock, _conn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO trades (ticket,symbol,side,volume,open_price,open_time,comment,source) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO trades "
+            "(ticket,symbol,side,volume,open_price,open_time,comment,source,sl,tp) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (ticket, symbol, side, volume, open_price,
-             datetime.now(timezone.utc).isoformat(), comment, source),
+             datetime.now(timezone.utc).isoformat(), comment, source, sl, tp),
         )
+
+
+def get_trade(ticket: int) -> dict | None:
+    """Fetch a single trade row by ticket (for SL/TP fallback lookup)."""
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM trades WHERE ticket=?", (ticket,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_open_trade_sl_tp(ticket: int) -> tuple[float, float]:
+    """Return (sl, tp) intended price levels for an open trade by ticket.
+    Returns (0.0, 0.0) if the trade is not found or has no stored SL/TP."""
+    row = get_trade(ticket)
+    if not row:
+        return 0.0, 0.0
+    return float(row.get("sl") or 0.0), float(row.get("tp") or 0.0)
 
 
 def close_trade(ticket: int, close_price: float, pnl: float, pips: float) -> None:
