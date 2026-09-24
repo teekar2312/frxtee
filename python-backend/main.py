@@ -198,12 +198,17 @@ async def _manage_positions_loop():
     """
     while True:
         try:
+            # Fetch fresh positions from MT5 (not cached — need real-time prices)
             positions = await asyncio.to_thread(mt5_positions)
             if not positions:
                 _be_applied.clear()
                 _partial_applied.clear()
                 await asyncio.sleep(5)
                 continue
+
+            # Also fetch fresh ticks for accurate current price
+            fresh_ticks = await asyncio.to_thread(mt5_ticks)
+            tick_map = {t["symbol"]: t for t in fresh_ticks} if fresh_ticks else {}
 
             trailing_enabled = settings.trailing_enabled
             trailing_pips = settings.trailing_pips
@@ -220,7 +225,9 @@ async def _manage_positions_loop():
                 ticket = p["ticket"]
                 pos_type = p["type"]
                 open_price = p["openPrice"]
-                current = p["currentPrice"]
+                # Use FRESH tick price (position currentPrice may be stale)
+                fresh_tick = tick_map.get(p["symbol"])
+                current = fresh_tick["bid"] if fresh_tick else p["currentPrice"]
                 sl = p.get("sl")
                 tp = p.get("tp")
 
@@ -238,13 +245,26 @@ async def _manage_positions_loop():
                             guard.register_close(pnl)
                             try:
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
-                            except Exception:  # noqa: BLE001
-                                pass
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("close_trade DB failed: %s", exc)
                             notify_async(
                                 f"🔴 SL hit: #{ticket} {p['symbol']}",
                                 f"<p>Stop loss triggered at {current}</p>"
                                 f"<p>P&L: ${pnl:.2f}</p>",
                             )
+                        else:
+                            log.error("❌ SL close FAILED: ticket=%s error=%s",
+                                      ticket, r.get("error"))
+                            # Retry once after 1s
+                            await asyncio.sleep(1)
+                            r2 = await asyncio.to_thread(close_position, ticket)
+                            if r2.get("ok"):
+                                pnl = r2.get("pnl", 0.0)
+                                guard.register_close(pnl)
+                                log.info("SL close retry SUCCESS: ticket=%s", ticket)
+                            else:
+                                log.error("❌ SL close retry FAILED: ticket=%s error=%s",
+                                          ticket, r2.get("error"))
                         continue  # skip trailing/BE — position is closed
 
                 if tp and tp > 0:
@@ -259,13 +279,26 @@ async def _manage_positions_loop():
                             guard.register_close(pnl)
                             try:
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
-                            except Exception:  # noqa: BLE001
-                                pass
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("close_trade DB failed: %s", exc)
                             notify_async(
                                 f"🟢 TP hit: #{ticket} {p['symbol']}",
                                 f"<p>Take profit reached at {current}</p>"
                                 f"<p>P&L: ${pnl:.2f}</p>",
                             )
+                        else:
+                            log.error("❌ TP close FAILED: ticket=%s error=%s",
+                                      ticket, r.get("error"))
+                            # Retry once after 1s
+                            await asyncio.sleep(1)
+                            r2 = await asyncio.to_thread(close_position, ticket)
+                            if r2.get("ok"):
+                                pnl = r2.get("pnl", 0.0)
+                                guard.register_close(pnl)
+                                log.info("TP close retry SUCCESS: ticket=%s", ticket)
+                            else:
+                                log.error("❌ TP close retry FAILED: ticket=%s error=%s",
+                                          ticket, r2.get("error"))
                         continue  # skip trailing/BE — position is closed
 
                 # Log SL/TP status for debugging
