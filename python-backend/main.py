@@ -222,6 +222,59 @@ async def _manage_positions_loop():
                 open_price = p["openPrice"]
                 current = p["currentPrice"]
                 sl = p.get("sl")
+                tp = p.get("tp")
+
+                # CRITICAL: Check if price has hit SL or TP — close manually
+                # This is a backup in case broker-side SL/TP doesn't trigger
+                if sl and sl > 0:
+                    sl_hit = (pos_type == "BUY" and current <= sl) or \
+                             (pos_type == "SELL" and current >= sl)
+                    if sl_hit:
+                        log.warning("⚠ SL hit manually: ticket=%s %s %s sl=%s current=%s → closing",
+                                    ticket, pos_type, p["symbol"], sl, current)
+                        r = await asyncio.to_thread(close_position, ticket)
+                        if r.get("ok"):
+                            pnl = r.get("pnl", 0.0)
+                            guard.register_close(pnl)
+                            try:
+                                close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+                            except Exception:  # noqa: BLE001
+                                pass
+                            notify_async(
+                                f"🔴 SL hit: #{ticket} {p['symbol']}",
+                                f"<p>Stop loss triggered at {current}</p>"
+                                f"<p>P&L: ${pnl:.2f}</p>",
+                            )
+                        continue  # skip trailing/BE — position is closed
+
+                if tp and tp > 0:
+                    tp_hit = (pos_type == "BUY" and current >= tp) or \
+                             (pos_type == "SELL" and current <= tp)
+                    if tp_hit:
+                        log.warning("✅ TP hit manually: ticket=%s %s %s tp=%s current=%s → closing",
+                                    ticket, pos_type, p["symbol"], tp, current)
+                        r = await asyncio.to_thread(close_position, ticket)
+                        if r.get("ok"):
+                            pnl = r.get("pnl", 0.0)
+                            guard.register_close(pnl)
+                            try:
+                                close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+                            except Exception:  # noqa: BLE001
+                                pass
+                            notify_async(
+                                f"🟢 TP hit: #{ticket} {p['symbol']}",
+                                f"<p>Take profit reached at {current}</p>"
+                                f"<p>P&L: ${pnl:.2f}</p>",
+                            )
+                        continue  # skip trailing/BE — position is closed
+
+                # Log SL/TP status for debugging
+                if sl == 0 or sl is None:
+                    log.warning("⚠ Position #%s has NO SL set! (%s %s)",
+                                ticket, pos_type, p["symbol"])
+                if tp == 0 or tp is None:
+                    log.warning("⚠ Position #%s has NO TP set! (%s %s)",
+                                ticket, pos_type, p["symbol"])
                 symbol = p["symbol"]
                 digits = _get_digits(symbol)
                 pip = _pip_for_digits(digits)
