@@ -5574,3 +5574,26 @@ CRITICAL CHAINS ALL WORKING END-TO-END:
 Codebase is production-ready for the 8 critical integration chains. Remaining issues are
 cosmetic/low-severity (dead imports, type any[], inconsistent response shapes, stale strings).
 No code changes made — audit only.
+
+---
+Task ID: SLTP-FIX-FINAL
+Agent: main (Z.ai Code)
+Task: Fix "positions stay open when price hits SL/TP" — root-cause fix after previous manual-close backup failed
+
+Work Log:
+- Read worklog.md + dev.log to understand prior fix attempts (2 commits: manual close backup + 3 improvements)
+- Inspected _manage_positions_loop in main.py (lines 190-442) and send_order/close_position in mt5_service.py
+- Identified ROOT CAUSE: previous manual-close backup only fired when `if sl and sl > 0` — but when the broker silently drops SL/TP (because stops were too close to price per trade_stops_level), the position has sl=0/tp=0, so the guard skipped the close entirely. There was no fallback to the intended SL/TP values.
+- Secondary cause: mt5_ticks() was called WITHOUT position symbols in the manage loop — only fetched 4 default majors (EURUSD/GBPUSD/USDJPY/XAUUSD). Non-default pairs (AUDUSD, USDCAD…) had no fresh tick and fell back to position.price_current which can be stale.
+- Implemented 3-layer fix:
+  1. db.py: added sl/tp columns to trades table + idempotent ALTER TABLE migration + save_trade accepts sl/tp + new get_open_trade_sl_tp(ticket) helper
+  2. mt5_service.py: send_order now reads info.trade_stops_level and bumps sl_pips/tp_pips to min+1 if too tight (PREVENTS broker from dropping stops); returns intended sl/tp; close_position returns ok=True+already_closed=True when position not found (broker already closed it)
+  3. main.py: save_trade calls (auto-trade + manual order) now persist intended sl/tp; _manage_positions_loop falls back to DB sl/tp when broker sl/tp==0; passes position symbols to mt5_ticks; polls every 2s (was 5s); handles already_closed without retry
+- Verified all fixes: ast.parse OK on all 3 files; DB round-trip test (save sl=1.075/tp=1.095 → get_open_trade_sl_tp returns correct values); logic assertions pass (all fix code present)
+- Committed as 8370b85 "fix: SL/TP positions stay open — root-cause fix"
+
+Stage Summary:
+- Root cause = broker silently dropping SL/TP (stops_level too close) with NO fallback to intended values. Previous fix only handled the case where broker SL/TP were non-zero.
+- 3-layer defense now in place: (a) prevent broker from dropping stops via stops_level guard, (b) store intended SL/TP in DB as fallback, (c) use DB fallback in manage loop when broker sl/tp==0.
+- Files changed: python-backend/db.py, python-backend/mt5_service.py, python-backend/main.py (+ start-backend.sh helper)
+- NOTE for user: the running backend at /app is root-only (700 perms) and can't be updated from user shell. User must pull commit 8370b85 and restart their backend (on Windows where MT5 runs) to apply the fix. The DB migration (ALTER TABLE trades ADD COLUMN sl/tp) runs automatically on next startup.
