@@ -143,15 +143,35 @@ export const useTradingStore = create<TradingState>()(
   setDensity: (d) => set({ density: d }),
 
   symbols: ["EURUSD", "GBPUSD"],
-  setSymbols: (s) => set({ symbols: s }),
+  setSymbols: (s) => set((state) => {
+    if (state.autoTradeMode) {
+      try {
+        fetch("/api/trading/ai/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auto_trade_symbols: s.join(",") }),
+        });
+      } catch {}
+    }
+    return { symbols: s };
+  }),
   toggleSymbol: (sym) =>
     set((s) => {
       const exists = s.symbols.includes(sym);
-      return {
-        symbols: exists
-          ? s.symbols.filter((x) => x !== sym)
-          : [...s.symbols, sym],
-      };
+      const newSymbols = exists
+        ? s.symbols.filter((x) => x !== sym)
+        : [...s.symbols, sym];
+      // If auto-trade is on, push updated symbols to backend immediately
+      if (s.autoTradeMode) {
+        try {
+          fetch("/api/trading/ai/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ auto_trade_symbols: newSymbols.join(",") }),
+          });
+        } catch {}
+      }
+      return { symbols: newSymbols };
     }),
   setAutoSymbols: () =>
     set({
