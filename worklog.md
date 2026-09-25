@@ -5597,3 +5597,25 @@ Stage Summary:
 - 3-layer defense now in place: (a) prevent broker from dropping stops via stops_level guard, (b) store intended SL/TP in DB as fallback, (c) use DB fallback in manage loop when broker sl/tp==0.
 - Files changed: python-backend/db.py, python-backend/mt5_service.py, python-backend/main.py (+ start-backend.sh helper)
 - NOTE for user: the running backend at /app is root-only (700 perms) and can't be updated from user shell. User must pull commit 8370b85 and restart their backend (on Windows where MT5 runs) to apply the fix. The DB migration (ALTER TABLE trades ADD COLUMN sl/tp) runs automatically on next startup.
+
+---
+Task ID: OVERLAP-SESSIONS
+Agent: main (Z.ai Code)
+Task: Add Tokyo×London and London×New York overlap trading session options
+
+Work Log:
+- Read worklog.md + located session system: TRADING_SESSIONS in trading-data.ts, session-clock.tsx (header clock), risk_manager.py (backend session filter), config.py (active_sessions setting), trading-view.tsx (session selector chips)
+- Added 2 overlap sessions to TRADING_SESSIONS array with optional `overlap: [id1, id2]` field
+- Updated sessionOpen() in session-clock.tsx: overlap sessions are open only when BOTH underlying sessions are open (reuses per-session DST offset logic so overlap window shifts correctly with DST)
+- Refactored risk_manager.py session filter: extracted _base_window() and _in_window() helpers; overlap sessions compute intersection of two underlying UTC windows (max(start) to min(end))
+- Updated config.py comment to document overlap_tl / overlap_ln options
+- Verified overlap window computation: London×NY = 12-16 UTC (summer) / 13-17 UTC (winter); Tokyo×London = 7-9 UTC (summer) / 8-9 UTC (winter) — all assertions pass
+- Lint: 0 errors (25 pre-existing warnings, none new)
+- Browser verification (agent-browser): page renders fully, header clock shows "Tokyo × London" and "London × New York" status dots, Trading view shows both as selectable chips, no console errors
+- Committed b4317ea + pushed to https://github.com/teekar2312/frxtee
+
+Stage Summary:
+- 2 new overlap session options added: overlap_tl (Tokyo×London) and overlap_ln (London×New York)
+- These overlap windows have the highest trading volume/volatility — preferred by day traders
+- DST-aware: overlap window shifts automatically with daylight saving time (frontend + backend)
+- Users can now select overlap sessions in the Trading view session selector; backend accepts them in active_sessions config
