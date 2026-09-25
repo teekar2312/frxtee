@@ -31,6 +31,99 @@ def _is_dst(date) -> bool:
     return d >= second_sunday_march and d < first_sunday_nov
 
 
+# ---- session window helpers (shared by can_open + manage loop) -----------
+def _base_window(sess: str, is_dst: bool):
+    """Return (start, end) UTC hour window for a base session, DST-aware.
+
+    Returns None for unknown session ids. Overlap sessions are handled by
+    is_in_active_session() which computes the intersection of underlying
+    base windows.
+    """
+    if sess == "sydney":
+        # AEST: 22:00-07:00 local → UTC: ~21:00-06:00 (winter) / 20:00-05:00 (summer)
+        start = 20 if is_dst else 21
+        end = 5 if is_dst else 6
+    elif sess == "tokyo":
+        # JST: 00:00-09:00 local → UTC: 0-9 (no DST)
+        start, end = 0, 9
+    elif sess == "london":
+        # GMT/BST: 08:00-17:00 local → UTC: 8-17 (winter) / 7-16 (summer)
+        start = 7 if is_dst else 8
+        end = 16 if is_dst else 17
+    elif sess == "newyork":
+        # EST/EDT: 08:00-17:00 local → UTC: 13-22 (winter) / 12-21 (summer)
+        start = 12 if is_dst else 13
+        end = 21 if is_dst else 22
+    else:
+        return None
+    return start, end
+
+
+def _in_window(utc_hour: int, start: int, end: int) -> bool:
+    """Check if a UTC hour falls within a (start, end) window that may wrap midnight."""
+    if start < end:
+        return start <= utc_hour < end
+    # wraps midnight (e.g. Sydney 21→5)
+    return utc_hour >= start or utc_hour < end
+
+
+def is_in_active_session(now=None) -> bool:
+    """Check if `now` is within any of the configured active_sessions.
+
+    Returns True if:
+      - active_sessions is empty (no session filter — trade all day), OR
+      - `now` (UTC datetime, defaults to current UTC) is inside at least one
+        selected session window (DST-aware, including overlap sessions).
+
+    Used by risk_manager.can_open() to block NEW entries outside sessions,
+    and by _manage_positions_loop to detect session-end transitions and
+    optionally close all positions when the session ends.
+    """
+    from datetime import datetime, timezone
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    active_sessions = getattr(settings, "active_sessions", "")
+    if not active_sessions:
+        return True  # no filter = always in session
+
+    utc_h = now.hour
+    sessions = [s.strip().lower() for s in active_sessions.split(",") if s.strip()]
+    is_dst = _is_dst(now)
+
+    for sess in sessions:
+        # Overlap sessions: open only when BOTH underlying sessions are open.
+        if sess in ("overlap_tl", "overlap_ln"):
+            if sess == "overlap_tl":
+                pair = ("tokyo", "london")
+            else:
+                pair = ("london", "newyork")
+            windows = []
+            for sub in pair:
+                w = _base_window(sub, is_dst)
+                if w is None:
+                    windows = []
+                    break
+                windows.append(w)
+            if len(windows) == 2:
+                s0, e0 = windows[0]
+                s1, e1 = windows[1]
+                ov_start = max(s0, s1)
+                ov_end = min(e0, e1)
+                if ov_start < ov_end and _in_window(utc_h, ov_start, ov_end):
+                    return True
+            continue
+
+        w = _base_window(sess, is_dst)
+        if w is None:
+            continue
+        start, end = w
+        if _in_window(utc_h, start, end):
+            return True
+
+    return False
+
+
 @dataclass
 class PositionSize:
     lot: float
@@ -143,81 +236,11 @@ class RiskGuard:
             return False, "Market closed (weekend)"
 
         # trading session filter — only trade during selected sessions
+        # (uses shared is_in_active_session() so logic stays in sync with the
+        # manage-positions loop's session-end close detection)
         active_sessions = getattr(settings, "active_sessions", "")
-        if active_sessions:
-            utc_h = now.hour
-            in_session = False
-            sessions = [s.strip().lower() for s in active_sessions.split(",") if s.strip()]
-            is_dst = _is_dst(now)
-
-            # Compute the UTC hour-window for a single base session.
-            # Returns (start, end) in UTC hours (0-23), DST-aware.
-            def _base_window(sess: str):
-                if sess == "sydney":
-                    # AEST: 22:00-07:00 local → UTC: ~21:00-06:00 (winter) / 20:00-05:00 (summer)
-                    start = 20 if is_dst else 21
-                    end = 5 if is_dst else 6
-                elif sess == "tokyo":
-                    # JST: 00:00-09:00 local → UTC: 0-9 (no DST)
-                    start, end = 0, 9
-                elif sess == "london":
-                    # GMT/BST: 08:00-17:00 local → UTC: 8-17 (winter) / 7-16 (summer)
-                    start = 7 if is_dst else 8
-                    end = 16 if is_dst else 17
-                elif sess == "newyork":
-                    # EST/EDT: 08:00-17:00 local → UTC: 13-22 (winter) / 12-21 (summer)
-                    start = 12 if is_dst else 13
-                    end = 21 if is_dst else 22
-                else:
-                    return None
-                return start, end
-
-            # Check if a UTC hour falls within a (start, end) window that may wrap midnight.
-            def _in_window(utc_hour: int, start: int, end: int) -> bool:
-                if start < end:
-                    return start <= utc_hour < end
-                # wraps midnight (e.g. Sydney 21→5)
-                return utc_hour >= start or utc_hour < end
-
-            for sess in sessions:
-                # Overlap sessions: open only when BOTH underlying sessions are open.
-                # overlap_tl = Tokyo × London (~7-9 UTC summer / 8-9 winter)
-                # overlap_ln = London × New York (~12-16 UTC summer / 13-17 winter)
-                if sess in ("overlap_tl", "overlap_ln"):
-                    if sess == "overlap_tl":
-                        pair = ("tokyo", "london")
-                    else:
-                        pair = ("london", "newyork")
-                    windows = []
-                    for sub in pair:
-                        w = _base_window(sub)
-                        if w is None:
-                            windows = []
-                            break
-                        windows.append(w)
-                    if len(windows) == 2:
-                        # Intersection of the two UTC windows:
-                        s0, e0 = windows[0]
-                        s1, e1 = windows[1]
-                        # For non-wrapping windows, intersection = max(start) to min(end)
-                        # (all overlap pairs here are non-wrapping in UTC, so simple min/max works)
-                        ov_start = max(s0, s1)
-                        ov_end = min(e0, e1)
-                        if ov_start < ov_end and _in_window(utc_h, ov_start, ov_end):
-                            in_session = True
-                            break
-                    continue
-
-                w = _base_window(sess)
-                if w is None:
-                    continue
-                start, end = w
-                if _in_window(utc_h, start, end):
-                    in_session = True
-                    break
-
-            if not in_session:
-                return False, f"Outside active trading sessions ({active_sessions})"
+        if active_sessions and not is_in_active_session(now):
+            return False, f"Outside active trading sessions ({active_sessions})"
 
         return True, "ok"
 

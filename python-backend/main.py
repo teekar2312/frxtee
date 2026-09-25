@@ -35,6 +35,7 @@ from mt5_service import get_pip_value_per_lot, get_recent_deals, modify_sl_tp
 from mt5_service import partial_close, _pip_for_digits
 from news_service import economic_calendar, fetch_news, aggregate_sentiment
 from risk_manager import guard, size_position, near_high_impact_news
+from risk_manager import is_in_active_session
 import ai_service
 import backtest as bt
 import ml_model
@@ -186,6 +187,9 @@ _partial_applied: set[int] = set()
 # track last signal time per symbol for cooldown
 _last_signal_ts: dict[str, float] = {}
 _SIGNAL_COOLDOWN_SEC = 60  # min 60s between AI signals for same symbol
+# track previous in-session state for session-end close detection
+# (None = not yet initialized; True/False = last cycle's session status)
+_prev_in_session: bool | None = None
 
 
 async def _manage_positions_loop():
@@ -433,6 +437,53 @@ async def _manage_positions_loop():
             active_tickets = {p["ticket"] for p in positions}
             _be_applied &= active_tickets
             _partial_applied &= active_tickets
+
+            # ---- session-end close: force-close all positions when the
+            # selected trading session(s) end ---------------------------
+            # Detects the transition in_session True → False and, if
+            # settings.close_at_session_end is enabled, closes every open
+            # position. This avoids overnight/weekend gap exposure on
+            # day-trading setups. Only fires ONCE per transition.
+            global _prev_in_session
+            from datetime import datetime, timezone
+            now_in_session = is_in_active_session(datetime.now(timezone.utc))
+            if _prev_in_session is True and not now_in_session:
+                # session just ended
+                if getattr(settings, "close_at_session_end", False):
+                    log.warning("🔚 Session ended (active_sessions=%s) — "
+                                "close_at_session_end=True, closing %d open position(s)",
+                                settings.active_sessions, len(positions))
+                    for p in positions:
+                        ticket = p["ticket"]
+                        try:
+                            r = await asyncio.to_thread(close_position, ticket)
+                            if r.get("ok"):
+                                pnl = r.get("pnl", 0.0)
+                                guard.register_close(pnl)
+                                try:
+                                    close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+                                except Exception as exc:  # noqa: BLE001
+                                    log.error("close_trade DB failed: %s", exc)
+                                if not r.get("already_closed"):
+                                    log.info("🔚 session-end closed: ticket=%s %s %s pnl=%.2f",
+                                             ticket, p["type"], p["symbol"], pnl)
+                            else:
+                                log.error("🔚 session-end close FAILED: ticket=%s error=%s",
+                                          ticket, r.get("error"))
+                        except Exception as exc:  # noqa: BLE001
+                            log.error("session-end close exception ticket=%s: %s", ticket, exc)
+                    notify_async(
+                        f"🔚 Session ended — all positions closed",
+                        f"<p>Trading session(s) <b>{settings.active_sessions}</b> just ended.</p>"
+                        f"<p>Closed <b>{len(positions)}</b> position(s) automatically.</p>",
+                    )
+                    _be_applied.clear()
+                    _partial_applied.clear()
+                else:
+                    log.info("🔚 Session ended (active_sessions=%s) — "
+                             "close_at_session_end=False, keeping positions open",
+                             settings.active_sessions)
+            _prev_in_session = now_in_session
 
             # Poll faster (2s) when positions are open so SL/TP is caught
             # quickly — the 5s default can miss fast spikes.
@@ -1139,6 +1190,7 @@ async def api_ai_config():
         "auto_trade_mode": settings.auto_trade_mode,
         "auto_trade_symbols": settings.auto_trade_symbols,
         "active_sessions": getattr(settings, "active_sessions", "london,newyork"),
+        "close_at_session_end": getattr(settings, "close_at_session_end", False),
         "trading_strategy": getattr(settings, "trading_strategy", "auto"),
         "strategies": STRATEGY_INFO,
         "active_provider": getattr(settings, "ai_provider", "zai"),
@@ -1200,6 +1252,10 @@ async def api_ai_config_update(request: Request):
         settings.active_sessions = body["active_sessions"]
         updated.append(f"active_sessions={settings.active_sessions}")
         log.info("📅 trading sessions set to: %s", body["active_sessions"])
+    if "close_at_session_end" in body:
+        settings.close_at_session_end = bool(body["close_at_session_end"])
+        updated.append(f"close_at_session_end={settings.close_at_session_end}")
+        log.info("🔚 close_at_session_end set to: %s", settings.close_at_session_end)
     if "trading_strategy" in body:
         settings.trading_strategy = body["trading_strategy"]
         updated.append(f"trading_strategy={settings.trading_strategy}")

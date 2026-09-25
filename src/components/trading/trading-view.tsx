@@ -160,6 +160,28 @@ export function TradingView() {
               </Chip>
             ))}
           </div>
+          <Separator className="my-2" />
+          <SwitchRow
+            label="Close all at session end"
+            desc="Auto-close positions when selected session(s) end — avoids overnight gap exposure"
+            checked={store.closeAtSessionEnd}
+            onChange={(v) => {
+              store.setCloseAtSessionEnd(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ close_at_session_end: v }),
+              }).then(() => {
+                toast.success(
+                  v
+                    ? "🔚 Positions will auto-close when session ends"
+                    : "Positions kept open after session ends"
+                );
+              }).catch(() => {
+                toast.error("Failed to sync close-at-session-end to backend");
+              });
+            }}
+          />
         </Card>
 
         <Card className="p-3 space-y-1">

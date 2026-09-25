@@ -60,6 +60,9 @@ export function SettingsView() {
             useTradingStore.setState({ sessions });
           }
         }
+        if (d.close_at_session_end != null) {
+          useTradingStore.setState({ closeAtSessionEnd: !!d.close_at_session_end });
+        }
         if (d.trading_strategy != null) {
           store.setTradingStrategy(d.trading_strategy);
         }
@@ -80,13 +83,17 @@ export function SettingsView() {
           active_provider: store.aiProvider,
           auto_trade_mode: store.autoTradeMode,
           auto_trade_symbols: store.symbols.join(","),
+          active_sessions: store.sessions.join(","),
+          close_at_session_end: store.closeAtSessionEnd,
+          trading_strategy: store.tradingStrategy,
         }),
       });
     } catch {
       // backend not running — config saved locally only
     }
   }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence,
-      store.aiProvider, store.autoTradeMode, store.symbols]);
+      store.aiProvider, store.autoTradeMode, store.symbols,
+      store.sessions, store.closeAtSessionEnd, store.tradingStrategy]);
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");

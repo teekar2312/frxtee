@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     #   overlap_ln  = London × New York overlap (~12-16 UTC summer / 13-17 winter)
     # Empty = trade all sessions (no session filter)
     active_sessions: str = "london,newyork"
+    # When True, the manage-positions loop will CLOSE ALL open positions
+    # automatically when the current time leaves all selected sessions
+    # (i.e. session-end transition: in_session True → False).
+    # Helps avoid overnight/weekend gap exposure on day-trading setups.
+    close_at_session_end: bool = False
 
     # Trailing stop / position management
     trailing_enabled: bool = True

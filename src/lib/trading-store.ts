@@ -57,6 +57,9 @@ interface TradingState {
   setSessions: (s: string[]) => void;
   toggleSession: (s: string) => void;
   setAutoSessions: () => void;
+  // when true, backend closes all open positions when the selected session(s) end
+  closeAtSessionEnd: boolean;
+  setCloseAtSessionEnd: (v: boolean) => void;
 
   // AI
   aiProvider: AIProviderId;
@@ -206,6 +209,8 @@ export const useTradingStore = create<TradingState>()(
     set({
       sessions: TRADING_SESSIONS.map((x) => x.id),
     }),
+  closeAtSessionEnd: false,
+  setCloseAtSessionEnd: (v) => set({ closeAtSessionEnd: v }),
 
   aiProvider: "zai",
   setAiProvider: (p) => set({ aiProvider: p }),
@@ -289,6 +294,7 @@ export const useTradingStore = create<TradingState>()(
         symbols: s.symbols,
         timeframes: s.timeframes,
         sessions: s.sessions,
+        closeAtSessionEnd: s.closeAtSessionEnd,
         indicators: s.indicators,
         aiProvider: s.aiProvider,
         aiMinConfidence: s.aiMinConfidence,
