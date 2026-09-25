@@ -40,11 +40,25 @@ function getSessionOffset(sessionId: string, dst: boolean): number {
 }
 
 /** Check if a session is currently open, accounting for DST.
- * Session times are defined in LOCAL session time, converted to UTC. */
+ * Session times are defined in LOCAL session time, converted to UTC.
+ * Overlap sessions (with `overlap: [id1, id2]`) are open only when BOTH
+ * underlying sessions are open simultaneously. */
 function sessionOpen(
-  s: { id: string; utcStart: number; utcEnd: number },
+  s: { id: string; utcStart: number; utcEnd: number; overlap?: readonly string[] },
   now: Date
 ): boolean {
+  // Overlap session: open only when ALL underlying sessions are open.
+  // This reuses the per-session DST logic so the overlap window shifts
+  // correctly with DST (e.g. London×NY is 12-16 UTC in summer, 13-17 in winter).
+  if (s.overlap && s.overlap.length >= 2) {
+    return s.overlap.every((underlyingId) => {
+      const underlying = TRADING_SESSIONS.find((t) => t.id === underlyingId);
+      if (!underlying) return false;
+      // avoid infinite recursion — underlying sessions must not themselves be overlaps
+      if ("overlap" in underlying && underlying.overlap) return false;
+      return sessionOpen(underlying, now);
+    });
+  }
   const dst = isDST(now);
   const offset = getSessionOffset(s.id, dst);
   // convert local session hours to effective UTC hours

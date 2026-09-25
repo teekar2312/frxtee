@@ -32,7 +32,10 @@ export const TIMEFRAMES = [
 
 export type Timeframe = (typeof TIMEFRAMES)[number]["value"];
 
-// Trading sessions with approximate UTC windows
+// Trading sessions with approximate UTC windows.
+// `utcStart`/`utcEnd` are LOCAL session hours (converted to UTC in sessionOpen).
+// `overlap` (optional) marks a session as the intersection of two base sessions —
+// it is considered open only when BOTH underlying sessions are open (DST-aware).
 export const TRADING_SESSIONS = [
   {
     id: "sydney",
@@ -65,6 +68,24 @@ export const TRADING_SESSIONS = [
     utcEnd: 21,
     color: "var(--chart-2)",
     tz: "EST",
+  },
+  {
+    id: "overlap_tl",
+    name: "Tokyo × London",
+    utcStart: 7,
+    utcEnd: 9,
+    color: "var(--chart-3)",
+    tz: "Overlap",
+    overlap: ["tokyo", "london"] as const,
+  },
+  {
+    id: "overlap_ln",
+    name: "London × New York",
+    utcStart: 12,
+    utcEnd: 16,
+    color: "var(--chart-3)",
+    tz: "Overlap",
+    overlap: ["london", "newyork"] as const,
   },
 ] as const;
 

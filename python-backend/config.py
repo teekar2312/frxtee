@@ -48,6 +48,8 @@ class Settings(BaseSettings):
 
     # Trading sessions — comma-separated active sessions
     # Options: sydney, tokyo, london, newyork
+    #   overlap_tl  = Tokyo × London overlap (~7-9 UTC summer / 8-9 winter)
+    #   overlap_ln  = London × New York overlap (~12-16 UTC summer / 13-17 winter)
     # Empty = trade all sessions (no session filter)
     active_sessions: str = "london,newyork"
 
