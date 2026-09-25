@@ -5619,3 +5619,29 @@ Stage Summary:
 - These overlap windows have the highest trading volume/volatility — preferred by day traders
 - DST-aware: overlap window shifts automatically with daylight saving time (frontend + backend)
 - Users can now select overlap sessions in the Trading view session selector; backend accepts them in active_sessions config
+
+---
+Task ID: SESSION-END-CLOSE
+Agent: main (Z.ai Code)
+Task: Auto-close all open positions when the selected trading session(s) end
+
+Work Log:
+- Read worklog.md + explored session system: risk_manager.py (session filter in can_open), main.py (_manage_positions_loop), config.py (active_sessions), trading-store.ts (sessions state), trading-view.tsx (session selector UI), settings-view.tsx (backend sync)
+- Extracted session-check logic from risk_manager.can_open() into reusable module-level is_in_active_session(now) function with _base_window() + _in_window() helpers — handles all sessions including overlap_tl/overlap_ln
+- Refactored can_open() to call is_in_active_session(now) instead of duplicating logic (DRY)
+- Added config.py: close_at_session_end: bool = False setting
+- Added main.py _manage_positions_loop: tracks _prev_in_session state each 2s cycle; on True→False transition + close_at_session_end enabled, iterates all open positions calling close_position(), registers P&L via guard.register_close(), persists close_trade() to DB, sends notify_async() notification. Only fires ONCE per transition.
+- Exposed close_at_session_end in GET /api/trading/ai/config response + accepts it in POST /api/trading/ai/config body
+- Frontend: added closeAtSessionEnd field + setCloseAtSessionEnd setter + persisted in zustand store; added SwitchRow toggle "Close all at session end" in Trading Sessions card (trading-view.tsx) with POST to backend on change + toast; settings-view.tsx syncs from backend on load + includes in pushAiConfig
+- Unit tested is_in_active_session(): 12:00 UTC summer → True (London open), 18:00 UTC summer → True (NY open), 23:00 UTC summer → False (both closed). Session-end transition with active_sessions=london,newyork detected at 21:00 UTC ✓
+- Lint: 0 errors (25 pre-existing warnings, none new)
+- Browser verified: GET returns close_at_session_end=False; POST {close_at_session_end:true} → updated=['close_at_session_end=True']; GET re-check → True (persisted); UI toggle "Close all at session end" found in Trading view; clicking toggle → backend log "🔚 close_at_session_end set to: True"; no console errors
+- Committed ba57618 + pushed to https://github.com/teekar2312/frxtee
+
+Stage Summary:
+- New feature: "Close all at session end" toggle in Trading view
+- When ON, backend auto-closes all open positions the moment the selected session(s) end (DST-aware, handles overlaps)
+- Prevents overnight/weekend gap exposure for day-trading setups
+- Configurable via UI toggle, POST /api/trading/ai/config, or .env (CLOSE_AT_SESSION_END=true)
+- Fires only ONCE per session-end transition (no repeated closes)
+- Sends email/telegram/discord notification when positions are auto-closed
