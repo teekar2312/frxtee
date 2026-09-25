@@ -17,6 +17,9 @@ export function useWebSocket(symbols: string[]) {
   const [positions, setPositions] = React.useState<Position[]>([]);
   const [connected, setConnected] = React.useState(false);
 
+  // stable key so effect only re-runs when the symbol SET actually changes
+  const symbolKey = symbols.join(",");
+
   React.useEffect(() => {
     if (!WS_URL) return;
     if (!_socket) {
@@ -56,7 +59,8 @@ export function useWebSocket(symbols: string[]) {
       s.off("ticks");
       s.off("positions");
     };
-  }, [symbols.join(",")]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbolKey]);
 
   return { ticks, positions, connected };
 }

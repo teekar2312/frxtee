@@ -42,6 +42,11 @@ import ml_model
 from notifier import add_price_alert, check_alerts, send_email, notify_async
 from db import init_db, add_log, get_logs, get_trades, save_trade, close_trade, cleanup_old
 from db import get_open_trade_sl_tp
+from trading_analytics import (
+    compute_strength, check_correlation_risk, parameter_sweep,
+    create_journal_entry, analyze_order_flow,
+)
+from trading_strategies import evaluate as evaluate_strategy, STRATEGY_INFO, STRATEGY_REGISTRY
 
 # ---- structured JSON logging (for production log aggregation) --------------
 import json as _json
@@ -1325,11 +1330,6 @@ async def api_export():
 
 
 # ---- New feature endpoints ----
-from trading_analytics import (
-    compute_strength, check_correlation_risk, parameter_sweep,
-    create_journal_entry, analyze_order_flow,
-)
-from trading_strategies import evaluate as evaluate_strategy, STRATEGY_INFO, STRATEGY_REGISTRY
 
 
 @app.get("/api/trading/strength")

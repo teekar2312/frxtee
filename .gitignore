@@ -78,3 +78,7 @@ python-backend/.pytest_cache/
 screenshot-*.pngtool-results/
 tool-results/
 upload/
+
+# Runtime dev scripts (local-only state)
+.zscripts/dev.pid
+.zscripts/*.log

@@ -25,19 +25,17 @@ import {
 } from "@/lib/trading-data";
 import { useBacktest } from "@/lib/trading-hooks";
 import { useTradingStore } from "@/lib/trading-store";
-import { BadgeTone, SectionHeader, StatTile } from "./primitives";
+import { SectionHeader, StatTile } from "./primitives";
 
 export function BacktestView() {
   const indicators = useTradingStore((s) => s.indicators);
   const [symbol, setSymbol] = React.useState("EURUSD");
   const [tf, setTf] = React.useState<Timeframe>("H1");
   const [trades, setTrades] = React.useState(120);
-  const [runId, setRunId] = React.useState(0);
 
   const { data, isFetching, refetch } = useBacktest(symbol, trades, tf);
 
   function run() {
-    setRunId((x) => x + 1);
     refetch();
     toast.success(`Backtest started · ${symbol} ${tf} · ${trades} trades · ${indicators.length} indicators`);
   }

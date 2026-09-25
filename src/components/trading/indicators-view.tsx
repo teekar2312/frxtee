@@ -13,7 +13,7 @@ import {
   TECHNICAL_INDICATORS,
 } from "@/lib/trading-data";
 import { useTradingStore } from "@/lib/trading-store";
-import { BadgeTone, ModeToggle, SectionHeader } from "./primitives";
+import { ModeToggle, SectionHeader } from "./primitives";
 
 const CATEGORY_TONE: Record<string, string> = {
   Trend: "bg-chart-1/15 text-chart-1 border-chart-1/30",

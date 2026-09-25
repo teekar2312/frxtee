@@ -38,6 +38,7 @@ function TickerCell({
       return () => clearTimeout(id);
     }
     if (tick) prev.current = tick.bid;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick?.bid]);
 
   const change = tick?.changePct ?? 0;

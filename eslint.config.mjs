@@ -29,6 +29,9 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "src/components/ui/**",  // shadcn/ui generated components
     "src/hooks/**",  // shadcn hooks (use-toast, use-mobile)
     "skills/**",  // Z.ai skill scripts (not part of trading app)
+    "python-backend/.venv/**",  // Python venv (site-packages contains .js files)
+    "python-backend/**/__pycache__/**",
+    "mini-services/**",  // standalone Bun services (own lint configs)
   ],
 }];
 

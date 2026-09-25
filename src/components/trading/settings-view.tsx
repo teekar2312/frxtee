@@ -29,7 +29,7 @@ import { BadgeTone, SectionHeader, StatTile, SwitchRow } from "./primitives";
 export function SettingsView() {
   const { theme, setTheme } = useTheme();
   const store = useTradingStore();
-  const { mt5Connected, setMt5Connected, demoMode, toggleDemo, keys, setKey } = store;
+  const { mt5Connected, setMt5Connected, keys, setKey } = store;
 
   // Sync AI config from backend on mount
   React.useEffect(() => {

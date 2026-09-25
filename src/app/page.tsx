@@ -12,7 +12,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useTheme } from "next-themes";
-import { toast } from "sonner";
 import {
   Activity,
   AlertTriangle,
@@ -97,7 +96,6 @@ export default function Page() {
   const [view, setView] = React.useState<ViewId>("dashboard");
   const { theme, setTheme } = useTheme();
   const mt5Connected = useTradingStore((s) => s.mt5Connected);
-  const demoMode = useTradingStore((s) => s.demoMode);
   const autoTrade = useTradingStore((s) => s.autoTradeMode);
   const aiProvider = useTradingStore((s) => s.aiProvider);
   const density = useTradingStore((s) => s.density);

@@ -3,7 +3,6 @@
 import * as React from "react";
 import { Card } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
-import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { toast } from "sonner";
 import {
@@ -17,7 +16,6 @@ import {
 import { fmtMoney } from "@/lib/trading-data";
 import { useTradingStore } from "@/lib/trading-store";
 import {
-  AutoManualRow,
   BadgeTone,
   ModeToggle,
   SectionHeader,

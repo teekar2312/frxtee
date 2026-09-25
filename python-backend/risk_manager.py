@@ -270,24 +270,6 @@ class RiskGuard:
 guard = RiskGuard()
 
 
-def trail_stop(position: dict, current_price: float, trail_pips: int,
-               pip_value: float = 0.0001) -> dict | None:
-    """Advance SL behind price; returns updated position or None."""
-    new_sl = None
-    if position["type"] == "BUY":
-        candidate = current_price - trail_pips * pip_value
-        if position.get("sl") is None or candidate > position["sl"]:
-            new_sl = candidate
-    else:
-        candidate = current_price + trail_pips * pip_value
-        if position.get("sl") is None or candidate < position["sl"]:
-            new_sl = candidate
-    if new_sl is not None:
-        position["sl"] = new_sl
-        return position
-    return None
-
-
 def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
     """Check economic calendar for high-impact events within `minutes` window.
 

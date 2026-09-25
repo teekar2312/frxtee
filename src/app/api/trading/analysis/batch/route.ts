@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  type AIAnalysisResult,
-  type Timeframe,
-} from "@/lib/trading-data";
+import { type AIAnalysisResult } from "@/lib/trading-data";
 import { proxyBackend, passthroughQuery } from "@/lib/backend-proxy";
 
 export const dynamic = "force-dynamic";

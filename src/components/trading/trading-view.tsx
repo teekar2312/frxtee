@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import { Card } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -36,7 +35,6 @@ import { cn } from "@/lib/utils";
 import {
   fmtMoney,
   fmtPrice,
-  pipFor,
   TIMEFRAMES,
   TRADING_PAIRS,
   TRADING_SESSIONS,
@@ -341,7 +339,6 @@ function OrderTicket() {
   const tick = tickData?.ticks.find((t) => t.symbol === symbol);
   const p = TRADING_PAIRS.find((x) => x.symbol === symbol);
   const digits = p?.digits ?? 5;
-  const pip = pipFor(symbol);
 
   const riskAmount = (equity * riskPct) / 100;
   const autoLot = Math.max(0.01, +(riskAmount / (slPips * 10)).toFixed(2));
