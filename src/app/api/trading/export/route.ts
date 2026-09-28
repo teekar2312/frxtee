@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import { proxyBackend } from "@/lib/backend-proxy";
+import type { Trade } from "@/lib/trading-data";
 
 export const dynamic = "force-dynamic";
 
 /** Export trades as CSV. */
 export async function GET() {
-  const r = await proxyBackend<{ trades: any[]; csv: string }>(
+  const r = await proxyBackend<{ trades: Trade[]; csv: string }>(
     `/api/trading/export`, {}, 5000
   );
   if (r.data && r.data.csv) {

@@ -23,6 +23,7 @@ import {
   FlaskConical,
   Gauge,
   GitBranch,
+  History,
   LayoutDashboard,
   Moon,
   Newspaper,
@@ -51,6 +52,7 @@ const AlertsView = dynamic(() => import("@/components/trading/alerts-view").then
 const LogsView = dynamic(() => import("@/components/trading/logs-view").then(m => ({ default: m.LogsView })), { loading: () => <ViewSkeleton /> });
 const SettingsView = dynamic(() => import("@/components/trading/settings-view").then(m => ({ default: m.SettingsView })), { loading: () => <ViewSkeleton /> });
 const StrategyBuilderView = dynamic(() => import("@/components/trading/strategy-builder-view").then(m => ({ default: m.StrategyBuilderView })), { loading: () => <ViewSkeleton /> });
+const HistoryView = dynamic(() => import("@/components/trading/history-view").then(m => ({ default: m.HistoryView })), { loading: () => <ViewSkeleton /> });
 
 function ViewSkeleton() {
   return (
@@ -76,6 +78,7 @@ type ViewId =
   | "alerts"
   | "logs"
   | "strategy"
+  | "history"
   | "settings";
 
 const NAV: { id: ViewId; label: string; icon: any }[] = [
@@ -87,6 +90,7 @@ const NAV: { id: ViewId; label: string; icon: any }[] = [
   { id: "news", label: "News", icon: Newspaper },
   { id: "backtest", label: "Backtest", icon: FlaskConical },
   { id: "strategy", label: "Strategy", icon: GitBranch },
+  { id: "history", label: "History", icon: History },
   { id: "alerts", label: "Alerts", icon: Bell },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings },
@@ -367,6 +371,7 @@ function ViewTitle({ view }: { view: ViewId }) {
     alerts: { t: "Alerts & Notifications", d: "Price alerts · email notifications" },
     logs: { t: "Logs", d: "System · error · trade logs" },
     strategy: { t: "Strategy Builder", d: "Build custom strategies with visual rules" },
+    history: { t: "Trade History", d: "Closed & open trades · P&L summary · CSV export" },
     settings: { t: "Settings", d: "MT5 connection · broker · API keys · theme" },
   };
   const x = titles[view];
@@ -400,6 +405,8 @@ function View({ view }: { view: ViewId }) {
       return <LogsView />;
     case "strategy":
       return <StrategyBuilderView />;
+    case "history":
+      return <HistoryView />;
     case "settings":
       return <SettingsView />;
     default:

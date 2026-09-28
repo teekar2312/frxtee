@@ -11,6 +11,7 @@ import {
   type Position,
   type PriceTick,
   type Timeframe,
+  type Trade,
 } from "@/lib/trading-data";
 
 async function j<T>(u: string, signal?: AbortSignal): Promise<T> {
@@ -137,7 +138,7 @@ export interface MLModelInfo {
 }
 
 export function useTrades() {
-  return useQuery<{ trades: any[]; demo?: boolean }>({
+  return useQuery<{ trades: Trade[]; demo?: boolean }>({
     queryKey: ["trades"],
     queryFn: () => j("/api/trading/trades"),
     refetchInterval: 30_000,

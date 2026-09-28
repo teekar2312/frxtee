@@ -234,6 +234,26 @@ export interface Position {
   comment: string;
 }
 
+/** Trade history row — mirrors the Python backend's `trades` DB table.
+ * Closed trades have `close_time` + `close_price` + `pnl` set;
+ * open trades have those fields null/undefined. */
+export interface Trade {
+  ticket: number;
+  symbol: string;
+  side: "BUY" | "SELL";
+  volume: number;
+  open_price: number;
+  close_price: number | null;
+  pnl: number | null;
+  pips: number | null;
+  open_time: string;
+  close_time: string | null;
+  comment: string | null;
+  source: string;
+  sl: number;
+  tp: number;
+}
+
 export interface Candle {
   time: number;
   open: number;
