@@ -5645,3 +5645,39 @@ Stage Summary:
 - Configurable via UI toggle, POST /api/trading/ai/config, or .env (CLOSE_AT_SESSION_END=true)
 - Fires only ONCE per session-end transition (no repeated closes)
 - Sends email/telegram/discord notification when positions are auto-closed
+
+---
+Task ID: TRADE-HISTORY-VIEW
+Agent: main (Z.ai Code)
+Task: Create a trade history view showing all completed and open trades
+
+Work Log:
+- Read worklog + explored existing trades system: useTrades() hook (returns any[]), /api/trading/trades route (proxy to backend), get_trades() in db.py, trades table schema (ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, comment, source, sl, tp)
+- Added Trade interface to trading-data.ts mirroring backend DB schema with proper types (nullable close_price, pnl, pips, close_time)
+- Updated useTrades() in trading-hooks.ts to return Trade[] instead of any[] (type safety)
+- Updated trades/route.ts + export/route.ts to use Trade[] type
+- Created history-view.tsx with:
+  * 4 summary StatTiles: Net P&L (with tone), Win Rate (W/L count), Profit Factor (gross win/loss), Avg Pips/Trade
+  * Filterable trade table with sticky header, scrollable body (max-h-560px)
+  * 7 filter buttons with live counts: All, Open, Closed, Winners, Losers, AI, Manual
+  * Search input (by symbol, ticket, comment)
+  * CSV export button (exports filtered trades with proper escaping)
+  * Color-coded rows: green bg for winners, red bg for losers
+  * Color-coded P&L/pips: green for positive, red for negative
+  * BadgeTone for BUY/SELL side indicators
+  * Source column with TrendingUp icon for AI, TrendingDown for manual
+- Registered 'history' ViewId in page.tsx: added History icon import, dynamic import with loading skeleton, nav entry between Strategy and Alerts, ViewTitle entry, switch case
+- Synced local repo to remote (d3787ac) before applying changes
+- Lint: 0 errors, 0 warnings
+- Seeded 5 demo trades for verification: EURUSD (+$70), GBPUSD (+$46), USDJPY (-$14.5), XAUUSD (open), AUDUSD (+$51)
+- Browser verified: title "Trade History" found, 5 trade rows in table, filter counts correct (All 5, Open 1, Closed 4, Winners 3, Losers 1), summary tiles accurate (Net P&L $152.50, Win Rate 75%, Profit Factor 11.52, Avg Pips +29.9), Export CSV button present, no console errors
+- Committed d469ad8 + pushed to https://github.com/teekar2312/frxtee
+
+Stage Summary:
+- New "History" view accessible from sidebar navigation
+- Shows complete trade history with P&L analytics dashboard
+- Type-safe Trade interface replaces any[] throughout the codebase
+- Filter by status (open/closed), outcome (winners/losers), source (AI/manual)
+- Search by symbol, ticket, or comment
+- One-click CSV export of filtered trades
+- All calculations verified correct against seeded demo data
