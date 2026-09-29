@@ -5681,3 +5681,26 @@ Stage Summary:
 - Search by symbol, ticket, or comment
 - One-click CSV export of filtered trades
 - All calculations verified correct against seeded demo data
+
+---
+Task ID: OLLAMA-OOM-FIX
+Agent: main (Z.ai Code)
+Task: Fix Ollama out-of-memory error (40GB KV cache allocation)
+
+Work Log:
+- Analyzed error: "failed to allocate buffer of size 42949672960" = exactly 40 GiB = KV cache for unbounded context window. Ollama newer defaults use 128k+ token context which requires 40GB+ RAM.
+- Cascade fallback was working correctly (trying next provider), but every local AI call was doomed to OOM first.
+- Root-cause fix: cap context window via num_ctx option in Ollama API call.
+- config.py: added ollama_num_ctx: int = 8192 (safe default; was unbounded)
+- ai_service.py: _call_ollama() now passes num_ctx in options dict + detects OOM-specific error signatures (failed to allocate, out of memory, kv cache, failed to initialize the context) and raises clean RuntimeError so cascade falls through immediately
+- main.py: exposed ollama_num_ctx in GET /api/trading/ai/config + accept in POST body with validation
+- trading-store.ts: added ollamaNumCtx field (default 8192) + setter + persist
+- settings-view.tsx: sync from backend on load + push to backend on change + number input (1024-131072, step 1024) with helper text
+- Verified: GET returns 8192, POST 4096 → updated, GET re-check 4096, UI input shows 4096, backend log "🧠 ollama_num_ctx set to: 4096", lint 0/0, no console errors
+- Committed 550f56a + pushed to https://github.com/teekar2312/frxtee
+
+Stage Summary:
+- Ollama OOM fixed by capping context window to 8192 tokens (was unbounded → 40GB KV cache)
+- User can tune via Settings UI (1024-131072 range) or .env (OLLAMA_NUM_CTX)
+- OOM detection: if it still happens (very large model), cascade cleanly falls through to next provider with actionable log message
+- Recommended settings: 4096 for 8GB RAM, 8192 for 16GB RAM, 16384 for 32GB+ RAM
