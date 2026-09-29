@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     google_model: str = "gemini-1.5-pro"
     openrouter_model: str = "deepseek/deepseek-chat"
     ollama_model: str = "llama3"
+    # Ollama context window size (tokens). Default 8192 is a safe middle
+    # ground — Ollama's newer defaults (128k+) can require 40GB+ RAM for the
+    # KV cache and cause OOM on machines with limited memory. Lower this
+    # (e.g. 4096) if you still hit OOM; raise it (e.g. 16384) if you have
+    # 32GB+ RAM and need longer context.
+    ollama_num_ctx: int = 8192
 
     # AI confidence threshold (0-100) — signals below this are rejected
     ai_min_confidence: int = 60

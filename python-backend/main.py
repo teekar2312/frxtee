@@ -1190,6 +1190,7 @@ async def api_ai_config():
             "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
+        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
         "auto_trade_mode": settings.auto_trade_mode,
@@ -1237,6 +1238,13 @@ async def api_ai_config_update(request: Request):
             settings.openrouter_model = models["openrouter"]; updated.append(f"openrouter={models['openrouter']}")
         if "local" in models:
             settings.ollama_model = models["local"]; updated.append(f"ollama={models['local']}")
+    if "ollama_num_ctx" in body:
+        try:
+            settings.ollama_num_ctx = int(body["ollama_num_ctx"])
+            updated.append(f"ollama_num_ctx={settings.ollama_num_ctx}")
+            log.info("🧠 ollama_num_ctx set to: %d", settings.ollama_num_ctx)
+        except (ValueError, TypeError):
+            log.warning("invalid ollama_num_ctx value: %r", body["ollama_num_ctx"])
     if "ai_min_confidence" in body:
         settings.ai_min_confidence = int(body["ai_min_confidence"])
         updated.append(f"ai_min_confidence={settings.ai_min_confidence}")
@@ -1275,6 +1283,7 @@ async def api_ai_config_update(request: Request):
             "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
+        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
     }}

@@ -71,6 +71,9 @@ interface TradingState {
   // configurable models per provider
   aiModels: Record<string, string>;
   setAiModel: (provider: string, model: string) => void;
+  // Ollama context window (tokens) — caps KV cache size to prevent OOM
+  ollamaNumCtx: number;
+  setOllamaNumCtx: (v: number) => void;
   tradingStrategy: string;
   setTradingStrategy: (s: string) => void;
   autoTradeMode: boolean;
@@ -227,6 +230,8 @@ export const useTradingStore = create<TradingState>()(
   },
   setAiModel: (provider, model) =>
     set((s) => ({ aiModels: { ...s.aiModels, [provider]: model } })),
+  ollamaNumCtx: 8192,
+  setOllamaNumCtx: (v) => set({ ollamaNumCtx: v }),
   tradingStrategy: "auto",
   setTradingStrategy: (s) => set({ tradingStrategy: s }),
   autoTradeMode: false,
@@ -300,6 +305,7 @@ export const useTradingStore = create<TradingState>()(
         aiMinConfidence: s.aiMinConfidence,
         autoTradeMinConfidence: s.autoTradeMinConfidence,
         aiModels: s.aiModels,
+        ollamaNumCtx: s.ollamaNumCtx,
         tradingStrategy: s.tradingStrategy,
         autoTradeMode: s.autoTradeMode,
         autoIndicators: s.autoIndicators,

@@ -49,6 +49,10 @@ export function SettingsView() {
         if (d.auto_trade_min_confidence != null) {
           store.setAutoTradeMinConfidence(d.auto_trade_min_confidence);
         }
+        // sync ollama context window size (prevents local AI OOM)
+        if (d.ollama_num_ctx != null) {
+          useTradingStore.setState({ ollamaNumCtx: d.ollama_num_ctx });
+        }
         // sync auto-trade mode from backend
         if (d.auto_trade_mode != null) {
           store.setAutoTradeMode(d.auto_trade_mode);
@@ -86,6 +90,7 @@ export function SettingsView() {
           active_sessions: store.sessions.join(","),
           close_at_session_end: store.closeAtSessionEnd,
           trading_strategy: store.tradingStrategy,
+          ollama_num_ctx: store.ollamaNumCtx,
         }),
       });
     } catch {
@@ -93,7 +98,8 @@ export function SettingsView() {
     }
   }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence,
       store.aiProvider, store.autoTradeMode, store.symbols,
-      store.sessions, store.closeAtSessionEnd, store.tradingStrategy]);
+      store.sessions, store.closeAtSessionEnd, store.tradingStrategy,
+      store.ollamaNumCtx]);
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");
@@ -344,6 +350,36 @@ export function SettingsView() {
                 />
               </div>
             ))}
+          </div>
+          {/* Ollama context window — prevents OOM on local AI */}
+          <div className="mt-3 p-2.5 rounded-md border border-border/60 bg-muted/20">
+            <Label className="text-[10px] text-muted-foreground">
+              Ollama Context Window (tokens)
+            </Label>
+            <div className="flex items-center gap-2 mt-1">
+              <Input
+                type="number"
+                min={1024}
+                max={131072}
+                step={1024}
+                value={store.ollamaNumCtx}
+                onChange={(e) => store.setOllamaNumCtx(parseInt(e.target.value) || 8192)}
+                onBlur={() => {
+                  fetch("/api/trading/ai/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ ollama_num_ctx: store.ollamaNumCtx }),
+                  }).then(() => {
+                    toast.success(`Ollama context set to ${store.ollamaNumCtx} tokens`);
+                  }).catch(() => {});
+                }}
+                className="h-8 text-xs font-mono w-28"
+              />
+              <span className="text-[10px] text-muted-foreground leading-tight">
+                Lower (4096) = less RAM, prevents OOM.<br />
+                Higher (16384) = more context, needs 32GB+ RAM.
+              </span>
+            </div>
           </div>
           <Button
             variant="default"

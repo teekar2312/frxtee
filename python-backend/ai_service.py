@@ -208,16 +208,54 @@ def _call_openrouter(symbol: str, user_msg: str) -> dict:
 
 # ---------- Local AI (Ollama) ----------
 def _call_ollama(symbol: str, user_msg: str) -> dict:
-    log.info("Ollama calling model: %s", settings.ollama_model)
+    """Call local Ollama server with bounded context window.
+
+    The `num_ctx` option caps the KV cache size — without it, Ollama's
+    newer defaults (128k+ tokens) can try to allocate 40GB+ of RAM and
+    crash with OOM on machines with limited memory. We also detect OOM
+    errors specifically so the cascade can cleanly fall through to the
+    next provider instead of retrying a doomed call.
+    """
+    if not settings.ollama_model:
+        raise RuntimeError("no ollama_model configured")
+    log.info("Ollama calling model: %s (num_ctx=%d)",
+             settings.ollama_model, settings.ollama_num_ctx)
     import ollama
     client = ollama.Client(host=settings.ollama_url)
-    resp = client.chat(
-        model=settings.ollama_model,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                  {"role": "user", "content": user_msg}],
-        format="json",
-        options={"temperature": 0.2},
-    )
+    try:
+        resp = client.chat(
+            model=settings.ollama_model,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": user_msg}],
+            format="json",
+            options={
+                "temperature": 0.2,
+                "num_ctx": settings.ollama_num_ctx,
+            },
+        )
+    except Exception as exc:
+        # Detect OOM / memory allocation failures and raise a clean
+        # RuntimeError so the cascade knows to skip to the next provider
+        # instead of retrying. Common signatures:
+        #   - "failed to allocate buffer"
+        #   - "out of memory"
+        #   - "failed to allocate CPU buffer"
+        #   - "failed to initialize the context"
+        msg = str(exc).lower()
+        if any(kw in msg for kw in (
+            "failed to allocate", "out of memory", "oom",
+            "failed to initialize the context", "kv cache",
+        )):
+            log.warning("⚠ Ollama OOM: model=%s needs more RAM than available "
+                        "(try a smaller model or lower OLLAMA_NUM_CTX, "
+                        "currently %d). Falling through to next provider.",
+                        settings.ollama_model, settings.ollama_num_ctx)
+            raise RuntimeError(
+                f"Ollama out of memory (model={settings.ollama_model}, "
+                f"num_ctx={settings.ollama_num_ctx}) — try a smaller model "
+                f"or reduce ollama_num_ctx in settings"
+            ) from exc
+        raise
     return _parse(resp["message"]["content"], symbol)
 
 
