@@ -1327,7 +1327,8 @@ async def api_export():
         output = _io.StringIO()
         writer = _csv.DictWriter(output, fieldnames=[
             "ticket", "symbol", "side", "volume", "open_price", "close_price",
-            "pnl", "pips", "open_time", "close_time", "comment", "source"
+            "pnl", "pips", "open_time", "close_time", "sl", "tp",
+            "comment", "source"
         ])
         writer.writeheader()
         for t in trades:
