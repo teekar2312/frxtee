@@ -182,17 +182,18 @@ async def economic_calendar() -> list[dict]:
 
 
 def _demo_calendar() -> list[dict]:
-    """Demo calendar WITH time field (required for near_high_impact_news)."""
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    return [
-        {"event": "US CPI (YoY)", "country": "US", "actual": None, "estimate": "3.4%",
-         "impact": "high", "time": (now + timedelta(hours=2)).isoformat()},
-        {"event": "Core CPI (MoM)", "country": "US", "actual": None, "estimate": "0.3%",
-         "impact": "high", "time": (now + timedelta(hours=2)).isoformat()},
-        {"event": "BoE Rate Decision", "country": "GB", "actual": None, "estimate": "5.25%",
-         "impact": "high", "time": (now + timedelta(hours=6)).isoformat()},
-    ]
+    """Return empty calendar in demo mode (no API key configured).
+
+    Previously returned fake high-impact events (US CPI, BoE Rate) with
+    timestamps 2-6 hours in the future. This caused near_high_impact_news()
+    to ALWAYS return True (blackout active), silently blocking ALL
+    auto-trade entries — even though the user saw "confidence > threshold"
+    and "inside session". With no real API key, we can't know if there's
+    actually a high-impact event, so the safe default is to NOT block
+    (return empty calendar). Users who want news filtering must set
+    FINNHUB_API_KEY for real calendar data.
+    """
+    return []
 
 
 # ---- currency → symbol mapping for sentiment ----

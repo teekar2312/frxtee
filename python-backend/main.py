@@ -513,6 +513,10 @@ async def _auto_trade_loop():
 
     Polls analysis for active pairs every 60s (cooldown). If signal is
     directional (BUY/SELL) with confidence >= threshold, places order.
+
+    Verbose logging at every decision point so users can see WHY a trade
+    was/wasn't executed (was previously silent — users saw "confidence
+    > threshold, inside session" but no trade and no explanation).
     """
     while True:
         try:
@@ -525,17 +529,26 @@ async def _auto_trade_loop():
             symbols_str = getattr(settings, "auto_trade_symbols", "")
             symbols = [s.strip() for s in symbols_str.split(",") if s.strip()] if symbols_str else []
             if not symbols:
+                log.info("auto-trade: ON but auto_trade_symbols is empty — "
+                         "select pairs in Trading view to enable execution")
                 await asyncio.sleep(30)
                 continue
 
             provider = getattr(settings, "ai_provider", "zai")
             min_confidence = getattr(settings, "auto_trade_min_confidence", 75)
+            log.info("auto-trade: ON — scanning %d symbol(s): %s (provider=%s, "
+                     "min_confidence=%d%%, strategy=%s)",
+                     len(symbols), symbols, provider, min_confidence,
+                     getattr(settings, "trading_strategy", "auto"))
 
             for symbol in symbols:
                 # cooldown check
                 now = time.time()
                 last = _last_signal_ts.get(symbol, 0)
                 if now - last < _SIGNAL_COOLDOWN_SEC:
+                    remaining = int(_SIGNAL_COOLDOWN_SEC - (now - last))
+                    log.debug("auto-trade %s: cooldown %ds remaining — skipping",
+                              symbol, remaining)
                     continue
 
                 # build context with indicators + sentiment (was empty — hallucinated)
@@ -569,7 +582,15 @@ async def _auto_trade_loop():
                 signal = result.get("signal", "NEUTRAL")
                 confidence = result.get("confidence", 0)
 
-                if signal == "NEUTRAL" or confidence < min_confidence:
+                log.info("auto-trade %s: signal=%s confidence=%d%% (threshold=%d%%)",
+                         symbol, signal, confidence, min_confidence)
+
+                if signal == "NEUTRAL":
+                    log.info("auto-trade %s: SKIP — signal is NEUTRAL", symbol)
+                    continue
+                if confidence < min_confidence:
+                    log.info("auto-trade %s: SKIP — confidence %d%% < threshold %d%%",
+                             symbol, confidence, min_confidence)
                     continue
 
                 # Strategy evaluation — override AI signal with strategy signal
@@ -617,9 +638,13 @@ async def _auto_trade_loop():
                     st = mt5_status()
                     if st.account:
                         equity = st.account.get("equity", 10000.0)
+                    log.info("auto-trade %s: risk check — equity=$%.2f, open_count=%d/%d, "
+                             "daily_loss=$%.2f/%.2f",
+                             symbol, equity, guard.open_count, settings.max_open_positions,
+                             guard.daily_loss, equity * settings.daily_risk_limit_pct / 100)
                     ok, msg = guard.can_open(equity)
                     if not ok:
-                        log.warning("auto-trade BLOCKED: %s", msg)
+                        log.warning("auto-trade %s: BLOCKED by risk guard — %s", symbol, msg)
                         continue
 
                     # CRITICAL: news filter — bypassed in previous version!
@@ -630,8 +655,11 @@ async def _auto_trade_loop():
                     if getattr(settings, "avoid_high_impact_news", True):
                         is_blackout, news_reason = near_high_impact_news(15)
                         if is_blackout:
-                            log.warning("auto-trade BLOCKED by news filter: %s", news_reason)
+                            log.warning("auto-trade %s: BLOCKED by news filter — %s",
+                                        symbol, news_reason)
                             continue
+                        log.info("auto-trade %s: news filter OK — no high-impact event within 15min",
+                                 symbol)
 
                     pip_value = await asyncio.to_thread(get_pip_value_per_lot, symbol)
                     # use strategy SL if provided, else global default
