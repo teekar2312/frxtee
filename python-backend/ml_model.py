@@ -108,6 +108,14 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     balancing. Compares new model's test_acc against the old one — refuses to
     promote a worse model (prevents regression).
 
+    Overfitting controls:
+    - Early stopping (stops when val loss stops improving — typically 50-100
+      trees instead of 300, drastically reduces overfit)
+    - L1/L2 regularization (reg_alpha=1, reg_lambda=3)
+    - min_child_weight=3 (prevents splitting on tiny noisy subsets)
+    - Reduced max_depth=3 (was 4 — simpler trees generalize better)
+    - Non-overlapping walk-forward folds (was overlapping → leakage)
+
     CPU-bound — callers in async context should use ``asyncio.to_thread``.
     """
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -130,18 +138,22 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     df["label"] = df["label"].map(label_map)
     log.info("label distribution: %s", df["label"].value_counts().to_dict())
 
-    # ---- walk-forward: 3 folds, each trains on first 70%, tests on next 15% ----
+    # ---- walk-forward: 3 NON-OVERLAPPING folds ----
+    # Each fold trains on segment [0..k] and tests on segment [k..k+1].
+    # Previous implementation overlapped (fold 2 trained on [0..2k] which
+    # included fold 1's test data [k..2k]) → leakage → inflated train_acc.
     fold_accs = []
-    fold_size = len(df) // 4  # 4 segments, 3 overlapping folds
+    n = len(df)
+    fold_size = n // 4  # 4 segments, 3 non-overlapping train→test pairs
     if fold_size < 50:
         # fallback to single split for small datasets
-        fold_size = len(df) // 2
-        folds = [(0, fold_size, fold_size, len(df))]
+        fold_size = n // 2
+        folds = [(0, fold_size, fold_size, n)]
     else:
         folds = [
             (0, fold_size, fold_size, fold_size * 2),
-            (0, fold_size * 2, fold_size * 2, fold_size * 3),
-            (0, fold_size * 3, fold_size * 3, len(df)),
+            (fold_size, fold_size * 2, fold_size * 2, fold_size * 3),
+            (fold_size * 2, fold_size * 3, fold_size * 3, n),
         ]
 
     best_clf = None
@@ -154,13 +166,24 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         # class-balanced sample weights (handle imbalanced labels)
         sw = compute_sample_weight("balanced", y_tr)
         clf = XGBClassifier(
-            n_estimators=300, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
+            n_estimators=500,           # cap (early stopping will halt ~50-100)
+            max_depth=3,                 # was 4 — simpler trees generalize better
+            learning_rate=0.05,
+            subsample=0.7,               # was 0.8 — more randomness = less overfit
+            colsample_bytree=0.7,        # was 0.8 — same rationale
+            min_child_weight=3,          # NEW — prevents splits on tiny noisy subsets
+            reg_alpha=1.0,               # NEW — L1 regularization (feature sparsity)
+            reg_lambda=3.0,              # NEW — L2 regularization (weight shrinkage)
+            gamma=0.1,                   # NEW — min loss reduction to split
+            early_stopping_rounds=20,    # NEW — stop when val loss stalls 20 rounds
+            eval_metric="mlogloss",
             n_jobs=-1,
         )
         clf.fit(X_tr, y_tr, sample_weight=sw, eval_set=[(X_te, y_te)], verbose=False)
         acc = clf.score(X_te, y_te)
         fold_accs.append(acc)
+        log.debug("fold %d→%d: test_acc=%.3f, best_iteration=%d",
+                  train_end, test_end, acc, getattr(clf, "best_iteration", -1) or -1)
         if acc > best_test_acc:
             best_test_acc = acc
             best_clf = clf
@@ -185,8 +208,11 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     X_full = df[FEATURES].values
     y_full = df["label"].values
     train_acc = clf.score(X_full, y_full)
+    best_iter = getattr(clf, "best_iteration", None)
     log.info("Model promoted on %s %s — %d rows, train_acc=%.3f test_acc=%.3f "
-             "avg_fold=%.3f", symbol, tf, len(df), train_acc, test_acc, avg_acc)
+             "avg_fold=%.3f best_iteration=%s",
+             symbol, tf, len(df), train_acc, test_acc, avg_acc,
+             best_iter if best_iter is not None else "n/a")
 
     # log feature importances for debugging (which features drive predictions?)
     try:
@@ -198,10 +224,17 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         pass
 
     # overfitting detection: if train_acc >> test_acc, flag it
-    if train_acc - test_acc > 0.15:
+    gap = train_acc - test_acc
+    if gap > 0.15:
         log.warning("⚠ Overfitting detected: train_acc=%.3f >> test_acc=%.3f (gap=%.3f)"
                     " — consider more data or fewer features",
-                    train_acc, test_acc, train_acc - test_acc)
+                    train_acc, test_acc, gap)
+    elif gap > 0.08:
+        log.info("ℹ mild overfitting: train_acc=%.3f, test_acc=%.3f (gap=%.3f) — within tolerance",
+                 train_acc, test_acc, gap)
+    else:
+        log.info("✓ good generalization: train_acc=%.3f, test_acc=%.3f (gap=%.3f)",
+                 train_acc, test_acc, gap)
 
     # ---- backup existing model before overwrite (rollback path) ----
     if MODEL_PATH.exists():

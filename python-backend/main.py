@@ -1461,18 +1461,26 @@ async def api_email_test(request: Request, _auth=Depends(require_token)):
 
 @app.post("/api/trading/ml/train")
 @limiter.limit("3/hour")
-async def api_ml_train(request: Request, symbol: str = "EURUSD"):
+async def api_ml_train(request: Request, symbol: str = "EURUSD",
+                       tf: str = "H1", count: int = 3000):
     """Train ML model. No auth required (safe operation).
     Returns immediately if MT5 not connected (can't fetch candle data).
+
+    Query params:
+      symbol — e.g. EURUSD, GBPUSD, XAUUSD (default EURUSD)
+      tf     — timeframe M5/M15/M30/H1/H4/D1 (default H1)
+      count  — number of candles to fetch (default 3000, max 10000)
+               More data = less overfitting but slower training
     """
     # check if MT5 is connected (needed for candle data)
     st = mt5_status()
     if not st.connected:
         return {"ok": False, "error": "MT5 not connected — cannot fetch training data",
                 "demo": True, "message": f"Connect MT5 first, then train {symbol}"}
+    count = max(200, min(count, 10000))  # clamp 200..10000
     try:
-        result = await asyncio.to_thread(ml_model.train, symbol)
-        return {"ok": True, "message": f"training complete on {symbol}"}
+        result = await asyncio.to_thread(ml_model.train, symbol, tf, count)
+        return {"ok": True, "message": f"training complete on {symbol} {tf} ({count} bars)"}
     except Exception as exc:  # noqa: BLE001
         log.error("ML train failed: %s", exc)
         return {"ok": False, "error": str(exc), "message": f"Training failed: {exc}"}
