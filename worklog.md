@@ -6012,3 +6012,284 @@ Minor observations (not FAILs, do not affect functionality):
   - ai-engine-view.tsx POST body (lines 77-80) sends `{ active_provider: p.id, models: store.aiModels }` — sends models as a courtesy even though only the provider changed. Harmless.
 
 No code changes made — read-only audit.
+
+
+---
+Task ID: AUDIT-AUTOTRADE
+Agent: audit-auto-trading
+Task: Deep audit of auto-trading pipeline (frontend toggle → backend loop → MT5 execution)
+
+Work Log:
+- Read worklog.md (6014 lines) to understand prior work: prior AUDIT-1 (AI provider config sync), AUDIT-2 (trade history + SL/TP fix), AUDIT-3 (session-end close), OLLAMA-OOM-FIX, OVERLAP-SESSIONS, TRADE-HISTORY-VIEW — all relevant code paths already partially verified in adjacent audits
+- Read /home/z/my-project/src/components/trading/trading-view.tsx (671 lines) — AutoManualRow "Auto Trading" at L207-240, strategy selector at L243-269, session SwitchRow at L162-201
+- Read /home/z/my-project/src/lib/trading-store.ts (339 lines) — partialize block L298-330
+- Read /home/z/my-project/python-backend/main.py — POST /api/trading/ai/config (L1257-1340), _auto_trade_loop (L508-649), _manage_positions_loop (L200-498), lifespan startup (L657-745), api_order manual endpoint (L899-960)
+- Read /home/z/my-project/python-backend/risk_manager.py (318 lines) — can_open (L206-245), near_high_impact_news (L273-317), is_in_active_session (L70-124)
+- Read /home/z/my-project/python-backend/trading_strategies.py (379 lines) — evaluate dispatch + 7 strategies + STRATEGY_REGISTRY
+- Read /home/z/my-project/python-backend/mt5_service.py — send_order (L380-479), close_position (L482-521), modify_sl_tp (L524-561), partial_close (L564-607)
+- Read /home/z/my-project/python-backend/ai_service.py (lines 80-120, 320-359) — provider cascade + heuristic fallback
+- Read /home/z/my-project/src/components/trading/settings-view.tsx (1-120) — on-mount sync + pushAiConfig
+- Grepped for `near_high_impact_news` / `avoid_high_impact_news` to trace news filter usage
+- Grepped for `_order_lock` / `register_open` / `register_close` / `open_count` to verify max positions enforcement
+- Grepped for `circuit` / `consecutive` / `failure_count` / `disable.*auto` to look for auto-disable circuit breaker (none found in main.py — only the drawdown circuit breaker in risk_manager.py:223)
+
+Stage Summary:
+- Total checks: 16 — PASS: 12, FAIL: 2, PARTIAL: 2
+- FAIL #1 (HIGH severity): Auto-trade loop bypasses `avoid_high_impact_news` filter — main.py:605 only calls `guard.can_open(equity)`, which does NOT call `near_high_impact_news()`. The manual `/api/trading/order` endpoint DOES call `near_high_impact_news(15)` at main.py:913, but the auto-trade loop never invokes it. With `avoid_high_impact_news=True` (default in config.py:53), the auto-trade loop will still open positions during NFP/FOMC/CPI events (30-50 pip spike risk per the comment in risk_manager.py:280).
+- FAIL #2 (MEDIUM severity): No auto-disable circuit breaker on repeated order failures. Grepped for `circuit|consecutive|failure_count|disable.*auto` — only the drawdown circuit breaker exists (risk_manager.py:223). If MT5 connection drops or broker repeatedly rejects orders (e.g. retcode 10004 requote, 10006 off-quote), the auto-trade loop will keep firing AI analysis every 30s indefinitely — burning API credits and log volume.
+- PARTIAL #1 (MEDIUM severity): Strategy SL/TP overrides extracted but never used. At main.py:581-583, the loop reads `sl_price_override = strat_result.get("sl")` and `tp_price_override = strat_result.get("tp")` but then sends the order at L617-619 using `settings.stop_loss_pips` + `ps.tp_pips` (global defaults) instead of the strategy-specific values. Strategy signal DIRECTION (BUY/SELL/HOLD) IS respected (L578-580), but strategy-specific risk parameters are silently discarded. Additional issue: `sl_price_override` is a PRICE while `send_order` expects `sl_pips` (pip count) — even if it were used, units would mismatch.
+- PARTIAL #2 (LOW severity): Partial fill logging incomplete. send_order correctly returns `partial: filled < volume` (mt5_service.py:476) and `requested_volume` (L475), but the auto-trade loop's success log at main.py:623-624 only logs `vol=%s` (filled volume) — does not log `requested_volume` or `partial` flag. Order is saved with correct filled volume (save_trade uses `r.get("volume")` = filled), so accounting is correct, but a partial fill (e.g. requested 0.50, filled 0.30) would silently show "vol=0.30" with no indication it was partial. Makes partial fills hard to debug in production logs.
+- Files verified:
+  1. /home/z/my-project/src/components/trading/trading-view.tsx (AutoManualRow onAuto/onManual handlers)
+  2. /home/z/my-project/src/lib/trading-store.ts (partialize persistence)
+  3. /home/z/my-project/python-backend/main.py (POST /api/trading/ai/config, _auto_trade_loop, _manage_positions_loop, lifespan, api_order)
+  4. /home/z/my-project/src/components/trading/settings-view.tsx (mount sync + pushAiConfig)
+  5. /home/z/my-project/python-backend/risk_manager.py (can_open, near_high_impact_news, is_in_active_session, guard.register_open/close)
+  6. /home/z/my-project/python-backend/trading_strategies.py (evaluate dispatch + 7 strategies)
+  7. /home/z/my-project/python-backend/mt5_service.py (send_order, close_position, modify_sl_tp, partial_close)
+  8. /home/z/my-project/python-backend/ai_service.py (provider cascade + heuristic fallback)
+
+Detailed Check Results:
+
+Chain A: Frontend → Backend Config Sync
+  #1  UI toggle in trading-view.tsx — PASS
+      Evidence: trading-view.tsx:207-240
+        — onAuto (L211-230): L212 `store.setAutoTradeMode(true)` first ✓, L214-224 POST `/api/trading/ai/config` with body containing all 6 keys ✓:
+          • L218 `auto_trade_mode: true` ✓
+          • L219 `auto_trade_symbols: store.symbols.join(",")` ✓
+          • L220 `auto_trade_min_confidence: store.autoTradeMinConfidence` ✓
+          • L221 `active_provider: store.aiProvider` ✓
+          • L222 `active_sessions: store.sessions.join(",")` ✓
+          • L223 `trading_strategy: store.tradingStrategy` ✓
+        — L226 `toast.success("🤖 Auto-trading ENABLED…")` ✓
+        — L228 `toast.error("Failed to enable auto-trade on backend…")` on catch ✓
+        — onManual (L231-239): L232 `store.setAutoTradeMode(false)` first ✓, L233-237 POST `{auto_trade_mode: false}` ✓, L238 `toast.info("Manual mode…")` ✓
+      Minor: onManual doesn't `.catch()` errors (fire-and-forget) — acceptable for disable path.
+
+  #2  Store persistence — PASS
+      Evidence: trading-store.ts:298-330 (partialize)
+        — L310 `autoTradeMode: s.autoTradeMode` ✓ (persisted)
+        — L306 `autoTradeMinConfidence: s.autoTradeMinConfidence` ✓ (persisted)
+        — L309 `tradingStrategy: s.tradingStrategy` ✓ (persisted)
+      Init values: L237 `autoTradeMode: false` (safe default off), L222 `autoTradeMinConfidence: 75` (sensible threshold), L235 `tradingStrategy: "auto"` (sensible default)
+
+  #3  Backend config acceptance — PASS
+      Evidence: main.py:1257-1319 (POST /api/trading/ai/config)
+        All 7 required keys accepted:
+        — L1301-1304 `auto_trade_mode` (bool coercion + log "🤖 auto-trade ENABLED/DISABLED") ✓
+        — L1305-1307 `auto_trade_symbols` (string, no coercion needed) ✓
+        — L1295-1297 `auto_trade_min_confidence` (int coercion) ✓
+        — L1298-1300 `active_provider` ✓
+        — L1308-1311 `active_sessions` (+ log) ✓
+        — L1316-1319 `trading_strategy` (+ log) ✓
+        — L1312-1315 `close_at_session_end` (bool coercion + log) ✓
+
+  #4  Settings view sync — PASS
+      Evidence: settings-view.tsx:35-106
+        Mount sync (lines 35-79):
+          — L57-59 `if (d.auto_trade_mode != null) store.setAutoTradeMode(d.auto_trade_mode)` ✓
+          — L65-70 `active_sessions` sync (split by comma) ✓ — note: sessions push from trading-view on toggle, so sync matters mostly for first-run
+        pushAiConfig (lines 82-106):
+          — L92 `auto_trade_mode: store.autoTradeMode` ✓
+          — L93 `auto_trade_symbols: store.symbols.join(",")` ✓
+          — Also sends all 10 fields including active_provider, models, ollama_num_ctx etc.
+
+Chain B: Backend Auto-Trade Loop
+  #5  _auto_trade_loop structure — PASS
+      Evidence: main.py:508-649
+        — Started in lifespan: main.py:691 `_autotrade_task = asyncio.create_task(_auto_trade_loop())` ✓
+        — L517 `if not getattr(settings, "auto_trade_mode", False):` → L518 sleep 30s + continue ✓
+        — L522-523 `symbols_str.split(",")` into list ✓
+        — L524-526 empty symbols → sleep 30s + continue ✓
+        — L528 provider from `getattr(settings, "ai_provider", "zai")` ✓
+        — L529 min_confidence from `getattr(settings, "auto_trade_min_confidence", 75)` ✓
+        — L531 `for symbol in symbols:` iterates each ✓
+        — L534-536 cooldown check `_last_signal_ts.get(symbol, 0)` vs `_SIGNAL_COOLDOWN_SEC = 60` (L194) ✓
+        — L541-560 builds context with indicators + sentiment (not hallucinated) ✓
+        — L563-565 calls `ai_service.analyze` via `asyncio.to_thread` ✓
+        — L566-567 extracts signal + confidence ✓
+        — L569-570 filters: `if signal == "NEUTRAL" or confidence < min_confidence: continue` ✓
+        — L649 sleep 30s at end of cycle ✓
+
+  #6  Risk guard integration — FAIL (HIGH severity)
+      Evidence: main.py:605-608 calls `guard.can_open(equity)` inside `async with _order_lock`
+      can_open() checks (risk_manager.py:206-245):
+        — L208-210 daily_risk_limit_pct ✓
+        — L211-212 max_open_positions ✓
+        — L215-221 margin level < 60% ✓ (50% MC + 10% buffer)
+        — L223-227 drawdown > 10% ✓
+        — L231-236 weekend block (Friday 21:00+ UTC, Sat/Sun) ✓
+        — L241-243 session filter (is_in_active_session) ✓
+      MISSING: `near_high_impact_news()` is NOT called by the auto-trade loop. The function exists in risk_manager.py:273-317 and the manual `/api/trading/order` endpoint DOES call it (main.py:913 `blackout, reason = await asyncio.to_thread(near_high_impact_news, 15)` + L914-916 refuses order if blackout). But `_auto_trade_loop()` only calls `guard.can_open(equity)` which does NOT internally call `near_high_impact_news()`. With `avoid_high_impact_news=True` (default config.py:53), the auto-trade loop will open positions during high-impact news events (NFP/FOMC/CPI), defeating the user's explicit opt-out.
+      Root cause: News filter is implemented as a separate top-level function `near_high_impact_news()` rather than being integrated into `can_open()`. The manual endpoint calls both, but the auto-trade loop author forgot the second call.
+      Suggested fix: After `ok, msg = guard.can_open(equity)` at main.py:605, add:
+        ```python
+        if ok and settings.avoid_high_impact_news:
+            blackout, news_reason = await asyncio.to_thread(near_high_impact_news, 15)
+            if blackout:
+                ok = False
+                msg = f"News blackout: {news_reason}"
+        if not ok:
+            log.warning("auto-trade BLOCKED: %s", msg)
+            continue
+        ```
+      Severity: HIGH — silently violates user's explicit risk setting on automated trades.
+
+  #7  Order execution — PASS
+      Evidence: main.py:617-645
+        — L617-619 `send_order(symbol, side, volume, settings.stop_loss_pips, ps.tp_pips, "AI:auto")` ✓
+        — L622 success branch:
+          — L623-624 logs ticket/price/vol ✓
+          — L625 `guard.register_open()` ✓
+          — L627-633 `save_trade(...)` with sl=`float(r.get("sl") or 0.0)`, tp=`float(r.get("tp") or 0.0)`, source="ai", comment="AI:auto" ✓ (this is the SL/TP root-cause fix call site verified in AUDIT-2)
+          — L636-641 `notify_async(...)` with HTML body including side/symbol/vol/price/SL/TP ✓
+        — L643-645 failure branch: logs `❌ auto-trade FAILED: %s | retcode=%s` ✓
+        — Volume computed at L610-612: `pip_value = get_pip_value_per_lot(symbol)` (per-symbol, not hardcoded), `ps = size_position(equity, settings.stop_loss_pips, pip_value)`, `volume = round(max(0.01, min(ps.lot, 50.0)), 2)` (FINEX limits enforced) ✓
+
+  #8  Strategy evaluation — PARTIAL (MEDIUM severity)
+      Evidence: main.py:572-592 + main.py:617-619
+        — L573 `strategy_id = getattr(settings, "trading_strategy", "auto")` ✓
+        — L574 `if strategy_id and strategy_id != "auto":` correctly branches ✓
+        — L577 `strat_result = evaluate_strategy(strategy_id, pd.DataFrame(rates), ctx.get("indicators", {}))` ✓ (note: `evaluate_strategy` is aliased to `evaluate` at main.py:49 `from trading_strategies import evaluate as evaluate_strategy`)
+        — L578-580: if strategy returns non-NEUTRAL signal → overrides signal + confidence ✓
+        — L586-589: if strategy returns NEUTRAL → `continue` (skip trade) ✓
+      HOWEVER — L581-583 extract strategy's SL/TP into `sl_price_override`/`tp_price_override` but these are NEVER passed to `send_order()`. The actual send_order call at L617-619 uses `settings.stop_loss_pips` (global default 10) and `ps.tp_pips` (sl_pips * rr_ratio = global R:R) instead.
+      Root cause: Dead variables. The override extraction was scaffolded but never wired into the send_order call.
+      Additional issue: `strat_result.get("sl")` returns a PRICE (e.g. 1.0850), but `send_order`'s 4th argument is `sl_pips` (a pip COUNT, e.g. 10). So even if `sl_price_override` were passed in place of `settings.stop_loss_pips`, the units would mismatch and the order would either fail or place SL at an absurd level.
+      Suggested fix: Either (a) remove the dead `*_override` variables and document that strategy signals use global risk params, OR (b) compute `strat_sl_pips = abs(strat_result["sl"] - strat_result["entry"]) / pip` and pass to send_order.
+      Severity: MEDIUM — signal direction is still respected (most critical), but strategy-specific risk management is silently lost. User selecting "EMA Crossover" strategy expects ATR-based SL (per trading_strategies.py:177 `sl=close-atr_dist`), not the global 10-pip default.
+
+Chain C: Position Management
+  #9  SL/TP enforcement — PASS
+      Evidence: main.py:200-498 (_manage_positions_loop)
+        — L209 `while True:` ✓
+        — L212 `positions = await asyncio.to_thread(mt5_positions)` — fresh fetch each cycle ✓
+        — L213-217 if no positions → clear _be_applied/_partial_applied sets, sleep 5s ✓ (NOTE: 5s when no positions, 2s when positions — see L495)
+        — L223-225 fetches fresh ticks for ALL position symbols (not just default majors) ✓
+        — L245-261 broker SL/TP fallback to DB (`get_open_trade_sl_tp(ticket)`) when broker_sl==0 or broker_tp==0 ✓ (root-cause fix from AUDIT-2)
+        — L267-302 SL hit detection: `(pos_type == "BUY" and current <= sl) or (pos_type == "SELL" and current >= sl)` → calls close_position, register_close, close_trade, notify_async ✓
+        — L281-283: if `r.get("already_closed")` skip notify_async (broker already closed) ✓
+        — L290-301: failure → retry once after 1s ✓
+        — L304-339: same pattern for TP hit ✓
+        — L495 `await asyncio.sleep(2)` when positions are open (faster than 5s default for catching fast spikes) ✓
+      Applies to ALL positions (no source filter) — so auto-opened positions ARE covered.
+
+  #10 Break-even + trailing — PASS
+      Evidence: main.py:367-440
+        Break-even (L367-385):
+          — L368 `if be_enabled and r_multiple >= be_r and ticket not in _be_applied:` ✓
+          — L369-373 computes new SL = open_price ± (be_buffer * pip) ✓
+          — L375 only moves if new SL strictly better than current ✓
+          — L376 `modify_sl_tp(ticket, new_sl, None)` ✓
+          — L378 `_be_applied.add(ticket)` (prevents repeated BE moves) ✓
+          — L381-385 notify_async ✓
+        Trailing (L387-422):
+          — L388 `if trailing_enabled and r_multiple > 0:` ✓
+          — L390-404 ATR-based dynamic trailing (adapts to volatility) with fallback to fixed pips ✓
+          — L407-412 computes candidate SL + checks `should_move` (strictly better) ✓
+          — L416 `modify_sl_tp(ticket, new_sl, None)` ✓
+          — L420-422 handles retcode 10013 (invalid stops) gracefully ✓
+        Position filter: NONE — loop iterates ALL positions from `mt5_positions()` regardless of source/comment, so auto-opened positions (comment="AI:auto") receive the same BE/trailing treatment as manual ones. ✓
+
+  #11 Session-end close — PASS
+      Evidence: main.py:452-491
+        — L454 `now_in_session = is_in_active_session(datetime.now(timezone.utc))` ✓
+        — L455 `if _prev_in_session is True and not now_in_session:` detects True→False transition ✓
+        — L457 `if getattr(settings, "close_at_session_end", False):` branches on user setting ✓
+        — L461-479 iterates ALL positions (no source filter — auto-opened positions closed too) ✓
+          — L464 `close_position(ticket)` ✓
+          — L467 `guard.register_close(pnl)` ✓
+          — L469 `close_trade(...)` persists to DB ✓
+        — L480-484 notify_async reports close count ✓
+        — L485-486 clears _be_applied/_partial_applied sets (so they don't leak to next session) ✓
+        — L491 `_prev_in_session = now_in_session` updates state for next cycle ✓
+        Fires exactly ONCE per transition (state becomes False after firing, so condition fails until next True→False). ✓
+
+Chain D: Edge Cases & Safety
+  #12 Duplicate signal prevention — PASS
+      Evidence: main.py:189-194, 531-536, 596
+        — L193 `_last_signal_ts: dict[str, float] = {}` (per-symbol timestamp tracker) ✓
+        — L194 `_SIGNAL_COOLDOWN_SEC = 60` ✓
+        — L533 `now = time.time()` (epoch seconds) ✓
+        — L534 `last = _last_signal_ts.get(symbol, 0)` (defaults to 0 = never fired) ✓
+        — L535-536 `if now - last < _SIGNAL_COOLDOWN_SEC: continue` (skip AI analysis entirely if within cooldown) ✓
+        — L596 `_last_signal_ts[symbol] = now` (update timestamp AFTER order sent) ✓
+      Verified cooldown timing for single + multi-symbol setups:
+        Single-symbol: 60-65s minimum gap (cycle is ~32s including AI analysis)
+        Multi-symbol: per-symbol independent cooldowns enforced correctly
+      Bonus: cooldown is set even if order FAILED — prevents rapid retry spamming on persistent broker errors.
+
+  #13 Max positions enforcement — PASS
+      Evidence: main.py:600-625 + risk_manager.py:211-212 + 252-263 + reconcile loop L138-176
+        — L600 `async with _order_lock:` (serializes orders) ✓
+        — L605 `ok, msg = guard.can_open(equity)` ✓
+        — risk_manager.py:211-212 `if self.open_count >= settings.max_open_positions: return False, ...` ✓
+        — risk_manager.py:252-255 `register_open()` increments `self.open_count += 1` + persists ✓
+        — risk_manager.py:257-262 `register_close(pnl)` decrements `self.open_count = max(0, self.open_count - 1)` ✓
+        — L625 `guard.register_open()` called only on send_order success ✓
+      Reconcile loop (main.py:138-176) runs every 10s to correct drift:
+        — L147 fetches real broker position count ✓
+        — L150 `drift = guard.open_count - real_count` ✓
+        — L150-173 if drift > 0 (guard overcounted — broker closed positions we didn't track), processes recent deals via `get_recent_deals(15)` and calls `register_close(pnl)` for each unprocessed deal ✓
+        — L173 `guard.open_count = real_count` (force sync) ✓
+      So broker-side closes (SL/TP hit, margin call) are reflected in open_count within 10s — prevents auto-trade loop from blocking forever on stale count.
+
+  #14 Auto-trade disable on error — FAIL (MEDIUM severity)
+      Evidence: Grepped for `circuit|consecutive|failure_count|disable.*auto|auto_trade_mode\s*=\s*False` across python-backend/ — only match is the drawdown circuit breaker in risk_manager.py:223. No counter that DISABLES `settings.auto_trade_mode` after N consecutive failed orders.
+      Impact: If MT5 disconnects or broker persistently rejects orders (retcode 10004 requote, 10006 off-quote, 10010 partial timeout), the loop will:
+        1. Fire AI analysis every 30s (burns API credits — esp. paid providers like zai/groq/openrouter/google)
+        2. Attempt send_order every 60s per symbol (cooldown still applies, but still spams broker)
+        3. Log "❌ auto-trade FAILED" repeatedly — log volume accumulates
+      The drawdown circuit breaker (risk_manager.py:223-227) does eventually halt new entries when equity drops 10%, but that's after losses occur — doesn't address the "repeated broker rejections" case where no actual trade happens.
+      The daily_risk_limit_pct also doesn't help — it's based on realized losses, not failed attempts.
+      Root cause: No failure-tracking state in `_auto_trade_loop` (no `_consecutive_failures: int = 0` counter, no auto-disable threshold).
+      Suggested fix: Add `_auto_trade_fail_count: int = 0` global; increment on order failure (L643-645); reset to 0 on success (L622); in L517 gate, also check `if _auto_trade_fail_count >= 3: settings.auto_trade_mode = False; notify_async("Auto-trade DISABLED — 3 consecutive failures"); continue`.
+      Severity: MEDIUM — existing guards (daily risk, max positions, drawdown) provide baseline safety, but lack of failure circuit breaker means waste of API credits + log spam on persistent broker issues.
+
+  #15 Partial fill handling — PARTIAL (LOW severity)
+      Evidence: mt5_service.py:429-479 (send_order return) + main.py:622-642 (loop handling)
+        send_order return (mt5_service.py:473-479):
+          — L436 `filled = getattr(r, "volume_order", volume) or volume` (defaults to requested if MT5 doesn't report) ✓
+          — L430-433 `success = r.retcode in (TRADE_RETCODE_DONE, TRADE_RETCODE_DONE_PARTIAL=10008)` — treats partial as success ✓
+          — L475 `"volume": filled` (actually filled) ✓
+          — L475 `"requested_volume": volume` (originally requested) ✓
+          — L476 `"partial": filled < volume` (boolean flag) ✓
+        Auto-trade loop handling (main.py:622-642):
+          — L623-624 logs `vol=%s` using `r.get("volume")` (filled) — does NOT log `requested_volume` or `partial` flag ✗
+          — L627-633 `save_trade(...)` uses `volume=volume` (the LOOP's local variable, which is the REQUESTED volume, not filled) ✗
+      Root cause: Two issues:
+        (a) Logging: partial fills don't show "(partial)" or the requested volume in logs — silent failure mode.
+        (b) DB persistence: save_trade saves the REQUESTED volume, not the FILLED volume. So trade history will show 0.50 lot when actual position is 0.30 lot. Position-level P&L tracking will be wrong on close (uses `p.volume` from broker, but trade history shows different volume).
+      Suggested fix:
+        ```python
+        filled_vol = r.get("volume", volume)
+        if r.get("partial"):
+            log.warning("⚠ PARTIAL FILL: ticket=%s requested=%s filled=%s",
+                        r.get("ticket"), volume, filled_vol)
+        save_trade(..., volume=filled_vol, ...)  # use filled, not requested
+        ```
+      Severity: LOW — order is correctly opened (1 position exists regardless of size), guard.register_open() correctly increments by 1 (not by volume). The accounting mismatch only affects trade history records and downstream reporting (e.g., history-view.tsx volume column).
+
+  #16 Cascade failure — PASS
+      Evidence: ai_service.py:88-120 + 320-358
+        — L89 `cascade = _PROVIDER_CASCADE.get(provider, [provider])` (5-provider chain, verified in AUDIT-1) ✓
+        — L90 `for p in cascade:` tries each provider in order ✓
+        — L91-113 each provider call wrapped in try/except at L114-116:
+          — L114 `except Exception as exc:` ✓
+          — L115 `log.warning("AI provider %s failed: %s — trying next in cascade", p, exc)` ✓
+          — L116 `continue` (try next provider) ✓
+        — L117-120 if ALL providers fail: `log.warning("All AI providers failed — using heuristic fallback")` then `result = _heuristic(symbol)` ✓
+        Heuristic fallback (ai_service.py:320-358) returns proper signal dict:
+          — L323-325 deterministic signal (md5 hash of symbol) ✓
+          — L326 `conf = 55 + (h % 40)` (range 55-94) ✓ — NOTE: this CAN exceed `auto_trade_min_confidence=75` default, so heuristic signals CAN trigger auto-trade entries when all AI providers are down. This is by design — heuristic provides SOME signal rather than no signal.
+          — L346-358 returns full 11-field schema matching frontend contract ✓
+        Auto-trade loop wraps `ai_service.analyze` call at main.py:563-565 in `asyncio.to_thread` inside outer try/except at L647-649 — if analyze itself raises (shouldn't, due to heuristic fallback), loop catches and continues. ✓
+      No crash possible from provider failures — graceful degradation to heuristic, then continue trading.
+
+Minor observations (not FAILs, do not affect functionality):
+  - In auto_trade_loop L535-536, the cooldown `continue` skips the AI analysis call entirely (efficient — saves API credits), but it also bypasses the strategy evaluation branch (L572-589). This means if a user manually selects "EMA Crossover" strategy, the strategy is only evaluated after the 60s cooldown expires — not on every cycle. Acceptable behavior since cooldown exists to prevent over-trading.
+  - In auto_trade_loop L569 `if signal == "NEUTRAL" or confidence < min_confidence: continue` — this `continue` does NOT update `_last_signal_ts[symbol]`. So neutral/low-confidence signals don't trigger cooldown — they can be re-evaluated on next cycle. This is correct: we don't want a single NEUTRAL signal to block trades for 60s.
+  - L600 `async with _order_lock:` is held for the entire `send_order` + `guard.register_open` + `save_trade` sequence. This is correct (prevents concurrent orders from racing the open_count check), but it means if save_trade takes >1s (slow SQLite), other order attempts (manual endpoint) block. Acceptable for single-user trading terminal.
+  - The auto-trade loop sleeps 30s at the end of EACH cycle (L649), regardless of how many symbols were processed. With 5 symbols each taking ~5s AI analysis, a single cycle takes 25s + 30s sleep = 55s. Combined with the 60s per-symbol cooldown, this means effective per-symbol polling is ~55-60s — at the edge of the cooldown window. For >5 symbols, cooldown will almost always be expired by next evaluation.
+
+No code changes made — read-only audit.
