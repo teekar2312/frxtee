@@ -693,7 +693,31 @@ async def lifespan(app: FastAPI):
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         scheduler = AsyncIOScheduler()
-        scheduler.add_job(ml_model.train, "cron", hour=2, minute=0)
+
+        def _nightly_retrain_all():
+            """Retrain ML models for ALL symbols that already have a model file.
+
+            Previously only retrained EURUSD (default arg) — other symbols'
+            models went stale. Now scans models/ dir and retrains each.
+            Runs in a thread to avoid blocking the scheduler.
+            """
+            import threading
+            syms = ml_model._all_model_symbols()
+            if not syms:
+                log.info("nightly retrain: no models to retrain yet")
+                return
+            log.info("nightly retrain: %d symbol(s): %s", len(syms), syms)
+
+            def _do_train():
+                for sym in syms:
+                    try:
+                        ml_model.train(sym)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("nightly retrain %s failed: %s", sym, exc)
+
+            threading.Thread(target=_do_train, daemon=True).start()
+
+        scheduler.add_job(_nightly_retrain_all, "cron", hour=2, minute=0)
         scheduler.start()
         app.state.scheduler = scheduler
     except Exception as exc:  # noqa: BLE001
@@ -1173,9 +1197,15 @@ async def api_analysis_batch(symbols: str, provider: str = "zai"):
 
 
 @app.get("/api/trading/ml/info")
-async def api_ml_info():
-    """Return real model metadata for the ML panel UI."""
-    return ml_model.model_info()
+async def api_ml_info(symbol: str | None = None):
+    """Return real model metadata for the ML panel UI.
+
+    Query params:
+      symbol — if given, returns info for that symbol's model only.
+               If omitted, returns aggregated info with a 'models' dict
+               containing per-symbol breakdowns.
+    """
+    return ml_model.model_info(symbol)
 
 
 @app.get("/api/trading/ai/config")
