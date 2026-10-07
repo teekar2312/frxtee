@@ -136,6 +136,13 @@ export function TradingView() {
                 onAuto={() => {
                   store.setAutoSession(true);
                   store.setAutoSessions();
+                  // Push all-sessions selection to backend
+                  const all = TRADING_SESSIONS.map((s) => s.id).join(",");
+                  fetch("/api/trading/ai/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ active_sessions: all }),
+                  }).catch(() => {});
                   toast.success("AI selected all sessions");
                 }}
                 onManual={() => store.setAutoSession(false)}
@@ -147,7 +154,20 @@ export function TradingView() {
               <Chip
                 key={s.id}
                 active={sessions.includes(s.id)}
-                onClick={() => store.toggleSession(s.id)}
+                onClick={() => {
+                  store.toggleSession(s.id);
+                  // Push session change to backend immediately so
+                  // settings-view on-mount sync doesn't overwrite it
+                  // with stale backend values.
+                  const updated = store.sessions.includes(s.id)
+                    ? store.sessions.filter((x: string) => x !== s.id)
+                    : [...store.sessions, s.id];
+                  fetch("/api/trading/ai/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ active_sessions: updated.join(",") }),
+                  }).catch(() => {});
+                }}
                 title={`${s.tz} · UTC ${s.utcStart}:00–${s.utcEnd}:00`}
               >
                 <span

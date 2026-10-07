@@ -57,7 +57,11 @@ export function SettingsView() {
         if (d.auto_trade_mode != null) {
           store.setAutoTradeMode(d.auto_trade_mode);
         }
-        // sync sessions + strategy from backend
+        // sync sessions + strategy from backend.
+        // NOTE: sessions are now pushed to backend immediately when toggled
+        // in trading-view.tsx, so this sync is effectively a no-op in
+        // practice (frontend already matches backend). It only matters
+        // for first-run (no localStorage) or cross-device sync.
         if (d.active_sessions != null) {
           const sessions = d.active_sessions.split(",").filter((s: string) => s.trim());
           if (sessions.length > 0) {
