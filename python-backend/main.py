@@ -192,6 +192,9 @@ _partial_applied: set[int] = set()
 # track last signal time per symbol for cooldown
 _last_signal_ts: dict[str, float] = {}
 _SIGNAL_COOLDOWN_SEC = 60  # min 60s between AI signals for same symbol
+# ---- auto-trade circuit breaker (consecutive failure auto-disable) ----
+_auto_trade_fail_count: int = 0
+_AUTO_TRADE_MAX_FAILS = 3  # auto-disable after 3 consecutive failures
 # track previous in-session state for session-end close detection
 # (None = not yet initialized; True/False = last cycle's session status)
 _prev_in_session: bool | None = None
@@ -571,6 +574,8 @@ async def _auto_trade_loop():
 
                 # Strategy evaluation — override AI signal with strategy signal
                 strategy_id = getattr(settings, "trading_strategy", "auto")
+                sl_pips_override = None
+                tp_pips_override = None
                 if strategy_id and strategy_id != "auto":
                     # Manual strategy selected — use strategy signal instead of AI
                     import pandas as pd
@@ -578,18 +583,28 @@ async def _auto_trade_loop():
                     if strat_result.get("signal") != "NEUTRAL":
                         signal = strat_result["signal"]
                         confidence = strat_result.get("confidence", confidence)
-                        sl_pips_override = None
-                        tp_price_override = strat_result.get("tp")
-                        sl_price_override = strat_result.get("sl")
-                        log.info("strategy %s: %s conf=%s%% (%s)",
-                                 strategy_id, signal, confidence, strat_result.get("reason", ""))
+                        # Strategy returns SL/TP as PRICE LEVELS — convert to pips
+                        # so we can pass them to send_order(sl_pips, tp_pips).
+                        # This fixes the dead-code bug where overrides were extracted
+                        # but never used.
+                        entry_price = strat_result.get("entry") or ctx.get("current_price")
+                        strat_sl = strat_result.get("sl")
+                        strat_tp = strat_result.get("tp")
+                        if entry_price and strat_sl and strat_tp:
+                            from mt5_service import _pip_for_digits, _get_symbol_info
+                            info = _get_symbol_info(symbol)
+                            pip = _pip_for_digits(info.digits) if info else 0.0001
+                            sl_pips_override = abs(entry_price - strat_sl) / pip if pip > 0 else None
+                            tp_pips_override = abs(strat_tp - entry_price) / pip if pip > 0 else None
+                        log.info("strategy %s: %s conf=%s%% sl=%sp tp=%sp (%s)",
+                                 strategy_id, signal, confidence,
+                                 round(sl_pips_override, 1) if sl_pips_override else "default",
+                                 round(tp_pips_override, 1) if tp_pips_override else "default",
+                                 strat_result.get("reason", ""))
                     else:
                         log.info("strategy %s: NEUTRAL (%s) — skipping",
                                  strategy_id, strat_result.get("reason", ""))
                         continue
-                else:
-                    sl_price_override = None
-                    tp_price_override = None
 
                 # execute signal
                 side = "BUY" if "BUY" in signal else "SELL"
@@ -607,26 +622,49 @@ async def _auto_trade_loop():
                         log.warning("auto-trade BLOCKED: %s", msg)
                         continue
 
+                    # CRITICAL: news filter — bypassed in previous version!
+                    # near_high_impact_news() checks both pre-event (next 15min)
+                    # and post-event (last 15min) blackout windows. Without this,
+                    # auto-trade opens positions during NFP/FOMC/CPI → 30-50 pip
+                    # spike risk. Respect user's avoid_high_impact_news setting.
+                    if getattr(settings, "avoid_high_impact_news", True):
+                        is_blackout, news_reason = near_high_impact_news(15)
+                        if is_blackout:
+                            log.warning("auto-trade BLOCKED by news filter: %s", news_reason)
+                            continue
+
                     pip_value = await asyncio.to_thread(get_pip_value_per_lot, symbol)
-                    ps = size_position(equity, settings.stop_loss_pips, pip_value)
+                    # use strategy SL if provided, else global default
+                    eff_sl_pips = sl_pips_override if sl_pips_override else settings.stop_loss_pips
+                    ps = size_position(equity, eff_sl_pips, pip_value)
                     volume = round(max(0.01, min(ps.lot, 50.0)), 2)
+                    # use strategy TP if provided, else size_position's TP
+                    eff_tp_pips = tp_pips_override if tp_pips_override else ps.tp_pips
 
                     log.info("auto-trade: sending order %s %s %s lot sl=%dp tp=%.1fp",
-                             side, symbol, volume, settings.stop_loss_pips, ps.tp_pips)
+                             side, symbol, volume, eff_sl_pips, eff_tp_pips)
 
                     r = await asyncio.to_thread(
                         send_order, symbol, side, volume,
-                        settings.stop_loss_pips, ps.tp_pips, "AI:auto"
+                        eff_sl_pips, eff_tp_pips, "AI:auto"
                     )
 
                     if r.get("ok"):
+                        # reset failure counter on success
+                        global _auto_trade_fail_count
+                        _auto_trade_fail_count = 0
+                        # use FILLED volume (may differ from requested on partial fill)
+                        filled_volume = float(r.get("volume", volume))
+                        if filled_volume != volume:
+                            log.info("auto-trade partial fill: requested=%s filled=%s",
+                                     volume, filled_volume)
                         log.info("✅ auto-trade SUCCESS: ticket=%s price=%s vol=%s",
-                                 r.get("ticket"), r.get("price"), r.get("volume"))
+                                 r.get("ticket"), r.get("price"), filled_volume)
                         guard.register_open()
                         try:
                             save_trade(
                                 ticket=r.get("ticket", 0), symbol=symbol, side=side,
-                                volume=volume, open_price=r.get("price", 0),
+                                volume=filled_volume, open_price=r.get("price", 0),
                                 comment="AI:auto", source="ai",
                                 sl=float(r.get("sl") or 0.0),
                                 tp=float(r.get("tp") or 0.0),
@@ -636,13 +674,29 @@ async def _auto_trade_loop():
                         notify_async(
                             f"🤖 Auto-trade: {side} {symbol}",
                             f"<p>AI signal {signal} ({confidence}% confidence)</p>"
-                            f"<p>{side} {symbol} {volume} lot @ {r.get('price')}</p>"
-                            f"<p>SL {settings.stop_loss_pips}p · TP {ps.tp_pips:.1f}p</p>",
+                            f"<p>{side} {symbol} {filled_volume} lot @ {r.get('price')}</p>"
+                            f"<p>SL {eff_sl_pips}p · TP {eff_tp_pips:.1f}p</p>",
                         )
                         log.info("auto-trade executed: ticket=%s", r.get("ticket"))
                     else:
-                        log.error("❌ auto-trade FAILED: %s | retcode=%s",
+                        # circuit breaker: auto-disable after N consecutive failures
+                        _auto_trade_fail_count += 1
+                        log.error("❌ auto-trade FAILED (%d/%d): %s | retcode=%s",
+                                  _auto_trade_fail_count, _AUTO_TRADE_MAX_FAILS,
                                   r.get("error"), r.get("retcode"))
+                        if _auto_trade_fail_count >= _AUTO_TRADE_MAX_FAILS:
+                            log.error("🚨 auto-trade CIRCUIT BREAKER: %d consecutive failures — "
+                                      "disabling auto_trade_mode", _auto_trade_fail_count)
+                            settings.auto_trade_mode = False
+                            notify_async(
+                                "🚨 Auto-trade DISABLED — circuit breaker triggered",
+                                f"<p>Auto-trade was disabled after {_auto_trade_fail_count} "
+                                f"consecutive order failures.</p>"
+                                f"<p>Last error: {r.get('error', 'unknown')}</p>"
+                                f"<p>Check MT5 connection / broker errors, then re-enable "
+                                f"auto-trade in the dashboard.</p>",
+                            )
+                            _auto_trade_fail_count = 0  # reset for next enable
 
         except Exception as exc:  # noqa: BLE001
             log.debug("auto-trade loop: %s", exc)
