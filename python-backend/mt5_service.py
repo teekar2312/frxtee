@@ -315,12 +315,28 @@ def positions() -> list[dict]:
     pos = mt5.positions_get() or []  # type: ignore
     out = []
     for p in pos:
+        info = _get_symbol_info(p.symbol)  # cached
+        pip = _pip_for_digits(info.digits) if info else 0.0001
+        pos_type = "BUY" if p.type == 0 else "SELL"
+        # compute actual floating pips (was hardcoded 0.0 — user couldn't
+        # see how far price moved from entry or how close to SL/TP)
+        if pos_type == "BUY":
+            floating_pips = (p.price_current - p.price_open) / pip
+        else:
+            floating_pips = (p.price_open - p.price_current) / pip
+        # SL/TP distance from entry in pips — lets user verify TP follows
+        # their configured risk-reward ratio (e.g. SL=10p, TP=15p = 1:1.5)
+        sl_pips = abs(p.sl - p.price_open) / pip if p.sl else 0.0
+        tp_pips = abs(p.tp - p.price_open) / pip if p.tp else 0.0
         out.append({
             "ticket": p.ticket, "symbol": p.symbol,
-            "type": "BUY" if p.type == 0 else "SELL",
+            "type": pos_type,
             "volume": p.volume, "openPrice": p.price_open,
             "currentPrice": p.price_current, "sl": p.sl, "tp": p.tp,
-            "profit": p.profit, "pips": 0.0,
+            "profit": p.profit,
+            "pips": round(floating_pips, 1),
+            "slPips": round(sl_pips, 1),
+            "tpPips": round(tp_pips, 1),
             "openTime": str(p.time), "comment": p.comment,
         })
     return out

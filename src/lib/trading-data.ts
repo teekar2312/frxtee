@@ -230,6 +230,8 @@ export interface Position {
   tp: number | null;
   profit: number;
   pips: number;
+  slPips?: number;
+  tpPips?: number;
   openTime: string;
   comment: string;
 }

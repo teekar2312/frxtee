@@ -611,10 +611,28 @@ function PositionsCard() {
                     {fmtPrice(p.openPrice, p.symbol.includes("JPY") ? 3 : 5)}
                   </td>
                   <td className="px-2 py-1.5 text-right text-danger">
-                    {p.sl ? fmtPrice(p.sl, p.symbol.includes("JPY") ? 3 : 5) : "—"}
+                    {p.sl ? (
+                      <span>
+                        {fmtPrice(p.sl, p.symbol.includes("JPY") ? 3 : 5)}
+                        {p.slPips != null && (
+                          <span className="text-[9px] text-muted-foreground ml-1">
+                            ({p.slPips.toFixed(0)}p)
+                          </span>
+                        )}
+                      </span>
+                    ) : "—"}
                   </td>
                   <td className="px-2 py-1.5 text-right text-success">
-                    {p.tp ? fmtPrice(p.tp, p.symbol.includes("JPY") ? 3 : 5) : "—"}
+                    {p.tp ? (
+                      <span>
+                        {fmtPrice(p.tp, p.symbol.includes("JPY") ? 3 : 5)}
+                        {p.tpPips != null && (
+                          <span className="text-[9px] text-muted-foreground ml-1">
+                            ({p.tpPips.toFixed(0)}p)
+                          </span>
+                        )}
+                      </span>
+                    ) : "—"}
                   </td>
                   <td className={cn("px-2 py-1.5 text-right", p.pips >= 0 ? "text-success" : "text-danger")}>
                     {p.pips >= 0 ? "+" : ""}
