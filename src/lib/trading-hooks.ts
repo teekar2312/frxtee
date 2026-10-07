@@ -13,6 +13,7 @@ import {
   type Timeframe,
   type Trade,
 } from "@/lib/trading-data";
+import { useTradingStore } from "@/lib/trading-store";
 
 async function j<T>(u: string, signal?: AbortSignal): Promise<T> {
   const r = await fetch(u, { cache: "no-store", signal });
@@ -21,9 +22,15 @@ async function j<T>(u: string, signal?: AbortSignal): Promise<T> {
 }
 
 export function useTicks(enabled = true) {
+  // Fetch ticks for ALL active symbols (from store), not just the 4 default
+  // majors. Previously this called /api/trading/ticks with no symbols param,
+  // so the backend only returned EURUSD/GBPUSD/USDJPY/XAUUSD — other pairs
+  // (USDCHF, AUDUSD, etc.) had no realtime price in the header ticker.
+  const symbols = useTradingStore((s) => s.symbols);
+  const symbolsParam = symbols.length > 0 ? `?symbols=${symbols.join(",")}` : "";
   return useQuery<{ ticks: PriceTick[]; demo: boolean }>({
-    queryKey: ["ticks"],
-    queryFn: () => j("/api/trading/ticks"),
+    queryKey: ["ticks", symbols.join(",")],
+    queryFn: () => j(`/api/trading/ticks${symbolsParam}`),
     refetchInterval: enabled ? 2500 : false,
     staleTime: 0,
   });

@@ -123,7 +123,16 @@ async def _alert_loop():
     """Background task: poll ticks & check price alerts every 5s."""
     while True:
         try:
-            t = await asyncio.to_thread(mt5_ticks)
+            # Fetch ticks for all symbols that have alerts (not just the
+            # 4 default majors) so alerts on USDCHF/AUDUSD/etc. actually
+            # trigger. Fall back to defaults if no alerts configured.
+            from db import get_alerts
+            try:
+                alerts = get_alerts(active_only=True)
+                alert_syms = list({a["symbol"] for a in alerts if a.get("symbol")})
+            except Exception:  # noqa: BLE001
+                alert_syms = []
+            t = await asyncio.to_thread(mt5_ticks, alert_syms if alert_syms else None)
             if t:
                 await asyncio.to_thread(check_alerts, t)
         except Exception as exc:  # noqa: BLE001
@@ -878,6 +887,7 @@ class OrderReq(BaseModel):
     side: str = Field(..., pattern="^(BUY|SELL)$")
     volume: float | None = None  # optional; if omitted, AI sizes via risk%
     slPips: int = Field(default=10, ge=1, le=200)
+    tpPips: float | None = None  # NEW — frontend-computed TP (slPips * rrRatio)
     comment: str = Field(default="AI:auto", max_length=31)
 
 
@@ -1010,9 +1020,19 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
         volume = body.volume if body.volume is not None else ps.lot
         volume = round(max(0.01, min(volume, 50.0)), 2)  # FINEX: 0.01–50 lot
 
+        # Use frontend-computed TP if provided (respects UI rr_ratio slider),
+        # else fall back to backend's ps.tp_pips (from settings.rr_ratio).
+        # This fixes the bug where TP didn't match the user's configured
+        # risk-reward ratio shown in the Order Ticket UI.
+        eff_tp_pips = body.tpPips if body.tpPips is not None and body.tpPips > 0 else ps.tp_pips
+        log.info("order: %s %s %s lot sl=%dp tp=%.1fp (rr=%.2f, from=%s)",
+                 body.side, body.symbol, volume, body.slPips, eff_tp_pips,
+                 eff_tp_pips / body.slPips if body.slPips > 0 else 0,
+                 "frontend" if body.tpPips is not None else "backend-default")
+
         r = await asyncio.to_thread(
             send_order, body.symbol, body.side, volume,
-            body.slPips, ps.tp_pips, body.comment,
+            body.slPips, eff_tp_pips, body.comment,
         )
         if r.get("ok"):
             guard.register_open()

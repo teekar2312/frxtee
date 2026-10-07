@@ -382,6 +382,7 @@ function OrderTicket() {
           side,
           volume,
           slPips,
+          tpPips,  // NEW — send computed TP so backend respects UI rr_ratio
           comment: autoTrade ? "AI:auto" : "manual",
         }),
       });
