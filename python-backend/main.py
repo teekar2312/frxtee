@@ -1177,6 +1177,12 @@ async def api_analysis_batch(symbols: str, provider: str = "zai"):
             if ml_pred:
                 ai_result["ml_prediction"] = ml_pred
             return sym, ai_result
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # Graceful shutdown — Ctrl+C during in-flight AI request.
+            # Don't log a scary traceback; just return None so the partial
+            # batch completes cleanly instead of crashing the server.
+            log.info("batch analyze %s cancelled (server shutting down)", sym)
+            return sym, None
         except Exception as exc:  # noqa: BLE001
             log.debug("batch analyze %s failed: %s", sym, exc)
             return sym, None
@@ -1187,11 +1193,19 @@ async def api_analysis_batch(symbols: str, provider: str = "zai"):
             if rates:
                 import pandas as pd
                 return await asyncio.to_thread(ml_model.predict, pd.DataFrame(rates), sym)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            return None
         except Exception:  # noqa: BLE001
             pass
         return None
 
-    pairs = await asyncio.gather(*[_analyze_one(s) for s in sym_list])
+    try:
+        pairs = await asyncio.gather(*[_analyze_one(s) for s in sym_list])
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Server shutting down mid-batch — return partial results gracefully
+        log.info("batch analysis cancelled (server shutting down) — returning partial")
+        return {"results": {}, "provider": provider, "demo": False,
+                "cancelled": True}
     results = dict(pairs)
     return {"results": results, "provider": provider, "demo": False}
 
@@ -1519,4 +1533,7 @@ async def api_ml_train(request: Request, symbol: str = "EURUSD",
 if __name__ == "__main__":
     import uvicorn
     # bind 127.0.0.1 by default for safety; override via HOST env for remote access
+    # Note: when running via `python -m uvicorn main:app` (recommended for dev),
+    # uvicorn handles Ctrl+C itself. The CancelledError catch in the batch
+    # analysis endpoint prevents the scary traceback during shutdown.
     uvicorn.run("main:app", host=settings.host, port=settings.port, reload=False)
