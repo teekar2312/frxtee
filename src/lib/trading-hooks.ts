@@ -12,6 +12,7 @@ import {
   type PriceTick,
   type Timeframe,
   type Trade,
+  TRADING_PAIRS,
 } from "@/lib/trading-data";
 import { useTradingStore } from "@/lib/trading-store";
 
@@ -31,6 +32,22 @@ export function useTicks(enabled = true) {
   return useQuery<{ ticks: PriceTick[]; demo: boolean }>({
     queryKey: ["ticks", symbols.join(",")],
     queryFn: () => j(`/api/trading/ticks${symbolsParam}`),
+    refetchInterval: enabled ? 2500 : false,
+    staleTime: 0,
+  });
+}
+
+/**
+ * Fetch ticks for ALL 14 TRADING_PAIRS — used by the header ticker tape
+ * so every pair shows realtime price regardless of which symbols the user
+ * selected in Trading view. Independent from useTicks() (which follows
+ * store.symbols for order ticket / analysis).
+ */
+export function useAllTicks(enabled = true) {
+  const allSymbols = TRADING_PAIRS.map((p) => p.symbol).join(",");
+  return useQuery<{ ticks: PriceTick[]; demo: boolean }>({
+    queryKey: ["ticks-all"],
+    queryFn: () => j(`/api/trading/ticks?symbols=${allSymbols}`),
     refetchInterval: enabled ? 2500 : false,
     staleTime: 0,
   });

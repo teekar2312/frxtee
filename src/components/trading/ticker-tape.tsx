@@ -3,10 +3,13 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import { TRADING_PAIRS, fmtPrice, type PriceTick } from "@/lib/trading-data";
-import { useTicks } from "@/lib/trading-hooks";
+import { useAllTicks } from "@/lib/trading-hooks";
 
 export function TickerTape() {
-  const { data } = useTicks(true);
+  // Fetch ticks for ALL 14 TRADING_PAIRS (not just store.symbols) so the
+  // header always shows realtime prices for every pair, regardless of
+  // which symbols the user selected in Trading view.
+  const { data } = useAllTicks(true);
   const ticks = data?.ticks ?? [];
   return (
     <div className="border-b bg-card/50 overflow-hidden">
