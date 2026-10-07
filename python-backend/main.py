@@ -581,9 +581,16 @@ async def _auto_trade_loop():
                 )
                 signal = result.get("signal", "NEUTRAL")
                 confidence = result.get("confidence", 0)
+                model_used = result.get("model", "unknown")
 
-                log.info("auto-trade %s: signal=%s confidence=%d%% (threshold=%d%%)",
-                         symbol, signal, confidence, min_confidence)
+                log.info("auto-trade %s: signal=%s confidence=%d%% (threshold=%d%%) model=%s",
+                         symbol, signal, confidence, min_confidence, model_used)
+
+                if model_used == "heuristic":
+                    log.info("auto-trade %s: SKIP — AI failed, using heuristic (NEUTRAL). "
+                             "Check Ollama is running + model downloaded, or set cloud API keys.",
+                             symbol)
+                    continue
 
                 if signal == "NEUTRAL":
                     log.info("auto-trade %s: SKIP — signal is NEUTRAL", symbol)

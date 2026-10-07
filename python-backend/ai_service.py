@@ -107,6 +107,7 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
                 return result
             if p == "local":
                 if not settings.ollama_model:
+                    log.info("provider 'local' skipped — no ollama_model configured")
                     continue  # skip if model name is empty (not configured)
                 result = _call_ollama(symbol, user_msg)
                 result["model"] = settings.ollama_model
@@ -114,7 +115,9 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
         except Exception as exc:
             log.warning("AI provider %s failed: %s — trying next in cascade", p, exc)
             continue
-    log.warning("All AI providers failed — using heuristic fallback")
+    log.warning("All AI providers failed — using heuristic fallback (NEUTRAL signal, "
+                "no auto-trade will trigger). Check: 1) Ollama running? 2) Model "
+                "downloaded? 3) API keys set for cloud providers?")
     result = _heuristic(symbol)
     result["model"] = "heuristic"
     return result
@@ -207,21 +210,30 @@ def _call_openrouter(symbol: str, user_msg: str) -> dict:
 
 
 # ---------- Local AI (Ollama) ----------
+# Timeout for Ollama calls — local models on CPU can be slow (30-60s).
+# Without a timeout, the auto-trade loop blocks indefinitely. With a timeout,
+# the cascade can fall through to the next provider.
+_OLLAMA_TIMEOUT = 45  # seconds
+
 def _call_ollama(symbol: str, user_msg: str) -> dict:
-    """Call local Ollama server with bounded context window.
+    """Call local Ollama server with bounded context window + timeout.
 
     The `num_ctx` option caps the KV cache size — without it, Ollama's
     newer defaults (128k+ tokens) can try to allocate 40GB+ of RAM and
     crash with OOM on machines with limited memory. We also detect OOM
     errors specifically so the cascade can cleanly fall through to the
     next provider instead of retrying a doomed call.
+
+    A timeout (_OLLAMA_TIMEOUT=45s) ensures the auto-trade loop doesn't
+    block indefinitely when Ollama is slow (CPU-only inference of large
+    models can take 30-60+ seconds per request).
     """
     if not settings.ollama_model:
         raise RuntimeError("no ollama_model configured")
-    log.info("Ollama calling model: %s (num_ctx=%d)",
-             settings.ollama_model, settings.ollama_num_ctx)
+    log.info("Ollama calling model: %s (num_ctx=%d, timeout=%ds)",
+             settings.ollama_model, settings.ollama_num_ctx, _OLLAMA_TIMEOUT)
     import ollama
-    client = ollama.Client(host=settings.ollama_url)
+    client = ollama.Client(host=settings.ollama_url, timeout=_OLLAMA_TIMEOUT)
     try:
         resp = client.chat(
             model=settings.ollama_model,
@@ -255,23 +267,82 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
                 f"num_ctx={settings.ollama_num_ctx}) — try a smaller model "
                 f"or reduce ollama_num_ctx in settings"
             ) from exc
+        # Detect timeout — common signatures from httpx/requests
+        if any(kw in msg for kw in ("timeout", "timed out", "read timeout")):
+            log.warning("⚠ Ollama timeout: model=%s didn't respond within %ds "
+                        "— falling through to next provider (try a smaller "
+                        "model or increase OLLAMA_NUM_CTX)",
+                        settings.ollama_model, _OLLAMA_TIMEOUT)
+            raise RuntimeError(
+                f"Ollama timeout (model={settings.ollama_model}, "
+                f"timeout={_OLLAMA_TIMEOUT}s) — model too slow for CPU"
+            ) from exc
         raise
-    return _parse(resp["message"]["content"], symbol)
+    content = resp["message"]["content"]
+    log.info("Ollama response received: %d chars", len(content))
+    return _parse(content, symbol)
 
 
 def _parse(content: str, symbol: str) -> dict:
     """Parse possibly-fenced JSON from LLM output, then normalize to the
-    exact contract the frontend expects (11 camelCase fields)."""
+    exact contract the frontend expects (11 camelCase fields).
+
+    Handles 3 common LLM output formats:
+    1. Raw JSON: {"signal": "BUY", ...}
+    2. Code-fenced: ```json\n{...}\n```
+    3. Conversational: "Here is the analysis:\n```json\n{...}\n```\nHope this helps!"
+
+    Local models (llama3 8B, mistral 7B) often add conversational text
+    around the JSON, which caused the previous strict parser to fail →
+    heuristic fallback → NEUTRAL → no auto-trade.
+    """
     text = content.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
+
+    # Strategy 1: extract JSON from ```json ... ``` code fences
+    # (handles both pure-fenced and conversational-with-fenced)
+    if "```" in text:
+        parts = text.split("```")
+        for i, part in enumerate(parts):
+            part = part.strip()
+            # skip the opening ``json`` label
+            if part.startswith("json"):
+                part = part[4:].strip()
+            # try to parse this segment as JSON
+            if part.startswith("{"):
+                try:
+                    d = json.loads(part)
+                    if isinstance(d, dict) and "signal" in d:
+                        return _normalize(d, symbol)
+                except Exception:
+                    continue
+
+    # Strategy 2: find first '{' and last '}' — extract substring as JSON
+    # This handles conversational text like:
+    # "Here is the analysis for EURUSD: {"signal": "BUY", ...} Hope this helps!"
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        json_substr = text[first_brace:last_brace + 1]
+        try:
+            d = json.loads(json_substr)
+            if isinstance(d, dict) and "signal" in d:
+                return _normalize(d, symbol)
+        except Exception:
+            pass
+
+    # Strategy 3: try raw text as JSON (original behavior)
     try:
         d = json.loads(text)
+        if isinstance(d, dict):
+            return _normalize(d, symbol)
     except Exception:
-        return _heuristic(symbol)
-    return _normalize(d, symbol)
+        pass
+
+    # All strategies failed — fall back to heuristic
+    log.warning("⚠ JSON parse failed for %s — using heuristic (NEUTRAL). "
+                "LLM response was %d chars, starts with: %.80s",
+                symbol, len(text), text[:80])
+    return _heuristic(symbol)
 
 
 # snake_case keys commonly emitted by LLMs → camelCase the frontend expects
