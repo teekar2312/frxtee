@@ -327,16 +327,13 @@ export function SettingsView() {
             </p>
           </div>
           <Separator />
-          {/* Model per provider */}
+          {/* Model per provider — only Groq + Local (Ollama) supported */}
           <div className="text-[11px] text-muted-foreground font-medium">
             Model per Provider (configurable)
           </div>
           <div className="grid grid-cols-2 gap-2">
             {([
-              { id: "zai", label: "Z.AI" },
               { id: "groq", label: "Groq" },
-              { id: "google", label: "Google AI" },
-              { id: "openrouter", label: "OpenRouter" },
               { id: "local", label: "Local (Ollama)" },
             ] as const).map((p) => (
               <div key={p.id}>
@@ -355,7 +352,7 @@ export function SettingsView() {
                     }).catch(() => {});
                   }}
                   className="h-8 text-xs font-mono"
-                  placeholder={`e.g. ${p.id === "zai" ? "glm-4.6" : p.id === "groq" ? "llama-3.3-70b" : p.id === "google" ? "gemini-1.5-pro" : "llama3"}`}
+                  placeholder={`e.g. ${p.id === "groq" ? "llama-3.3-70b-versatile" : "llama3"}`}
                 />
               </div>
             ))}
@@ -461,28 +458,10 @@ export function SettingsView() {
           />
           <Separator />
           <KeyField
-            label="Z.AI API Key"
-            value={keys.zai}
-            onChange={(v) => setKey("zai", v)}
-            placeholder="z.ai token"
-          />
-          <KeyField
             label="Groq API Key"
             value={keys.groq}
             onChange={(v) => setKey("groq", v)}
-            placeholder="groq token"
-          />
-          <KeyField
-            label="Google AI Studio Key"
-            value={keys.google}
-            onChange={(v) => setKey("google", v)}
-            placeholder="google token"
-          />
-          <KeyField
-            label="OpenRouter API Key"
-            value={keys.openrouter}
-            onChange={(v) => setKey("openrouter", v)}
-            placeholder="sk-or-v1-..."
+            placeholder="groq token (free at console.groq.com)"
           />
         </div>
       </Card>
@@ -502,7 +481,7 @@ export function SettingsView() {
           <Row k="MT5 Library" v="MetaTrader5 (pip)" />
           <Row k="ML Stack" v="scikit-learn · xgboost · pandas · ta" />
           <Row k="News APIs" v="Finnhub · MARKETAUX" />
-          <Row k="AI Providers" v="Z.AI · Groq · Google · Ollama" />
+          <Row k="AI Providers" v="Groq · Ollama (Local)" />
           <Separator />
           <div className="rounded-md bg-muted/40 p-2 font-mono text-[10px] leading-relaxed">
             <div className="text-muted-foreground"># start the backend on Windows</div>

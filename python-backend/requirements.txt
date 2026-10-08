@@ -17,9 +17,8 @@ xgboost>=2.1.1
 ta>=0.11.0
 joblib>=1.4.2
 
-# AI providers
+# AI providers (Groq uses OpenAI SDK, Ollama has its own)
 openai>=1.51.0
-google-generativeai>=0.8.3
 ollama>=0.3.3
 
 # Notifications

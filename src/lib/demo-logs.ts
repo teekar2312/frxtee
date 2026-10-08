@@ -5,7 +5,7 @@ function genLogs(): LogEntry[] {
   const base: Omit<LogEntry, "id" | "ts">[] = [
     { level: "INFO", source: "mt5", message: "Terminal path detected: C:\\Program Files\\FINEX MetaTrader 5\\terminal64.exe" },
     { level: "INFO", source: "mt5", message: "Login 5012**** @ FINEX-Real — authorized" },
-    { level: "INFO", source: "engine", message: "AI engine initialized (provider=zai, model=glm-4.6)" },
+    { level: "INFO", source: "engine", message: "AI engine initialized (provider=groq, model=llama-3.3-70b-versatile)" },
     { level: "DEBUG", source: "indicators", message: "Computed EMA(20), RSI(14), MACD(12,26,9), ATR(14) on EURUSD M15" },
     { level: "INFO", source: "news", message: "Finnhub stream connected — 3 symbols subscribed" },
     { level: "WARN", source: "risk", message: "Daily risk usage at 2.1% / 3.0% — throttling new entries" },

@@ -91,38 +91,17 @@ export const TRADING_SESSIONS = [
 
 export const AI_PROVIDERS = [
   {
-    id: "zai",
-    name: "Z.AI",
-    model: "glm-4.6",
-    desc: "General-purpose LLM with strong reasoning",
-    latencyMs: 720,
-  },
-  {
     id: "groq",
     name: "Groq AI",
     model: "llama-3.3-70b",
-    desc: "Ultra-low latency inference",
+    desc: "Ultra-low latency cloud inference (free, 1-3s per request)",
     latencyMs: 180,
-  },
-  {
-    id: "google",
-    name: "Google AI Studio",
-    model: "gemini-1.5-pro",
-    desc: "Multimodal, long context",
-    latencyMs: 980,
-  },
-  {
-    id: "openrouter",
-    name: "OpenRouter",
-    model: "deepseek/deepseek-chat",
-    desc: "100+ models via unified API",
-    latencyMs: 500,
   },
   {
     id: "local",
     name: "Local AI",
     model: "ollama / llama3",
-    desc: "On-device, private inference",
+    desc: "On-device private inference via Ollama (no API key needed)",
     latencyMs: 240,
   },
 ] as const;

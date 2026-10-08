@@ -27,7 +27,7 @@ function seeded(str: string) {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const symbol = searchParams.get("symbol") ?? "EURUSD";
-  const provider = searchParams.get("provider") ?? "zai";
+  const provider = searchParams.get("provider") ?? "groq";
 
   // Try the Python backend first (real AI + ML prediction)
   const qs = passthroughQuery(req);

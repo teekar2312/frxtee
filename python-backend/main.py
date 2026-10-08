@@ -619,7 +619,7 @@ async def _auto_trade_loop():
                 await asyncio.sleep(30)
                 continue
 
-            provider = getattr(settings, "ai_provider", "zai")
+            provider = getattr(settings, "ai_provider", "groq")
             min_confidence = getattr(settings, "auto_trade_min_confidence", 75)
             log.info("auto-trade: ON — scanning %d symbol(s): %s (provider=%s, "
                      "min_confidence=%d%%, strategy=%s)",
@@ -1263,7 +1263,7 @@ def _get_symbol_sentiment(symbol: str) -> dict:
 
 
 @app.get("/api/trading/analysis")
-async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
+async def api_analysis(symbol: str = "EURUSD", provider: str = "groq"):
     # Build technical context from real indicator data (not hallucinated)
     async def _build_context():
         ctx = {"timeframe": "M15", "symbol": symbol}
@@ -1325,7 +1325,7 @@ async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):
 
 
 @app.get("/api/trading/analysis/batch")
-async def api_analysis_batch(symbols: str, provider: str = "zai"):
+async def api_analysis_batch(symbols: str, provider: str = "groq"):
     """Batch analysis for multiple symbols in one request.
 
     Runs all pair analyses concurrently — reduces 5 round-trips to 1 for the
@@ -1427,13 +1427,10 @@ async def api_ai_config():
     Frontend reads this to sync its UI with backend state."""
     return {
         "models": {
-            "zai": settings.zai_model,
             "groq": settings.groq_model,
-            "google": settings.google_model,
-            "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
-        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
+        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 4096),
         "ollama_timeout": getattr(settings, "ollama_timeout", 120),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
@@ -1443,12 +1440,9 @@ async def api_ai_config():
         "close_at_session_end": getattr(settings, "close_at_session_end", False),
         "trading_strategy": getattr(settings, "trading_strategy", "auto"),
         "strategies": STRATEGY_INFO,
-        "active_provider": getattr(settings, "ai_provider", "zai"),
+        "active_provider": getattr(settings, "ai_provider", "groq"),
         "api_keys_set": {
-            "zai": bool(settings.zai_api_key),
             "groq": bool(settings.groq_api_key),
-            "google": bool(settings.google_api_key),
-            "openrouter": bool(settings.openrouter_api_key),
             "local": True,
         },
     }
@@ -1459,7 +1453,7 @@ async def api_ai_config():
 async def api_ai_config_update(request: Request):
     """Update AI model config at runtime (no restart needed).
 
-    Frontend sends {models: {zai: "glm-4.6", ...}, ai_min_confidence: 65, ...}
+    Frontend sends {models: {groq: "llama-3.3-70b-versatile", local: "llama3"}, ...}
     and backend applies immediately to settings singleton.
     """
     import json as _json
@@ -1472,14 +1466,8 @@ async def api_ai_config_update(request: Request):
     updated = []
     if "models" in body:
         models = body["models"]
-        if "zai" in models:
-            settings.zai_model = models["zai"]; updated.append(f"zai={models['zai']}")
         if "groq" in models:
             settings.groq_model = models["groq"]; updated.append(f"groq={models['groq']}")
-        if "google" in models:
-            settings.google_model = models["google"]; updated.append(f"google={models['google']}")
-        if "openrouter" in models:
-            settings.openrouter_model = models["openrouter"]; updated.append(f"openrouter={models['openrouter']}")
         if "local" in models:
             settings.ollama_model = models["local"]; updated.append(f"ollama={models['local']}")
     if "ollama_num_ctx" in body:
@@ -1528,13 +1516,10 @@ async def api_ai_config_update(request: Request):
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {
         "models": {
-            "zai": settings.zai_model,
             "groq": settings.groq_model,
-            "google": settings.google_model,
-            "openrouter": settings.openrouter_model,
             "local": settings.ollama_model,
         },
-        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
+        "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 4096),
         "ollama_timeout": getattr(settings, "ollama_timeout", 120),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,

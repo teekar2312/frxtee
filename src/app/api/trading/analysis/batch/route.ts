@@ -59,7 +59,7 @@ function demoAnalysis(symbol: string, provider: string): AIAnalysisResult {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const symbols = searchParams.get("symbols") ?? "EURUSD";
-  const provider = searchParams.get("provider") ?? "zai";
+  const provider = searchParams.get("provider") ?? "groq";
 
   // Try the Python backend batch endpoint first (1 round-trip for all pairs)
   const qs = passthroughQuery(req);

@@ -6293,3 +6293,65 @@ Minor observations (not FAILs, do not affect functionality):
   - The auto-trade loop sleeps 30s at the end of EACH cycle (L649), regardless of how many symbols were processed. With 5 symbols each taking ~5s AI analysis, a single cycle takes 25s + 30s sleep = 55s. Combined with the 60s per-symbol cooldown, this means effective per-symbol polling is ~55-60s — at the edge of the cooldown window. For >5 symbols, cooldown will almost always be expired by next evaluation.
 
 No code changes made — read-only audit.
+
+---
+Task ID: AUDIT-REMOVE-PROVIDERS
+Agent: audit-provider-removal
+Task: Verify Z.AI, Google AI Studio, OpenRouter completely removed; only Groq + Local remain
+
+Work Log:
+- Read worklog.md (6295 lines) for prior context — last entries were AUDIT-2 SL/TP root cause + AU-2 auto-trade loop audit.
+- Inspected all 11 audit-scope files line-by-line + ran cross-cutting greps (case-insensitive) for zai / openrouter / google_api / google_model / google_ai_studio / genai / gemini / chatglm / glm-4 / z-ai across python-backend/, src/, and adjacent infra files.
+- Verified ai_service.py: _PROVIDER_CASCADE only has "groq" + "local" (L45-48); analyze() loop only checks p=="groq" and p=="local" (L108, L112); _call_zai/_call_google/_call_openrouter deleted; _call_groq (L131) + _call_ollama (L153) intact; no httpx import; no settings.zai_api_key / settings.google_api_key / settings.openrouter_api_key usage. STALE MODULE DOCSTRING at L1.
+- Verified config.py: only groq_api_key + ollama_url + groq_model + ollama_model + ollama_num_ctx + ollama_timeout (L22-41); ai_provider default = "groq" (L103). CLEAN.
+- Verified main.py GET /api/trading/ai/config (L1424-1448): models dict only has groq + local (L1429-1432); api_keys_set only groq + local (L1444-1447); active_provider default "groq" (L1443). POST handler (L1451-1526) only checks "groq" / "local" in models (L1469-1472); response config.models only groq + local (L1518-1521). HOWEVER — 4 STALE "zai" DEFAULTS at L622, L1266, L1328, L1456.
+- Verified config.example.env: only GROQ_API_KEY / GROQ_MODEL / OLLAMA_* remain (L15-24); L13-14 informational comment about removal (acceptable). CLEAN.
+- Verified trading-data.ts: AI_PROVIDERS array has exactly 2 entries — groq + local (L92-107); AIProviderId type derived from array. CLEAN.
+- Verified trading-store.ts: aiModels default {groq, local} (L224-227); keys type has finnhub/marketaux/groq only (L124-128); keys default {finnhub:"", marketaux:"", groq:""} (L286); aiProvider default "groq" (L218). CLEAN.
+- Verified settings-view.tsx: model grid shows Groq + Local (Ollama) only (L334-358); API key fields show Groq only (plus Finnhub/Marketaux news keys) (L446-466); "AI Providers" row says "Groq · Ollama (Local)" (L484); pushAiConfig body sends `models: store.aiModels` (L92). CLEAN.
+- Verified ai-engine-view.tsx: provider selector loops over AI_PROVIDERS (L68); no hardcoded zai/google/openrouter references; cascade error messages in ai_service.py only mention Groq/Ollama. CLEAN.
+- Verified page.tsx: footer text says "Python 3.13+ · MT5 · AI: Groq / Local (Ollama)" (L261). CLEAN.
+- Verified dashboard-view.tsx: "AI providers:" line uses `AI_PROVIDERS.map((p) => p.name).join(" · ")` (L298) — auto-updated to 2 entries. CLEAN.
+- Ran global greps (excluding worklog.md, node_modules, .venv) — found 17 stale references across 8 non-audit-scoped files: demo-logs.ts, src/app/api/trading/analysis/route.ts, src/app/api/trading/analysis/batch/route.ts, requirements.txt (google-generativeai), docker-compose.yml (ZAI_API_KEY + GOOGLE_API_KEY env passthroughs), python-backend/README.md (3 lines), root README.md (2 lines), API.md (4 lines), DEPLOYMENT.md (1 line).
+- Also noted borderline: src/app/layout.tsx:34 references Z.AI CDN (`https://z-cdn.chatglm.cn/z-ai/static/logo.svg`) for favicon — not flagged by prescribed greps but is a Z.AI infrastructure dependency.
+- No code changes made — read-only audit.
+
+Stage Summary:
+- PASS: 8 / 11 (config.py, config.example.env, trading-data.ts, trading-store.ts, settings-view.tsx, ai-engine-view.tsx, page.tsx, dashboard-view.tsx)
+- FAIL: 3 / 11 (ai_service.py docstring; main.py 4× stale "zai" defaults; global grep surfaces 17 stale references across 8 infra/doc files)
+- STALE REFERENCES FOUND (17 in scope + 1 borderline):
+  CRITICAL — runtime code defaults:
+    1. python-backend/main.py:622          `provider = getattr(settings, "ai_provider", "zai")`  (should be "groq")
+    2. python-backend/main.py:1266         `async def api_analysis(symbol: str = "EURUSD", provider: str = "zai"):`  (should be "groq")
+    3. python-backend/main.py:1328         `async def api_analysis_batch(symbols: str, provider: str = "zai"):`  (should be "groq")
+    4. python-backend/main.py:1456         docstring `Frontend sends {models: {zai: "glm-4.6", ...}, ...}`  (should reference groq/local)
+    5. src/app/api/trading/analysis/route.ts:30           `const provider = searchParams.get("provider") ?? "zai";`  (should be "groq")
+    6. src/app/api/trading/analysis/batch/route.ts:62     `const provider = searchParams.get("provider") ?? "zai";`  (should be "groq")
+    7. src/lib/demo-logs.ts:8              `message: "AI engine initialized (provider=zai, model=glm-4.6)"`  (stale demo log shown in demo mode)
+  CRITICAL — dependency / env config:
+    8. python-backend/requirements.txt:22  `google-generativeai>=0.8.3`  (Gemini SDK no longer imported anywhere — should be deleted to slim install)
+    9. docker-compose.yml:26                `- ZAI_API_KEY=${ZAI_API_KEY:-}`  (env passthrough — should be deleted)
+   10. docker-compose.yml:28                `- GOOGLE_API_KEY=${GOOGLE_API_KEY:-}`  (env passthrough — should be deleted)
+  COSMETIC — docstrings/comments:
+   11. python-backend/ai_service.py:1      `"""AI service — multi-provider inference (Z.AI, Groq, Google AI Studio, Ollama).`  (stale module docstring)
+  COSMETIC — markdown docs:
+   12. python-backend/README.md:5           "Z.AI / Groq / Google AI / Ollama"  (stack line)
+   13. python-backend/README.md:26          "API keys (Finnhub, MARKETAUX, Z.AI, Groq, Google, Ollama URL)"
+   14. python-backend/README.md:43          "Z.AI / Groq / Google AI Studio / Ollama local inference"  (ai_service.py row)
+   15. README.md:127                         `| AI | \`ZAI_API_KEY\`, \`GROQ_API_KEY\`, \`GOOGLE_API_KEY\`, \`OLLAMA_URL\` |`  (env table)
+   16. README.md:148                         `| AI | Z.AI, Groq, Google AI Studio, Ollama |`  (tech stack table)
+   17. API.md:103                            `**Query:** \`?symbol=EURUSD&provider=zai\``  (API example)
+   18. API.md:120                            `"provider": "zai",`  (API example response)
+   19. API.md:131                            `**Query:** \`?symbols=EURUSD,GBPUSD,USDJPY&provider=zai\``  (API example)
+   20. API.md:140                            `"provider": "zai",`  (API example response)
+   21. DEPLOYMENT.md:186                     "Set \`ZAI_API_KEY\` or \`GROQ_API_KEY\`."  (troubleshooting table)
+  BORDERLINE (not flagged by prescribed grep patterns but is Z.AI infra dependency):
+   22. src/app/layout.tsx:34                `icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg"`  (favicon from Z.AI CDN — infrastructure dependency on removed provider; replace with /public/logo.svg)
+- IMPACT ANALYSIS:
+  - Items #1-3 (main.py defaults): dead in practice because settings.ai_provider always exists (default "groq") and frontend always passes ?provider=groq|local in URL — but if backend is called directly without provider param, ai_service.analyze() receives "zai", _PROVIDER_CASCADE.get("zai", ["zai"]) returns ["zai"], and neither `p=="groq"` nor `p=="local"` matches → silent fallback to heuristic. Real bug, low severity due to narrow trigger.
+  - Items #5-6 (Next.js route defaults): same — frontend always passes provider, so rarely hit; but stale code.
+  - Item #7 (demo-logs.ts): cosmetic — only shown when backend is down (demo mode).
+  - Items #8-10 (deps/env): google-generativeai installs unused ~12MB package; docker-compose passes empty ZAI/GOOGLE keys (harmless but signals config drift).
+  - Items #11-21 (docs/comments): user-facing docs misrepresent supported providers.
+  - Item #22 (favicon): external dependency on Z.AI CDN — if Z.AI shuts down CDN, favicon breaks. Replace with local /public/logo.svg.
+- VERDICT: NOT cleanly removed. 17 stale references found (21 incl. docs + 1 favicon). Provider removal is functionally complete (no _call_zai / _call_google / _call_openrouter functions, no settings fields, no UI entries), but 17-21 stale defaults/comments/docs/favicon remain.

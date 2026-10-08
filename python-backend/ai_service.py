@@ -1,4 +1,4 @@
-"""AI service — multi-provider inference (Z.AI, Groq, Google AI Studio, Ollama).
+"""AI service — multi-provider inference (Groq cloud + Local Ollama).
 
 Provider is selected manually in the dashboard. Each provider implements the
 same `analyze()` interface returning a structured analysis dict.
@@ -11,8 +11,6 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
-
-import httpx
 
 from config import settings
 
@@ -42,12 +40,11 @@ commodities, sentiment, breaking_news."""
 
 
 # provider fallback order — if primary fails, try next in chain
+# Only Groq (cloud) and Local (Ollama) are supported. Z.AI, Google AI
+# Studio, and OpenRouter have been removed.
 _PROVIDER_CASCADE = {
-    "zai": ["zai", "groq", "openrouter", "google", "local"],
-    "groq": ["groq", "zai", "openrouter", "google", "local"],
-    "google": ["google", "zai", "groq", "openrouter", "local"],
-    "openrouter": ["openrouter", "groq", "zai", "google", "local"],
-    "local": ["local", "zai", "groq", "openrouter", "google"],
+    "groq": ["groq", "local"],
+    "local": ["local", "groq"],
 }
 
 
@@ -55,8 +52,8 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
     """Run analysis with the chosen provider. Falls back to a rule-based
     heuristic if no provider/keys configured.
 
-    Provider cascade: if the primary provider fails, try the next in the
-    chain (e.g. Z.AI → Groq → Google → Ollama) before giving up to heuristic.
+    Provider cascade: if the primary provider fails, try the next in
+    the chain (Groq → Local, or Local → Groq) before giving up to heuristic.
     """
     # build a rich context string — no truncation (was [:800], slicing mid-JSON)
     ctx = context or {}
@@ -108,21 +105,9 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
     cascade = _PROVIDER_CASCADE.get(provider, [provider])
     for p in cascade:
         try:
-            if p == "zai" and settings.zai_api_key:
-                result = _call_zai(symbol, user_msg)
-                result["model"] = settings.zai_model
-                return result
             if p == "groq" and settings.groq_api_key:
                 result = _call_groq(symbol, user_msg)
                 result["model"] = settings.groq_model
-                return result
-            if p == "google" and settings.google_api_key:
-                result = _call_google(symbol, user_msg)
-                result["model"] = settings.google_model
-                return result
-            if p == "openrouter" and settings.openrouter_api_key:
-                result = _call_openrouter(symbol, user_msg)
-                result["model"] = settings.openrouter_model
                 return result
             if p == "local":
                 if not settings.ollama_model:
@@ -135,31 +120,11 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
             log.warning("AI provider %s failed: %s — trying next in cascade", p, exc)
             continue
     log.warning("All AI providers failed — using heuristic fallback (NEUTRAL signal, "
-                "no auto-trade will trigger). Check: 1) Ollama running? 2) Model "
-                "downloaded? 3) API keys set for cloud providers?")
+                "no auto-trade will trigger). Check: 1) Groq API key set? "
+                "2) Ollama running + model downloaded?")
     result = _heuristic(symbol)
     result["model"] = "heuristic"
     return result
-
-
-# ---------- Z.AI (z-ai-web-dev-sdk compatible HTTP) ----------
-def _call_zai(symbol: str, user_msg: str) -> dict:
-    base = os.environ.get("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4")
-    key = settings.zai_api_key
-    if not key:
-        return _heuristic(symbol)
-    log.info("Z.AI calling model: %s", settings.zai_model)
-    r = httpx.post(
-        f"{base}/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": settings.zai_model, "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ]},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return _parse(r.json()["choices"][0]["message"]["content"], symbol)
 
 
 # ---------- Groq (OpenAI-compatible) ----------
@@ -176,54 +141,6 @@ def _call_groq(symbol: str, user_msg: str) -> dict:
         response_format={"type": "json_object"},
         temperature=0.2,
         timeout=30,
-    )
-    return _parse(resp.choices[0].message.content, symbol)
-
-
-# ---------- Google AI Studio ----------
-def _call_google(symbol: str, user_msg: str) -> dict:
-    if not settings.google_api_key:
-        return _heuristic(symbol)
-    # google-generativeai SDK requires 'models/' prefix
-    model_name = settings.google_model
-    if not model_name.startswith("models/"):
-        model_name = f"models/{model_name}"
-    log.info("Google calling model: %s", model_name)
-    import google.generativeai as genai
-    genai.configure(api_key=settings.google_api_key)
-    model = genai.GenerativeModel(model_name, system_instruction=SYSTEM_PROMPT)
-    resp = model.generate_content(user_msg + "\nReturn JSON only.")
-    return _parse(resp.text, symbol)
-
-
-# ---------- OpenRouter (100+ models via unified API) ----------
-def _call_openrouter(symbol: str, user_msg: str) -> dict:
-    """OpenRouter uses OpenAI-compatible API.
-    Supports 100+ models: deepseek, llama, gpt, claude, mistral, etc.
-    Get API key: https://openrouter.ai/keys
-    """
-    key = settings.openrouter_api_key
-    if not key:
-        return _heuristic(symbol)
-    log.info("OpenRouter calling model: %s", settings.openrouter_model)
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=key,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={
-            "HTTP-Referer": "https://zenitrade.ai",
-            "X-Title": "ZeniTrade AI",
-        },
-    )
-    resp = client.chat.completions.create(
-        model=settings.openrouter_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        timeout=45,
     )
     return _parse(resp.choices[0].message.content, symbol)
 

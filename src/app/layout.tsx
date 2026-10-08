@@ -31,7 +31,7 @@ export const metadata: Metadata = {
   authors: [{ name: "ZeniTrade" }],
   manifest: "/manifest.json",
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: "/logo.svg",
   },
 };
 

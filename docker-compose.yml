@@ -23,9 +23,8 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
       - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
       - MARKETAUX_API_KEY=${MARKETAUX_API_KEY:-}
-      - ZAI_API_KEY=${ZAI_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}
     volumes:
       - backend-data:/app/data
       - backend-models:/app/models

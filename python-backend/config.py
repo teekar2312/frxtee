@@ -18,18 +18,12 @@ class Settings(BaseSettings):
     finnhub_api_key: str = ""
     marketaux_api_key: str = ""
 
-    # AI providers — API keys
-    zai_api_key: str = ""
+    # AI providers — API keys (only Groq + Local/Ollama supported)
     groq_api_key: str = ""
-    google_api_key: str = ""
-    openrouter_api_key: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
 
     # AI provider models (configurable per provider)
-    zai_model: str = "glm-4.6"
     groq_model: str = "llama-3.3-70b-versatile"
-    google_model: str = "gemini-1.5-pro"
-    openrouter_model: str = "deepseek/deepseek-chat"
     ollama_model: str = "llama3"
     # Ollama context window size (tokens). Default 8192 is a safe middle
     # ground — Ollama's newer defaults (128k+) can require 40GB+ RAM for the
@@ -106,7 +100,7 @@ class Settings(BaseSettings):
     # Auto-trade engine
     auto_trade_mode: bool = False
     auto_trade_symbols: str = "EURUSD,GBPUSD"
-    ai_provider: str = "zai"
+    ai_provider: str = "groq"
 
     # Trading strategy selection
     # Options: auto (AI selects), ma_ribbon, momentum_scalp, pivot_bounce,
