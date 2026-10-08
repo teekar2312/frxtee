@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     # News
     finnhub_api_key: str = ""
     marketaux_api_key: str = ""
+    # Apify token for economic calendar (free $5/mo credit at apify.com)
+    # Used by ForexFactory calendar scraper actor — alternative to Finnhub's
+    # paid /calendar/economic endpoint (which returns 403 on free tier).
+    # Get token: https://console.apify.com/account-integrations
+    apify_token: str = ""
 
     # AI providers — API keys (only Groq + Local/Ollama supported)
     groq_api_key: str = ""

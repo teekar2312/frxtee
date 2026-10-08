@@ -154,10 +154,12 @@ def _sentiment(entities: list) -> str:
 async def economic_calendar() -> list[dict]:
     """High-impact upcoming events. Cached 5 min with thundering-herd lock.
 
-    Finnhub's /calendar/economic endpoint requires a paid plan — free tier
-    returns 403 Forbidden. When that happens, we cache the empty result for
-    1 hour (instead of 5 min) to avoid spamming the API + log with the same
-    403 error every 5 minutes.
+    Provider priority:
+      1. Apify ForexFactory scraper (if APIFY_TOKEN set) — free $5/mo credit
+      2. Finnhub /calendar/economic (if FINNHUB_API_KEY set + paid plan)
+      3. Empty list (demo mode — news filter disabled)
+
+    Apify is preferred because Finnhub free tier returns 403 on calendar.
     """
     now_ts = datetime.now(timezone.utc).timestamp()
     if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
@@ -167,9 +169,18 @@ async def economic_calendar() -> list[dict]:
         now_ts = datetime.now(timezone.utc).timestamp()
         if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
             return CACHE["calendar"]
-        if not settings.finnhub_api_key:
-            cal = _demo_calendar()
-        else:
+
+        # ---- provider 1: Apify (preferred — free ForexFactory scraper) ----
+        if getattr(settings, "apify_token", ""):
+            cal = await _fetch_apify_calendar()
+            if cal:
+                CACHE["calendar"] = cal
+                CACHE["cal_ts"] = now_ts
+                return cal
+            # Apify failed — fall through to Finnhub
+
+        # ---- provider 2: Finnhub (needs paid plan — free = 403) ----
+        if settings.finnhub_api_key:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             try:
                 async with httpx.AsyncClient(timeout=15) as c:
@@ -181,20 +192,15 @@ async def economic_calendar() -> list[dict]:
                     cal = r.json().get("economicCalendar", [])[:10]
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 403:
-                    # 403 = free plan doesn't include economic calendar.
-                    # Log ONCE then cache empty for 1 hour to avoid spam.
                     if CACHE.get("cal_403_logged") is not True:
                         log.warning(
                             "📊 Finnhub economic calendar: 403 Forbidden — this endpoint "
-                            "requires a paid Finnhub plan. Free tier doesn't include "
-                            "/calendar/economic. News filter will be DISABLED (no blackout "
-                            "window) until you upgrade at https://finnhub.io/pricing or "
-                            "switch to a free alternative (e.g. ForexFactory calendar). "
+                            "requires a paid Finnhub plan. Set APIFY_TOKEN in .env for "
+                            "free ForexFactory calendar via Apify (https://console.apify.com). "
                             "This message will not repeat for 1 hour."
                         )
                         CACHE["cal_403_logged"] = True
                     cal = []
-                    # cache empty result for 1 hour (not 5 min) to avoid retry spam
                     CACHE["calendar"] = cal
                     CACHE["cal_ts"] = now_ts + 3600 - _CAL_CACHE_TTL
                     return cal
@@ -205,9 +211,113 @@ async def economic_calendar() -> list[dict]:
             except Exception as exc:  # noqa: BLE001
                 log.warning("calendar fetch failed: %s — using empty", exc)
                 cal = []
+        else:
+            # ---- provider 3: demo (no API keys) ----
+            cal = _demo_calendar()
         CACHE["calendar"] = cal
         CACHE["cal_ts"] = now_ts
         return cal
+
+
+async def _fetch_apify_calendar() -> list[dict]:
+    """Fetch economic calendar via Apify ForexFactory scraper actor.
+
+    Uses the 'scrapemint/forexfactory-economic-calendar' actor (free, no
+    ForexFactory login required). Returns list of high-impact events in the
+    format expected by near_high_impact_news():
+      [{"event": str, "impact": "high", "time": ISO8601, "country": str}, ...]
+
+    Apify API pattern:
+      POST https://api.apify.com/v2/acts/{actorId}/run-sync-get-dataset-items?token={TOKEN}
+      Body = actor input (JSON)
+      Response = array of dataset items
+
+    Actor input (minimal): {"weeksAhead": 1} (fetch current week)
+    Actor output fields: date, time, currency, impact, event, actual, forecast, previous
+    """
+    token = getattr(settings, "apify_token", "")
+    if not token:
+        return []
+    # Actor: scrapemint/forexfactory-economic-calendar
+    # ID format: ~scrapemint/forexfactory-economic-calendar
+    actor_id = "scrapemint~forexfactory-economic-calendar"
+    url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"
+    # Actor input — fetch this week's calendar (minimal, fast)
+    actor_input = {"weeksAhead": 1}
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:  # 60s for actor run
+            r = await c.post(
+                url,
+                params={"token": token, "timeout": 50},
+                json=actor_input,
+                headers={"Content-Type": "application/json"},
+            )
+            if r.status_code == 402:
+                log.warning("📊 Apify: 402 Payment Required — your free $5 credit is "
+                            "exhausted. Top up at https://console.apify.com/billing "
+                            "or use a different calendar provider.")
+                return []
+            if r.status_code == 403:
+                log.warning("📊 Apify: 403 Forbidden — invalid APIFY_TOKEN. Check "
+                            "token at https://console.apify.com/account-integrations")
+                return []
+            r.raise_for_status()
+            items = r.json()
+            if not isinstance(items, list):
+                log.warning("Apify calendar: unexpected response type %s", type(items).__name__)
+                return []
+            # filter high-impact events + normalize format
+            cal = []
+            for item in items:
+                impact = str(item.get("impact", "")).lower()
+                if impact != "high":
+                    continue
+                # ForexFactory date+time fields — combine into ISO8601
+                date_str = item.get("date", "")
+                time_str = item.get("time", "")
+                if date_str:
+                    # ForexFactory date format: "Oct 8" → parse with current year
+                    try:
+                        from datetime import datetime as _dt
+                        year = _dt.now(timezone.utc).year
+                        # parse "Oct 8, 2026" or "Oct 8"
+                        for fmt in ("%b %d, %Y", "%b %d"):
+                            try:
+                                parsed = _dt.strptime(f"{date_str}, {year}" if "," not in date_str else date_str, fmt)
+                                if time_str and time_str.lower() not in ("all day", "tentative"):
+                                    # time like "8:30am"
+                                    try:
+                                        from datetime import datetime as _dt2
+                                        full = _dt2.strptime(f"{date_str} {time_str}", "%b %d %I:%M%p")
+                                        parsed = full
+                                    except Exception:
+                                        pass
+                                iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
+                            except Exception:
+                                continue
+                            break
+                        else:
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    continue
+                cal.append({
+                    "event": item.get("event", item.get("title", "economic event")),
+                    "impact": "high",
+                    "time": iso_time,
+                    "country": item.get("currency", ""),
+                })
+            log.info("📊 Apify calendar: fetched %d high-impact events from ForexFactory",
+                     len(cal))
+            return cal[:20]  # cap at 20 events
+    except httpx.HTTPStatusError as exc:
+        log.warning("Apify calendar fetch failed (HTTP %d): %s",
+                    exc.response.status_code, exc)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Apify calendar fetch failed: %s", exc)
+        return []
 
 
 def _demo_calendar() -> list[dict]:
