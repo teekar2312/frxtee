@@ -6685,3 +6685,190 @@ Additional Finding (not in audit checklist but discovered):
       Suggested fix: add line `- APIFY_TOKEN=${APIFY_TOKEN:-}` after L25 in docker-compose.yml.
 
 No code changes made — read-only audit.
+
+---
+Task ID: AUDIT-APIFY-NOTUSED
+Agent: audit-apify-not-used
+Task: Deep audit — why Apify is not used even though APIFY_TOKEN is set
+
+Work Log:
+- Read /home/z/my-project/worklog.md (prior audit AUDIT-APIFY context, lines 6360-6687) to understand prior findings.
+- Read /home/z/my-project/python-backend/config.py (130 lines) — verified apify_token field at L24, model_config at L8 (no env_prefix, env_file=".env").
+- Read /home/z/my-project/python-backend/news_service.py (425 lines) — traced economic_calendar() at L157-231 + _fetch_apify_calendar() at L234-330.
+- Read /home/z/my-project/python-backend/risk_manager.py (318 lines) — verified near_high_impact_news() at L273-318 calls economic_calendar() synchronously.
+- Read /home/z/my-project/python-backend/main.py:1258-1288 — discovered diagnostic endpoint /api/trading/calendar/test exists (bypasses cache, directly tests Apify).
+- Read /home/z/my-project/python-backend/start-backend.sh — confirmed `cd /home/z/my-project/python-backend` before launch (CWD = python-backend/, so env_file=".env" resolves to python-backend/.env).
+- Read /home/z/my-project/docker-compose.yml — confirmed APIFY_TOKEN=${APIFY_TOKEN:-} passthrough at L26 (already fixed by prior audit's D1 recommendation).
+- Listed /home/z/my-project/python-backend/ — discovered NO .env file present in sandbox (only config.example.env). User's claim "set APIFY_TOKEN in python-backend/.env" is untestable here — they must have it locally.
+- Ran Python simulation #1: confirmed `[] is not None == True` → cache check at L168/L173 evaluates True even for empty list.
+- Ran Python simulation #2: simulated 90 calls (1 min apart) with Apify returning [] — confirmed Apify is only tried ONCE per hour (on cache miss), then cache-poisoned [] is served for next 59 min.
+- Ran Python simulation #3: tested date parser at L293-312 against 9 common date formats — confirmed only "Oct 8" or "Oct 8, 2024" format parses successfully. ISO "2024-10-08", "October 8", "8 Oct 2024", "10/08/2024" ALL silently DROP items via `continue` at L312.
+- Verified _CAL_CACHE_TTL = 21600 (6 hours) at L18 (was 300 in prior audit; bumped to 21600 per prior audit's Option C recommendation).
+
+Stage Summary:
+
+  ROOT CAUSE (PRIMARY): Cache poisoning at news_service.py:168 + 217 — Finnhub 403 cached [] is treated as a valid cache hit, blocking Apify for 60 minutes.
+
+  Detailed trace:
+    1. User starts backend WITHOUT APIFY_TOKEN (or with broken Apify call).
+    2. economic_calendar() called → cache miss → Apify skipped (token empty) → falls to Finnhub → 403.
+    3. Finnhub 403 handler at L215-218 caches [] with cal_ts = now_ts + 3600 - 21600 = now_ts - 18000 (5h in past).
+    4. User then sets APIFY_TOKEN in python-backend/.env (without restarting server).
+    5. User calls economic_calendar() 5 min later, expecting Apify to be tried.
+    6. Cache check at L168: `(now_ts+300) - (now_ts-18000) = 18300 < 21600` → True
+       AND `[] is not None` → True  → CACHE HIT → returns [] immediately.
+    7. APIFY NEVER TRIED for the next 55 minutes until cache naturally expires at +60 min.
+
+  Even if user RESTARTS backend with APIFY_TOKEN set:
+    1. Fresh process → CACHE reset to defaults → first call cache-miss → Apify tried.
+    2. If Apify SUCCEEDS → returns events → cache populated with real data → all good.
+    3. If Apify FAILS (returns [] due to bug below) → falls through to Finnhub → 403 →
+       caches [] for 1 hour → next hour: cache hit on [] → Apify NEVER TRIED.
+    4. User sees "Finnhub economic calendar: 403 Forbidden" once on first call, then
+       suppressed by cal_403_logged=True (L214) for the rest of the process lifetime.
+       (Each cache-miss every hour re-encounters Finnhub 403 silently.)
+
+  The prior audit (AUDIT-APIFY, #10 + #11) INCORRECTLY judged this as PASS — they
+  believed `CACHE["calendar"] is not None` distinguishes "no cached value yet" from
+  "cached empty list", but the initial state at L14 is `[]` (not None), and Finnhub
+  403 also caches `[]` (not None) — both states look identical to the cache check.
+
+  SECONDARY ISSUE (HIGH severity, likely the actual trigger of user's complaint):
+    Date parsing at news_service.py:293-312 is FRAGILE. The outer try/except at L311
+    catches ValueError on bad date format → `continue` silently drops the item. If
+    the Apify actor returns dates in ISO format ("2024-10-08") or full month name
+    ("October 8") or day-first ("8 Oct 2024"), ALL items are dropped → cal = [] →
+    economic_calendar() treats this as Apify failure → falls through to Finnhub →
+    403 → cache poisoning kicks in for 1 hour.
+
+    Verified with simulation: of 9 common date formats, only 2 ("Oct 8" + "Oct 8, 2024")
+    parse successfully; the other 7 silently drop the item via `continue` at L312.
+
+  NOT A BUG (verified clean):
+    - config.py L8 + L24: pydantic-settings v2 auto-maps APIFY_TOKEN env var → apify_token
+      field (case-insensitive, no env_prefix). Loading is correct.
+    - docker-compose.yml L26: APIFY_TOKEN passthrough present (was missing in prior audit,
+      now fixed).
+    - news_service.py L255: actor_id "scrapemint~forexfactory-economic-calendar" matches
+      Apify's username~actorname convention.
+    - news_service.py L256: URL pattern https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items is correct.
+    - news_service.py L261-266: HTTP POST + params={"token": token, "timeout": 50} + json=actor_input + Content-Type header — all match Apify API spec.
+    - news_service.py L267-280: HTTP 402/403/non-list response handling is correct.
+    - config.example.env L18: APIFY_TOKEN= placeholder present.
+
+  Fix Recommendations:
+
+    FIX A (CRITICAL — fixes the cache poisoning root cause):
+      At news_service.py:217, when caching Finnhub 403 result, EXPLICITLY mark this as
+      a "Finnhub-failure" cache (not a "real data" cache) so Apify is still tried on
+      subsequent calls (but Finnhub is not hammered). Replace the early-return at L218:
+
+      ```python
+      # OLD (L215-218):
+      cal = []
+      CACHE["calendar"] = cal
+      CACHE["cal_ts"] = now_ts + 3600 - _CAL_CACHE_TTL
+      return cal
+      ```
+
+      ```python
+      # NEW: do NOT cache the empty result as "calendar data". Instead, cache the
+      # 403-backoff timestamp in a separate key so subsequent calls still try Apify
+      # first (Apify is free; Finnhub is the one that's paying-and-403'ing).
+      CACHE["calendar"] = []  # cache empty so UI shows no events
+      CACHE["cal_ts"] = now_ts  # expires in 6 hours like normal cache
+      CACHE["finnhub_403_until"] = now_ts + 3600  # backoff Finnhub separately
+      return []
+      ```
+
+      And at L195 (Finnhub section entry), add backoff check:
+      ```python
+      if settings.finnhub_api_key and CACHE.get("finnhub_403_until", 0) > now_ts:
+          # Finnhub is in 403 backoff — skip and use demo calendar
+          cal = _demo_calendar()
+          CACHE["calendar"] = cal
+          CACHE["cal_ts"] = now_ts
+          return cal
+      ```
+
+      This decouples Apify from Finnhub's failures — Apify is retried on every
+      cache-miss (every 6 hours), and Finnhub only retries after its 1-hour backoff.
+
+    FIX B (HIGH — fixes the secondary trigger):
+      At news_service.py:300, make date parsing tolerant of multiple formats. Replace:
+
+      ```python
+      # OLD:
+      date_no_year = date_str.split(",")[0].strip()
+      parsed = _dt.strptime(f"{date_no_year} {year}", "%b %d %Y")
+      ```
+
+      ```python
+      # NEW: try multiple formats
+      date_no_year = date_str.split(",")[0].strip()
+      parsed = None
+      for fmt in ("%b %d %Y", "%B %d %Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y",
+                  "%m/%d/%Y", "%d/%m/%Y"):
+          try:
+              if "%Y" in fmt:
+                  parsed = _dt.strptime(date_str if "%Y-%m" in fmt or "," in date_str
+                                       else f"{date_no_year} {year}", fmt)
+              else:
+                  parsed = _dt.strptime(date_no_year, fmt).replace(year=year)
+              break
+          except ValueError:
+              continue
+      if parsed is None:
+          continue  # still skip if no format matches, but at least try ISO/long-month/etc.
+      ```
+
+    FIX C (DIAGNOSTIC — helps user verify if Apify actually works):
+      The endpoint /api/trading/calendar/test at main.py:1258-1288 already exists and
+      bypasses the cache. User should hit this endpoint to verify whether Apify works
+      independently of the cache poisoning bug. If it returns apify_result.ok=True with
+      events, the issue is purely cache poisoning (FIX A). If apify_result.ok=False or
+      events=0, the issue is date parsing (FIX B) or bad actor input.
+
+      Recommend adding a log line on backend startup that prints:
+      `Apify token loaded: <preview>` — to confirm .env loading works.
+
+    FIX D (DEFENSIVE — prevents silent suppression):
+      At news_service.py:214, the cal_403_logged flag suppresses repeated 403 logs.
+      This is dangerous because it hides ongoing Finnhub 403 + Apify-failed cycles
+      from the user. Recommend logging at INFO level (not WARNING) every hour when
+      cache expires, so user sees "still falling through to Finnhub 403" each hour.
+
+      Or: surface this state to the /api/trading/status endpoint so the dashboard
+      can show a warning banner ("Calendar: Apify failing, falling back to Finnhub").
+
+  Severity Summary:
+    - PRIMARY bug (cache poisoning): CRITICAL — silently disables Apify for up to 1 hour
+      after each Finnhub 403, even when APIFY_TOKEN is set. User sees "Finnhub 403"
+      error message and assumes Apify is broken, but actually Apify is just not being
+      tried.
+    - SECONDARY bug (date parsing): HIGH — if Apify actor returns any date format other
+      than "Oct 8" or "Oct 8, 2024", ALL items are silently dropped → cal = [] → triggers
+      cache poisoning above. This is likely the ACTUAL trigger of the user's complaint.
+    - All other steps verified CLEAN (config, docker-compose, actor ID, URL, HTTP method,
+      params, response type check).
+
+  Verdict: The user's "Finnhub 403 Forbidden" message is most likely caused by:
+    (1) Apify IS being called on the first request after a restart, but the response
+        parsing at news_service.py:293-312 silently drops all items (e.g., if actor
+        returns ISO dates), so cal=[] is returned → falls through to Finnhub → 403.
+    (2) Once Finnhub 403 is cached at L217, Apify is NEVER TRIED AGAIN for the next
+        60 minutes, so the user keeps seeing the "Finnhub 403" symptom.
+
+  Suggested user-facing diagnostic action (no code change required to test):
+    Hit endpoint GET http://127.0.0.1:8000/api/trading/calendar/test (main.py:1258).
+    - If `apify_token_set: true` and `apify_result.ok: true` → Apify works; issue is
+      cache poisoning (FIX A) — restart backend to clear cache, then refresh.
+    - If `apify_token_set: true` but `apify_result.ok: false` or `events: 0` → Apify
+      is broken; check apify_result.error or inspect server log for "Apify calendar
+      fetch failed" warning. Likely date parsing issue (FIX B).
+    - If `apify_token_set: false` → APIFY_TOKEN is NOT loaded from .env. Verify the
+      .env file is at python-backend/.env (start-backend.sh sets CWD to python-backend/
+      so env_file=".env" resolves there). Verify file is named .env (not .env.local,
+      not .env.txt). Verify APIFY_TOKEN= line has no surrounding quotes/whitespace.
+
+No code changes made — read-only audit.
