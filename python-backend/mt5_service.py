@@ -587,14 +587,28 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
         else:
             log.info("position verified: ticket=%s sl=%s tp=%s OK",
                      r.order, p.sl, p.tp)
+    # CRITICAL: r.order is the ORDER ticket, not the POSITION ticket.
+    # In MT5, these are different numbers. positions_get(ticket=r.order)
+    # works because MT5 maps order→position, BUT when the position is
+    # later closed via close_position(position_ticket), the ticket won't
+    # match what we saved in DB (which was the order ticket).
+    # Solution: fetch the actual position_id from the position itself.
+    position_ticket = r.order  # fallback (usually same for new positions)
+    if pos_check:
+        position_ticket = pos_check[0].ticket
+        if position_ticket != r.order:
+            log.info("order ticket=%s → position ticket=%s (different — "
+                     "using position ticket for DB save)", r.order, position_ticket)
+
     # Always return the INTENDED sl/tp so callers can persist them as a
     # fallback for the manage loop (in case broker drops them later).
     return {
-        "ok": True, "ticket": r.order, "price": r.price,
+        "ok": True, "ticket": position_ticket, "price": r.price,
         "volume": filled, "requested_volume": volume,
         "partial": filled < volume,
         "sl": sl_rounded, "tp": tp_rounded,
         "broker_sl": broker_sl, "broker_tp": broker_tp,
+        "order_ticket": r.order,  # keep for debugging
     }
 
 
