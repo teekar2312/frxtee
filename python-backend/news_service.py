@@ -11,7 +11,15 @@ from config import settings
 
 log = logging.getLogger("news")
 
-CACHE: dict = {"news": [], "ts": 0.0, "calendar": [], "cal_ts": 0.0}
+CACHE: dict = {
+    "news": [], "ts": 0.0,
+    "calendar": None, "cal_ts": 0.0,   # calendar=None (not []) so cache
+                                        # check can distinguish "never fetched"
+                                        # from "fetched but empty"
+    "finnhub_403_until": 0.0,           # Finnhub 403 backoff timestamp —
+                                        # separate from calendar cache so
+                                        # Apify is retried on every cache-miss
+}
 # prevent thundering herd on cache expiry
 _news_lock = asyncio.Lock()
 _cal_lock = asyncio.Lock()
@@ -155,7 +163,7 @@ def _sentiment(entities: list) -> str:
 
 
 async def economic_calendar() -> list[dict]:
-    """High-impact upcoming events. Cached 5 min with thundering-herd lock.
+    """High-impact upcoming events. Cached 6 hours with thundering-herd lock.
 
     Provider priority:
       1. Apify ForexFactory scraper (if APIFY_TOKEN set) — free $5/mo credit
@@ -163,14 +171,22 @@ async def economic_calendar() -> list[dict]:
       3. Empty list (demo mode — news filter disabled)
 
     Apify is preferred because Finnhub free tier returns 403 on calendar.
+
+    Cache design (fixed — was poisoned by Finnhub 403):
+      - CACHE["calendar"] starts as None (not []) so the first call always
+        tries Apify. If Apify succeeds, calendar is cached for 6 hours.
+      - Finnhub 403 uses a SEPARATE backoff key ("finnhub_403_until") so
+        it doesn't poison the calendar cache. Apify is retried on every
+        cache-miss (every 6 hours), regardless of Finnhub's state.
     """
     now_ts = datetime.now(timezone.utc).timestamp()
-    if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
+    # cache hit ONLY if calendar is not None AND not expired
+    if CACHE["calendar"] is not None and now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL:
         return CACHE["calendar"]
     async with _cal_lock:
         # double-check after acquiring lock
         now_ts = datetime.now(timezone.utc).timestamp()
-        if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
+        if CACHE["calendar"] is not None and now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL:
             return CACHE["calendar"]
 
         # ---- provider 1: Apify (preferred — free ForexFactory scraper) ----
@@ -183,16 +199,17 @@ async def economic_calendar() -> list[dict]:
                 log.info("📊 Calendar: Apify SUCCESS — %d high-impact events", len(cal))
                 CACHE["calendar"] = cal
                 CACHE["cal_ts"] = now_ts
-                CACHE["cal_403_logged"] = False  # reset Finnhub 403 flag
+                CACHE["cal_403_logged"] = False
                 return cal
-            # Apify failed — log WHY and fall through to Finnhub
-            log.warning("📊 Calendar: Apify returned empty (check token/credit/actor). "
-                        "Falling through to Finnhub as backup...")
+            log.warning("📊 Calendar: Apify returned empty (check token/credit/actor "
+                        "or date parsing). Falling through to Finnhub as backup...")
         else:
             log.info("📊 Calendar: APIFY_TOKEN not set — using Finnhub/demo")
 
         # ---- provider 2: Finnhub (needs paid plan — free = 403) ----
-        if settings.finnhub_api_key:
+        # Check Finnhub 403 backoff — skip Finnhub for 1 hour after 403
+        # (separate from calendar cache so Apify is NOT blocked)
+        if settings.finnhub_api_key and now_ts > CACHE.get("finnhub_403_until", 0):
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             try:
                 async with httpx.AsyncClient(timeout=15) as c:
@@ -202,30 +219,32 @@ async def economic_calendar() -> list[dict]:
                     )
                     r.raise_for_status()
                     cal = r.json().get("economicCalendar", [])[:10]
+                    # success — cache + return
+                    CACHE["calendar"] = cal
+                    CACHE["cal_ts"] = now_ts
+                    return cal
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 403:
+                    # 403 = free plan. Set Finnhub backoff (NOT calendar cache)
+                    # so Apify is retried on next cache-miss.
+                    CACHE["finnhub_403_until"] = now_ts + 3600  # 1 hour backoff
                     if CACHE.get("cal_403_logged") is not True:
                         log.warning(
-                            "📊 Finnhub economic calendar: 403 Forbidden — this endpoint "
-                            "requires a paid Finnhub plan. Set APIFY_TOKEN in .env for "
-                            "free ForexFactory calendar via Apify (https://console.apify.com). "
-                            "This message will not repeat for 1 hour."
+                            "📊 Finnhub economic calendar: 403 Forbidden — paid plan "
+                            "required. %s. Apify will be retried on next cache-miss "
+                            "(in 6 hours). This Finnhub message will not repeat for 1 hour.",
+                            "Set APIFY_TOKEN for free ForexFactory calendar" if not apify_token
+                            else "Apify also failed — check token/credit"
                         )
                         CACHE["cal_403_logged"] = True
-                    cal = []
-                    CACHE["calendar"] = cal
-                    CACHE["cal_ts"] = now_ts + 3600 - _CAL_CACHE_TTL
-                    return cal
                 else:
                     log.warning("calendar fetch failed (HTTP %d): %s — using empty",
                                 exc.response.status_code, exc)
-                    cal = []
             except Exception as exc:  # noqa: BLE001
                 log.warning("calendar fetch failed: %s — using empty", exc)
-                cal = []
-        else:
-            # ---- provider 3: demo (no API keys) ----
-            cal = _demo_calendar()
+
+        # ---- provider 3: demo (no API keys or all failed) ----
+        cal = _demo_calendar()
         CACHE["calendar"] = cal
         CACHE["cal_ts"] = now_ts
         return cal
@@ -285,32 +304,65 @@ async def _fetch_apify_calendar() -> list[dict]:
                 if impact != "high":
                     continue
                 # ForexFactory date+time fields — combine into ISO8601
-                date_str = item.get("date", "")
-                time_str = item.get("time", "")
-                if date_str:
-                    # ForexFactory date format: "Oct 8" or "Oct 8, 2026"
-                    # Strip year if present so time-combining works correctly
-                    try:
-                        from datetime import datetime as _dt
-                        year = _dt.now(timezone.utc).year
-                        # normalize: extract date part without year
-                        # "Oct 8, 2026" → "Oct 8"; "Oct 8" → "Oct 8"
-                        date_no_year = date_str.split(",")[0].strip()
-                        # parse date (with current year for ISO8601)
-                        parsed = _dt.strptime(f"{date_no_year} {year}", "%b %d %Y")
-                        # if time is provided and not "All Day"/"Tentative",
-                        # combine date + time for accurate event timestamp
-                        if time_str and time_str.lower() not in ("all day", "tentative"):
-                            try:
-                                # "Oct 8" + "8:30am" → datetime
-                                full = _dt.strptime(f"{date_no_year} {time_str}", "%b %d %I:%M%p")
-                                parsed = full
-                            except Exception:
-                                pass  # keep date-only parsed (midnight)
-                        iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
-                    except Exception:
+                # Support multiple date formats (Apify actors may return
+                # different formats depending on ForexFactory HTML changes)
+                date_str = str(item.get("date", "")).strip()
+                time_str = str(item.get("time", "")).strip()
+                if not date_str:
+                    continue
+                try:
+                    from datetime import datetime as _dt
+                    year = _dt.now(timezone.utc).year
+                    iso_time = None
+
+                    # Try multiple date formats — ForexFactory + ISO + others
+                    # Each format tries: date-only, then date+time if available
+                    date_formats = [
+                        "%b %d %Y",           # "Oct 8 2026"
+                        "%b %d, %Y",          # "Oct 8, 2026"
+                        "%B %d %Y",            # "October 8 2026"
+                        "%B %d, %Y",           # "October 8, 2026"
+                        "%Y-%m-%d",            # "2026-10-08" (ISO)
+                        "%d %b %Y",            # "8 Oct 2026"
+                        "%d/%m/%Y",            # "08/10/2026"
+                        "%m/%d/%Y",            # "10/08/2026"
+                    ]
+                    time_formats = [
+                        "%I:%M%p",             # "8:30am"
+                        "%H:%M",               # "08:30"
+                        "%I:%M %p",            # "8:30 AM"
+                    ]
+
+                    for df in date_formats:
+                        # Try date-only parse (strip comma, add year if missing)
+                        test_date = date_str
+                        # if no year in string, append current year
+                        if str(year) not in test_date:
+                            test_date = f"{date_str.rstrip(',')} {year}"
+                        try:
+                            parsed = _dt.strptime(test_date, df)
+                            # Try to add time if provided
+                            if time_str and time_str.lower() not in ("all day", "tentative", ""):
+                                for tf in time_formats:
+                                    try:
+                                        # extract date part without year from test_date
+                                        date_only = test_date.replace(str(year), "").strip().rstrip(",")
+                                        full = _dt.strptime(f"{date_only} {time_str}", f"%b %d {tf}" if "b" in df else f"%B %d {tf}" if "B" in df else f"%d {tf}" if df.startswith("%d") else f"{tf}")
+                                        parsed = full
+                                        break
+                                    except Exception:
+                                        continue
+                            iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
+                            break
+                        except Exception:
+                            continue
+
+                    if iso_time is None:
+                        log.debug("Apify calendar: could not parse date '%s' time '%s' — skipping",
+                                  date_str, time_str)
                         continue
-                else:
+
+                except Exception:
                     continue
                 cal.append({
                     "event": item.get("event", item.get("title", "economic event")),
