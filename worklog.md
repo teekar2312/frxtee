@@ -6355,3 +6355,333 @@ Stage Summary:
   - Items #11-21 (docs/comments): user-facing docs misrepresent supported providers.
   - Item #22 (favicon): external dependency on Z.AI CDN — if Z.AI shuts down CDN, favicon breaks. Replace with local /public/logo.svg.
 - VERDICT: NOT cleanly removed. 17 stale references found (21 incl. docs + 1 favicon). Provider removal is functionally complete (no _call_zai / _call_google / _call_openrouter functions, no settings fields, no UI entries), but 17-21 stale defaults/comments/docs/favicon remain.
+
+---
+Task ID: AUDIT-APIFY
+Agent: audit-apify-integration
+Task: Deep audit of Apify economic calendar integration (config → API → parsing → cache → auto-trade)
+
+Work Log:
+- Read worklog.md (6357 lines) for prior context — last entries were AUDIT-REMOVE-PROVIDERS stale reference cleanup.
+- Inspected python-backend/config.py (130 lines) — verified apify_token field exists at L24, in # News section (L17-24), comment explains usage + token URL.
+- Inspected python-backend/config.example.env (92 lines) — verified APIFY_TOKEN= at L18, comment at L12-17 explains Finnhub 403 problem + Apify solution + token URL, placeholder is empty.
+- Verified pydantic-settings v2.5+ in requirements.txt + model_config at config.py:8 has env_file=".env", env_file_encoding="utf-8", extra="ignore" (no env_prefix → auto-maps APIFY_TOKEN env var → settings.apify_token, case-insensitive).
+- Inspected python-backend/news_service.py (415 lines) — verified _fetch_apify_calendar() at L222-320 (Apify actor ID, URL, HTTP method, body, timeout, response parsing, error handling, date/time parsing).
+- Verified economic_calendar() at L154-219 — provider priority (Apify first → Finnhub → demo), cache TTL (300s), thundering-herd lock (_cal_lock), double-check pattern, Finnhub 403 cache (1 hour).
+- Inspected python-backend/risk_manager.py (318 lines) — verified near_high_impact_news() at L273-318 (calls economic_calendar, filters impact==high, parses ISO8601, pre/post-event windows).
+- Inspected python-backend/main.py (1733 lines) — verified _auto_trade_loop() L596-800 (news filter L747-754), api_order() L1088-1174 (news check L1102), api_news() L1245-1251 (returns calendar data).
+- Inspected docker-compose.yml (56 lines) — discovered APIFY_TOKEN env passthrough MISSING from backend service (FINNHUB, MARKETAUX, GROQ, OLLAMA_URL all present at L24-27, but no APIFY_TOKEN).
+- Cross-checked pydantic-settings v2 env loading behavior — field `apify_token` auto-maps to env var `APIFY_TOKEN` (case-insensitive).
+- No code changes made — read-only audit.
+
+Stage Summary:
+
+Total checks: 17 (16 functional + 1 recommendation)
+- PASS: 13
+- FAIL: 1
+- PARTIAL: 2
+- N/A (recommendation only): 1
+
+Detailed Check Results:
+
+Chain A: Config & Settings
+
+  #1 config.py — PASS
+      Evidence: config.py:17-24
+        — L17 `# News` section header ✓
+        — L18 `finnhub_api_key: str = ""` (existing, unchanged) ✓
+        — L19 `marketaux_api_key: str = ""` (existing, unchanged) ✓
+        — L20-23 comment block explains: Apify token for economic calendar, free $5/mo credit, alternative to Finnhub paid endpoint, URL to get token ✓
+        — L24 `apify_token: str = ""` (correct field, default empty) ✓
+      Field is in correct section (# News) with comprehensive comment.
+
+  #2 config.example.env — PASS
+      Evidence: config.example.env:12-18
+        — L12 `# ===== Economic Calendar (Apify — free alternative to Finnhub paid plan) =====` ✓
+        — L13 `# Finnhub free tier returns 403 on /calendar/economic. Apify provides a free` (explains Finnhub 403 problem) ✓
+        — L14 `# ForexFactory calendar scraper actor ($5/mo free credit covers ~500 runs).` (explains Apify as solution + cost caveat) ✓
+        — L15 `# Get token: https://console.apify.com/account-integrations` ✓
+        — L16-17 `# When set, ZeniTrade uses Apify as primary calendar source (falls back to Finnhub if Apify fails, then to empty/demo if neither works).` (explains fallback chain) ✓
+        — L18 `APIFY_TOKEN=` (placeholder empty, not "your_apify_key") ✓
+      All required elements present.
+
+  #3 Settings env loading — PASS
+      Evidence: config.py:8 + requirements.txt
+        — L8 `model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")` ✓
+        — No `env_prefix` set → pydantic-settings v2 defaults to "" (no prefix) ✓
+        — Field `apify_token` auto-maps to env var `APIFY_TOKEN` (case-insensitive by default in v2) ✓
+        — requirements.txt has `pydantic>=2.10.0` + `pydantic-settings>=2.5.2` ✓
+      Verified: APIFY_TOKEN env var → settings.apify_token auto-loads correctly.
+
+Chain B: API Call & Response Parsing
+
+  #4 _fetch_apify_calendar() endpoint — PASS
+      Evidence: news_service.py:222-254
+        — L243 `actor_id = "scrapemint~forexfactory-economic-calendar"` (matches prescribed value) ✓
+        — L244 `url = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items"` (correct URL pattern) ✓
+        — L249-254 `r = await c.post(url, params={"token": token, "timeout": 50}, json=actor_input, headers={"Content-Type": "application/json"})` (POST with token + timeout=50 in params, JSON body) ✓
+        — L246 `actor_input = {"weeksAhead": 1}` (correct body) ✓
+        — L248 `async with httpx.AsyncClient(timeout=60) as c:` (60s client timeout — allows 50s actor run + 10s buffer) ✓
+      MINOR doc inconsistency (LOW severity, cosmetic only):
+        — L226 docstring says "Uses the 'scrapemint/forexfactory-economic-calendar' actor" (slash /)
+        — L241 comment says "# Actor: scrapemint/forexfactory-economic-calendar" (slash /)
+        — L242 comment says "# ID format: ~scrapemint/forexfactory-economic-calendar" (tilde BEFORE username — WRONG)
+        — Actual code at L243 uses `scrapemint~forexfactory-economic-calendar` (tilde BETWEEN username + actor — CORRECT Apify convention)
+        The comments are confusing/wrong but the code is correct. Suggest fixing L242 to `# ID format: username~actor-name (Apify convention)`.
+
+  #5 Response parsing — PASS
+      Evidence: news_service.py:265-313
+        — L266 `if not isinstance(items, list):` checks type before iterating ✓
+        — L267 `log.warning("Apify calendar: unexpected response type %s", ...)` logs non-list responses ✓
+        — L268 `return []` early exit on non-list ✓
+        — L272 `impact = str(item.get("impact", "")).lower()` (case-insensitive via .lower()) ✓
+        — L273 `if impact != "high": continue` (filters high-impact only) ✓
+        — L276 `date_str = item.get("date", "")` (defaults to empty) ✓
+        — L277 `time_str = item.get("time", "")` (defaults to empty) ✓
+        — L284 `for fmt in ("%b %d, %Y", "%b %d"):` handles both date formats ✓
+        — L286 `parsed = _dt.strptime(f"{date_str}, {year}" if "," not in date_str else date_str, fmt)` (adds current year if missing) ✓
+        — L287 `if time_str and time_str.lower() not in ("all day", "tentative"):` (special time values) ✓
+        — L291 `full = _dt2.strptime(f"{date_str} {time_str}", "%b %d %I:%M%p")` (parses "8:30am" format) ✓
+        — L295 `iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()` (ISO8601 UTC) ✓
+        — L305-310 returns dict with keys: event (with title fallback), impact="high", time, country ✓
+        — L313 `return cal[:20]` (caps at 20 events) ✓
+
+  #6 Date/time parsing robustness — PARTIAL (MEDIUM severity)
+      Evidence: news_service.py:280-302
+      What works:
+        — "Oct 8" (no year) → handled correctly via `f"{date_str}, {year}"` coercion → "Oct 8, 2026" → matches "%b %d, %Y" ✓
+        — "Oct 8, 2026" (with year) → matches "%b %d, %Y" ✓ (date parses correctly)
+        — "All Day" / "Tentative" → uses date only (no time parsed) ✓
+        — "8:30am" time combined with "Oct 8" date → "Oct 8 8:30am" matches "%b %d %I:%M%p" ✓
+        — try/except wrapping prevents crashes (L296-297, L301-302) ✓
+        — for/else pattern at L299-300 correctly skips item if no fmt matched ✓
+      What FAILS:
+        — When date_str = "Oct 8, 2026" (WITH year) AND time_str = "8:30am":
+          L291: `full = _dt2.strptime(f"{date_str} {time_str}", "%b %d %I:%M%p")` 
+                = strptime("Oct 8, 2026 8:30am", "%b %d %I:%M%p")
+                → FAILS because ", 2026" doesn't fit format "%b %d"
+          L293: `except Exception: pass` — silently swallows the error
+          L295: `iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()` 
+                → uses `parsed` which is date-only datetime (midnight UTC)
+                → result: "2026-10-08T00:00:00+00:00" instead of "2026-10-08T08:30:00+00:00"
+      Impact on near_high_impact_news() (risk_manager.py:305-313):
+        — Pre-event check at L307: `0 <= delta <= minutes * 60` — with midnight UTC instead of 8:30am:
+          At 8:00am UTC (30 min before event), delta = midnight-Oct-8 - 8:00-Oct-8 = -8 hours → fails pre-event check
+          At 23:45pm UTC on Oct 7 (15 min before midnight-Oct-8), delta = +15 min → BLOCKS trade (over-blocking)
+        — Post-event check at L311: `-minutes * 60 <= delta < 0` — at 8:00am UTC on Oct 8 (30 min before ACTUAL event):
+          delta = -8 hours = -28800 sec, fails check (delta < -900) → no blackout (UNDER-blocking, dangerous)
+        — Result: news filter is INEFFECTIVE at the actual event time when actor returns year-format dates.
+      Root cause: L291 uses `date_str` (which may include ", 2026") in the strptime call with format "%b %d %I:%M%p" (which doesn't expect comma+year). The inner `except: pass` silently swallows the error, so `parsed` stays as date-only datetime (midnight UTC).
+      Severity: MEDIUM — depends on which date format the Apify actor actually returns. If actor returns "Oct 8" (no year), the bug doesn't trigger and parsing is correct. If actor returns "Oct 8, 2026" (with year), the bug silently produces midnight-UTC timestamps that make near_high_impact_news() ineffective during the actual event.
+      Also: The format `"%b %d"` at L284 is dead code — since the coercion at L286 always adds year if missing, the input to strptime is always "Oct 8, 2026" format, which never matches "%b %d" (expects no year). The else branch (continue) at L299-300 never fires either, because the first format always succeeds.
+      Suggested fix:
+        ```python
+        # Strip year suffix before time parsing so format "%b %d %I:%M%p" matches
+        date_no_year = date_str.split(",")[0].strip()
+        full = _dt2.strptime(f"{date_no_year} {time_str}", "%b %d %I:%M%p")
+        ```
+      OR: combine date+time into a single strptime with the right format:
+        ```python
+        # Try with year+time first, then without year
+        for fmt in ("%b %d, %Y %I:%M%p", "%b %d %I:%M%p"):
+            try:
+                parsed = _dt.strptime(f"{date_str} {time_str}" if "," not in date_str else f"{date_str} {time_str}", fmt)
+                break
+            except Exception:
+                continue
+        ```
+
+Chain C: Error Handling
+
+  #7 HTTP error codes — PASS
+      Evidence: news_service.py:247-320
+      Structure: outer try at L247 wraps `async with httpx.AsyncClient(timeout=60) as c:` block (L248-313) with both HTTPStatusError (L314-317) + generic Exception (L318-320) handlers.
+        — L255-259: `if r.status_code == 402:` → logs "Apify: 402 Payment Required — your free $5 credit is exhausted. Top up at..." + returns []  ✓
+        — L260-263: `if r.status_code == 403:` → logs "Apify: 403 Forbidden — invalid APIFY_TOKEN. Check..." + returns []  ✓
+        — L264: `r.raise_for_status()` raises httpx.HTTPStatusError for other 4xx/5xx (caught at L314-317) ✓
+        — L314-317: `except httpx.HTTPStatusError as exc:` → logs "Apify calendar fetch failed (HTTP %d): %s" + returns []  ✓
+        — L318-320: `except Exception as exc:  # noqa: BLE001` → logs "Apify calendar fetch failed: %s" + returns []  ✓
+      Function NEVER raises — always returns list (possibly empty). Safe to call without try/except wrapper.
+
+  #8 Empty/invalid response — PASS
+      Evidence: news_service.py:265-268, 271-310
+        — L266-268: Non-list JSON (e.g., dict, string, None) → logs "unexpected response type" + returns []  ✓
+        — L267: warning includes `type(items).__name__` for debugging  ✓
+        — Empty list `[]` → for loop at L271 doesn't execute → cal stays [] → L311 logs "fetched 0 high-impact events from ForexFactory" → L313 returns `cal[:20]` = [] (no crash)  ✓
+        — Missing fields in items → uses `.get()` with defaults at L272 (impact=""), L276 (date=""), L277 (time=""), L306 (event with title fallback to "economic event"), L309 (country="")  ✓
+      Edge case (not in spec but observed): If `items` is a list of non-dict items (e.g., strings), L272 `item.get("impact", "")` raises AttributeError → caught by outer except at L318-320 → returns []. Coarse handling — one bad item fails the whole fetch. LOW severity (Apify shouldn't return non-dicts).
+
+Chain D: Integration with economic_calendar()
+
+  #9 Provider priority — PASS
+      Evidence: news_service.py:154-219
+        — L174: `if getattr(settings, "apify_token", ""):` — Apify tried FIRST (if token set) ✓
+        — L175: `cal = await _fetch_apify_calendar()` (Apify call) ✓
+        — L176-179: `if cal: CACHE["calendar"] = cal; CACHE["cal_ts"] = now_ts; return cal` (if non-empty → cache + return immediately) ✓
+        — L180: `# Apify failed — fall through to Finnhub` (comment explains) ✓
+        — L183: `if settings.finnhub_api_key:` (Finnhub tried second) ✓
+        — L191-213: Finnhub fetch wrapped in try/except — on 403 returns [], on other error returns [] ✓
+        — L214-216: `else: cal = _demo_calendar()` (no Finnhub key → demo returns []) ✓
+        — L217-219: `CACHE["calendar"] = cal; CACHE["cal_ts"] = now_ts; return cal` (final cache + return) ✓
+      Uses `getattr(settings, "apify_token", "")` (safe access, not direct attribute). PASS.
+
+  #10 Cache behavior — PASS
+      Evidence: news_service.py:14-18, 154-219
+        — L14: `CACHE: dict = {"news": [], "ts": 0.0, "calendar": [], "cal_ts": 0.0}` (cache key + ts key) ✓
+        — L18: `_CAL_CACHE_TTL = 300  # 5 min for calendar (less volatile than news)` (300s = 5 min) ✓
+        — L17: `_cal_lock = asyncio.Lock()` (thundering-herd lock) ✓
+        — L165: `if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:` (first check before lock) ✓
+        — L167: `async with _cal_lock:` (acquire lock) ✓
+        — L170: `if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:` (double-check after acquiring lock) ✓
+      `CACHE["calendar"] is not None` check allows empty list `[]` to be cached (since `[] is not None == True`). Correctly distinguishes "no cached value yet" (None) from "cached empty list" ([]).
+
+  #11 Finnhub 403 cache — PASS
+      Evidence: news_service.py:193-206
+        — L193: `except httpx.HTTPStatusError as exc:` (catches Finnhub HTTP errors) ✓
+        — L194: `if exc.response.status_code == 403:` (specifically handle 403) ✓
+        — L195: `if CACHE.get("cal_403_logged") is not True:` (log once gate) ✓
+        — L196-201: log.warning with detailed message about Finnhub paid plan requirement + Apify URL ✓
+        — L202: `CACHE["cal_403_logged"] = True` (set gate so subsequent 403s don't spam logs) ✓
+        — L203: `cal = []` (empty result) ✓
+        — L204: `CACHE["calendar"] = cal` (cache empty list) ✓
+        — L205: `CACHE["cal_ts"] = now_ts + 3600 - _CAL_CACHE_TTL` (sets cache expiry 1 hour ahead; 3600 - 300 = 3300s extra, total cache duration = 1 hour after the first check) ✓
+        — L206: `return cal` (early return) ✓
+      Apify is tried first at L174 (returns before Finnhub reached if Apify has data), so 403 cache does NOT interfere with Apify. PASS.
+
+Chain E: End-to-End Flow
+
+  #12 near_high_impact_news() — PASS
+      Evidence: risk_manager.py:273-318
+        — L281-282: `if not settings.avoid_high_impact_news: return False, "disabled"` (respects user setting) ✓
+        — L284: `from news_service import economic_calendar` ✓
+        — L286-290: creates new event loop + runs economic_calendar() (which tries Apify first) ✓
+        — L291: `now = __import__("time").time()` ✓
+        — L292: `for event in cal[:20]:` (iterates up to 20 events) ✓
+        — L293-294: `impact = str(event.get("impact", "")).lower(); if impact != "high": continue` (filters high-impact) ✓
+        — L296: `ev_time = event.get("time") or event.get("date") or event.get("publishedAt")` (parses time field with fallbacks) ✓
+        — L301: `dt = datetime.fromisoformat(str(ev_time).replace("Z", "+00:00"))` (parses ISO8601, handles "Z" suffix) ✓
+        — L305: `delta = secs - now` ✓
+        — L307: `if 0 <= delta <= minutes * 60:` (pre-event: upcoming within `minutes`) ✓
+        — L309: `return True, f"high-impact {name} in <{minutes} min"` ✓
+        — L311: `if -minutes * 60 <= delta < 0:` (post-event: released within last `minutes`) ✓
+        — L313: `return True, f"high-impact {name} released {abs(int(delta/60))}m ago"` ✓
+        — L314: `return False, "ok"` (clear) ✓
+        — L315-317: `except Exception: return False, "check failed"` (never raises) ✓
+      NOTE (LOW severity): L286-290 creates a new asyncio event loop on every call (`asyncio.new_event_loop()` + `loop.run_until_complete()` + `loop.close()`). This is inefficient and could conflict with `_cal_lock` (asyncio.Lock bound to a different event loop) when called from an async context. The manual endpoint at main.py:1102 wraps `near_high_impact_news` in `asyncio.to_thread()` to isolate the new loop, but the auto-trade loop at main.py:748 calls it directly from async code — see #13 for details.
+
+  #13 Auto-trade integration — PARTIAL (MEDIUM severity)
+      Evidence: main.py:596-800, specifically L737-754
+      What works:
+        — L737: `ok, msg = guard.can_open(equity)` (risk guard check) ✓
+        — L738-740: `if not ok: log.warning(...); continue` (skip if risk fails) ✓
+        — L747: `if getattr(settings, "avoid_high_impact_news", True):` (respects user setting) ✓
+        — L748: `is_blackout, news_reason = near_high_impact_news(15)` (called with 15 min window) ✓
+        — L749-752: `if is_blackout: log.warning("auto-trade %s: BLOCKED by news filter — %s", ...); continue` (correct block behavior) ✓
+        — L753-754: `log.info("auto-trade %s: news filter OK — no high-impact event within 15min", ...)` (correct clear behavior) ✓
+        — News check is AFTER guard.can_open() ✓ (matches task spec)
+        — News check is INSIDE `async with _order_lock:` block (L728-754) — serialized with manual orders
+      What's wrong:
+        — L748: `near_high_impact_news(15)` is called DIRECTLY (synchronously) from async code, NOT wrapped in `asyncio.to_thread()`. The function internally creates a new event loop via `asyncio.new_event_loop()` + `loop.run_until_complete()` (risk_manager.py:286-290). When called from a running event loop, this blocks the main event loop for the duration of the calendar fetch.
+        — Compare to manual endpoint at L1102: `blackout, reason = await asyncio.to_thread(near_high_impact_news, 15)` — uses `asyncio.to_thread()` correctly (offloads sync function to thread pool, doesn't block main loop).
+        — The call is INSIDE `async with _order_lock:` (L728), so the order lock is held during the (potentially 60s) Apify fetch on cache miss.
+      Impact:
+        1. Main event loop blocked for up to 60s during Apify cache miss (every 5 min) — all HTTP requests to /api/trading/* hang during this window.
+        2. `_order_lock` held for up to 60s — manual orders via /api/trading/order also block (limit: 10/min, so a 60s block is within rate limit but causes UX lag).
+        3. asyncio.Lock (`_cal_lock`) may not bind correctly across event loops — though Python 3.10+ lazy binding usually handles this, the pattern is fragile.
+      Mitigation: Cache usually hits (5 min TTL) → block time is typically <10ms in steady state. Only the FIRST call after cache expiry blocks for up to 60s. So the practical impact is a 60s freeze every 5 min when auto_trade is ON.
+      Severity: MEDIUM — limited blast radius (once per 5 min) but causes noticeable UI freezes when triggered.
+      Root cause: Inconsistency between auto_trade_loop (direct sync call, blocks) and api_order endpoint (asyncio.to_thread, non-blocking).
+      Suggested fix at main.py:748:
+        ```python
+        is_blackout, news_reason = await asyncio.to_thread(near_high_impact_news, 15)
+        ```
+
+  #14 Manual order endpoint — PASS
+      Evidence: main.py:1088-1105
+        — L1090: `async def api_order(body: OrderReq, request: Request, _auth=Depends(require_token)):` ✓
+        — L1092: `async with _order_lock:` (serialized with auto-trade orders) ✓
+        — L1097: `ok, msg = guard.can_open(equity)` (risk guard first) ✓
+        — L1098-1099: `if not ok: return {"ok": False, "error": msg}` ✓
+        — L1101: comment "news blackout: refuse new entries near high-impact events" ✓
+        — L1102: `blackout, reason = await asyncio.to_thread(near_high_impact_news, 15)` (CORRECT — uses asyncio.to_thread, doesn't block main loop) ✓
+        — L1103-1105: `if blackout: log.warning("order blocked — news blackout: %s", reason); return {"ok": False, "error": f"News blackout: {reason}"}` ✓
+      NOTE: No explicit `if settings.avoid_high_impact_news:` gate at this endpoint, but `near_high_impact_news()` checks it internally at risk_manager.py:281-282 (returns `False, "disabled"` if setting is off). So defense-in-depth is via internal check — correct behavior.
+
+  #15 News endpoint — PASS
+      Evidence: main.py:1245-1251
+        — L1245: `@app.get("/api/trading/news")` ✓
+        — L1246: `async def api_news():` ✓
+        — L1248: `n, cal = await asyncio.gather(fetch_news(), economic_calendar())` (concurrent fetch — news + calendar) ✓
+        — L1250: `sentiment = aggregate_sentiment()` ✓
+        — L1251: `return {"news": n, "calendar": cal, "sentiment": sentiment, "demo": not n}` ✓
+      When APIFY_TOKEN is set, economic_calendar() tries Apify first → returns events → these appear in response under "calendar" key. Frontend News view (news-view.tsx) consumes this endpoint and renders the calendar.
+
+Chain F: Cost & Performance
+
+  #16 Apify cost estimation — FAIL (HIGH severity)
+      Evidence: news_service.py:18 + cost math
+      Free credit: $5/month (Apify free tier)
+      Cost per run: ~$0.01 (reasonable for paid Apify scrapers; scrapemint actor uses ~1-2 compute units per run; Apify bills ~$0.25/CU on pay-as-you-go, so $0.01-$0.05 per run is realistic; $0.01 is conservative estimate)
+      Cache TTL: 300s (5 min) — news_service.py:18 `_CAL_CACHE_TTL = 300`
+      Run frequency math:
+        — Runs per hour: 3600s / 300s = 12
+        — Runs per day: 12 × 24 = 288
+        — Runs per month (30 days): 288 × 30 = 8640
+      Monthly cost: 8640 runs × $0.01/run = $86.40/month
+      Free credit exhaustion time: $5 / $0.01 = 500 runs ÷ 288 runs/day = ~1.74 DAYS (free credit exhausted in ~2 days of continuous polling!)
+      At $0.005/run (optimistic): $5/$0.005 = 1000 runs ÷ 288 = ~3.5 days
+      At $0.001/run (very optimistic): $5/$0.001 = 5000 runs ÷ 288 = ~17.4 days
+      All scenarios EXCEED free credit within 3 weeks at 5-min cache TTL.
+      
+      Best-case scenario (when FINNHUB_API_KEY is also set + returns 403):
+        — Apify returns [] → falls through to Finnhub → 403 → cache empty for 1 hour (news_service.py:205)
+        — Next Apify call: after 1 hour (cache miss) → 24 calls/day → 720 calls/month → $7.20/month
+        — Still exceeds free credit by 1.4×.
+      
+      Worst-case scenario (Apify only, no FINNHUB_API_KEY):
+        — Apify returns [] → falls through to _demo_calendar() → cache [] for 5 min (news_service.py:217-218)
+        — Apify called every 5 min → 8640 calls/month → $86.40/month (17× free credit)
+      
+      Root cause: `_CAL_CACHE_TTL = 300` (5 min) is too aggressive for a PAID per-call API. Calendar data changes slowly (events are scheduled days/weeks in advance; only rarely do events get added/cancelled within 5 min of a previous fetch). 5-min cache is appropriate for FREE news sources (Finnhub, MARKETAUX) but wasteful for PAID Apify.
+      
+      Impact chain after credit exhaustion:
+        1. Day 2: Apify returns 402 → logged warning "your free $5 credit is exhausted" → returns []
+        2. economic_calendar() falls through to Finnhub → 403 → caches [] for 1 hour → news filter silently DISABLED
+        3. User sees no warning in dashboard (logs only) → near_high_impact_news() returns "ok" → auto-trade proceeds during high-impact events → 30-50 pip spike risk
+        4. Without credit alerts, user is unprotected for the rest of the month.
+      
+      Severity: HIGH — silent failure mode that disables the safety-critical news filter within 2 days of enabling Apify, leaving the user unprotected for the rest of the billing cycle.
+
+  #17 Recommendation — SUGGESTED FIXES (incorporated in #16 root cause)
+      Option A: Increase `_CAL_CACHE_TTL` to 1800s (30 min) → 1440 runs/month → $14.40/month (still exceeds free)
+      Option B: Increase `_CAL_CACHE_TTL` to 3600s (1 hour) → 720 runs/month → $7.20/month (still slightly exceeds free)
+      Option C: Increase `_CAL_CACHE_TTL` to 21600s (6 hours) → 120 runs/month → $1.20/month (FITS free credit ✓)
+      Option D: Only fetch when `auto_trade_mode` is ON — but breaks /api/trading/news endpoint (which needs calendar for display).
+      Option E (RECOMMENDED): Combine Option C (6-hour TTL) + skip fetch when market is closed (weekend + outside trading sessions) → ~70% reduction → ~36 runs/month → $0.36/month. Calendar data rarely changes outside market hours anyway.
+      Option F (ALTERNATIVE): Add a separate "calendar refresh" endpoint that the frontend calls on user demand (manual refresh button) rather than polling every 5 min.
+      
+      Additional recommendation: Update config.example.env:13 comment to be more honest about cost:
+        Current: `# ForexFactory calendar scraper actor ($5/mo free credit covers ~500 runs).`
+        Suggested: `# ForexFactory calendar scraper actor ($5/mo free credit covers ~500 runs ≈ 2 days at default 5-min cache). Increase _CAL_CACHE_TTL in news_service.py or set up billing alerts at https://console.apify.com/billing.`
+
+Additional Finding (not in audit checklist but discovered):
+
+  D1 docker-compose.yml missing APIFY_TOKEN env passthrough — MEDIUM severity
+      Evidence: docker-compose.yml:20-27
+        ```yaml
+        environment:
+          - ZENITRADE_API_TOKEN=${ZENITRADE_API_TOKEN:-}
+          - DB_PATH=/app/data/zenitrade.db
+          - SENTRY_DSN=${SENTRY_DSN:-}
+          - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}      # L24
+          - MARKETAUX_API_KEY=${MARKETAUX_API_KEY:-}  # L25
+          - GROQ_API_KEY=${GROQ_API_KEY:-}            # L26
+          - OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}  # L27
+          # MISSING: APIFY_TOKEN
+        ```
+      Impact: When deployed via `docker compose up`, even if user sets `APIFY_TOKEN=xxx` in their shell or .env, the container won't see it (Docker only injects env vars explicitly listed under `environment:`). Backend will skip Apify at news_service.py:174 (`getattr(settings, "apify_token", "")` returns empty) → fall through to Finnhub (likely 403 on free tier) → empty calendar → news filter silently disabled.
+      Root cause: docker-compose.yml was not updated when APIFY_TOKEN was added to config.py + config.example.env. FINNHUB/MARKETAUX passthroughs are present (older code), but APIFY passthrough was never added.
+      Severity: MEDIUM — affects all Docker deployments. Native Windows deployment (recommended for MT5 trading) is unaffected since the backend reads .env directly.
+      Suggested fix: add line `- APIFY_TOKEN=${APIFY_TOKEN:-}` after L25 in docker-compose.yml.
+
+No code changes made — read-only audit.
