@@ -36,13 +36,14 @@ class Settings(BaseSettings):
     # KV cache and cause OOM on machines with limited memory. Lower this
     # (e.g. 4096) if you still hit OOM; raise it (e.g. 16384) if you have
     # 32GB+ RAM and need longer context.
-    ollama_num_ctx: int = 8192
+    ollama_num_ctx: int = 4096
     # Ollama request timeout in seconds. Local models on CPU can be slow:
     #   - llama3 (8B) on modern CPU: ~20-40s per request
-    #   - llama3.3 (8B) on older CPU: ~60-120s per request
-    #   - larger models (70B): 180s+ (not recommended for CPU)
-    # If you see 'Ollama timeout' warnings in the log, increase this value
-    # or use a smaller/faster model. Default 120s handles most CPU setups.
+    #   - llama3.2 (3B) on any CPU: ~10-20s (RECOMMENDED for CPU)
+    #   - llama3.3 (70B) on CPU: 300s+ (NOT recommended — too slow)
+    #   - larger models: use GPU or cloud instead
+    # If you see 'Ollama timeout' warnings, use a SMALLER model (llama3 or
+    # llama3.2) instead of increasing timeout.
     ollama_timeout: int = 120
 
     # AI confidence threshold (0-100) — signals below this are rejected

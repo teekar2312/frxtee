@@ -60,14 +60,33 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
     """
     # build a rich context string — no truncation (was [:800], slicing mid-JSON)
     ctx = context or {}
-    # format indicators readably for the LLM
-    indicator_str = ""
-    if "indicators" in ctx:
-        ind_parts = []
-        for k, v in ctx["indicators"].items():
-            if v is not None:
-                ind_parts.append(f"{k}={v}")
-        indicator_str = "Indicators: " + ", ".join(ind_parts[:10]) + ". "
+    is_local = provider == "local"
+
+    # For local models (Ollama on CPU), use a lightweight prompt with fewer
+    # indicators to speed up inference. Full 10-indicator context can produce
+    # 500+ token prompts → 60-120s+ on CPU with 8B models. Trimming to top 5
+    # essential indicators + shorter format halves the inference time.
+    if is_local:
+        indicator_str = ""
+        if "indicators" in ctx:
+            ind_parts = []
+            # top 5 most important indicators for local (was top 10 for cloud)
+            priority = ["rsi_14", "ema_20", "ema_50", "atr_14", "macd"]
+            ind_items = ctx["indicators"]
+            for k in priority:
+                if k in ind_items and ind_items[k] is not None:
+                    ind_parts.append(f"{k}={ind_items[k]}")
+            if ind_parts:
+                indicator_str = "Ind: " + ", ".join(ind_parts) + ". "
+    else:
+        # Cloud models: full 10-indicator context (they're fast enough)
+        indicator_str = ""
+        if "indicators" in ctx:
+            ind_parts = []
+            for k, v in ctx["indicators"].items():
+                if v is not None:
+                    ind_parts.append(f"{k}={v}")
+            indicator_str = "Indicators: " + ", ".join(ind_parts[:10]) + ". "
     price_str = ""
     if "current_price" in ctx:
         price_str = f"Current price: {ctx['current_price']}. "
@@ -262,16 +281,18 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
             ) from exc
         if any(kw in msg for kw in ("timeout", "timed out", "read timeout")):
             log.warning("⚠ Ollama timeout: model=%s didn't respond within %ds. "
-                        "Options: 1) increase OLLAMA_TIMEOUT in .env "
-                        "(currently %d) 2) use a smaller model (llama3 instead "
-                        "of llama3.3) 3) reduce OLLAMA_NUM_CTX (currently %d) "
-                        "4) use a cloud provider instead — falling through.",
-                        settings.ollama_model, timeout, timeout,
-                        settings.ollama_num_ctx)
+                        "Model size guide:\n"
+                        "  llama3.2 (3B)   → 10-20s on CPU ✅ RECOMMENDED\n"
+                        "  llama3 (8B)     → 20-40s on CPU ✅ OK\n"
+                        "  mistral (7B)    → 20-40s on CPU ✅ OK\n"
+                        "  llama3.3 (70B)  → 300s+ on CPU ❌ TOO SLOW\n"
+                        "  qwen2.5 (7B)    → 20-40s on CPU ✅ OK\n"
+                        "Fix: run 'ollama pull llama3' (NOT llama3.3), then "
+                        "update model in Settings. Falling through to next provider.",
+                        settings.ollama_model, timeout)
             raise RuntimeError(
                 f"Ollama timeout (model={settings.ollama_model}, "
-                f"timeout={timeout}s) — increase OLLAMA_TIMEOUT or use a "
-                f"smaller model"
+                f"timeout={timeout}s) — use a smaller model (llama3 not llama3.3)"
             ) from exc
         raise
     content = resp["message"]["content"]
