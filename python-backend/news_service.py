@@ -152,14 +152,20 @@ def _sentiment(entities: list) -> str:
 
 
 async def economic_calendar() -> list[dict]:
-    """High-impact upcoming events. Cached 5 min with thundering-herd lock."""
+    """High-impact upcoming events. Cached 5 min with thundering-herd lock.
+
+    Finnhub's /calendar/economic endpoint requires a paid plan — free tier
+    returns 403 Forbidden. When that happens, we cache the empty result for
+    1 hour (instead of 5 min) to avoid spamming the API + log with the same
+    403 error every 5 minutes.
+    """
     now_ts = datetime.now(timezone.utc).timestamp()
-    if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"]:
+    if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
         return CACHE["calendar"]
     async with _cal_lock:
         # double-check after acquiring lock
         now_ts = datetime.now(timezone.utc).timestamp()
-        if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"]:
+        if now_ts - CACHE["cal_ts"] < _CAL_CACHE_TTL and CACHE["calendar"] is not None:
             return CACHE["calendar"]
         if not settings.finnhub_api_key:
             cal = _demo_calendar()
@@ -173,9 +179,32 @@ async def economic_calendar() -> list[dict]:
                     )
                     r.raise_for_status()
                     cal = r.json().get("economicCalendar", [])[:10]
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 403:
+                    # 403 = free plan doesn't include economic calendar.
+                    # Log ONCE then cache empty for 1 hour to avoid spam.
+                    if CACHE.get("cal_403_logged") is not True:
+                        log.warning(
+                            "📊 Finnhub economic calendar: 403 Forbidden — this endpoint "
+                            "requires a paid Finnhub plan. Free tier doesn't include "
+                            "/calendar/economic. News filter will be DISABLED (no blackout "
+                            "window) until you upgrade at https://finnhub.io/pricing or "
+                            "switch to a free alternative (e.g. ForexFactory calendar). "
+                            "This message will not repeat for 1 hour."
+                        )
+                        CACHE["cal_403_logged"] = True
+                    cal = []
+                    # cache empty result for 1 hour (not 5 min) to avoid retry spam
+                    CACHE["calendar"] = cal
+                    CACHE["cal_ts"] = now_ts + 3600 - _CAL_CACHE_TTL
+                    return cal
+                else:
+                    log.warning("calendar fetch failed (HTTP %d): %s — using empty",
+                                exc.response.status_code, exc)
+                    cal = []
             except Exception as exc:  # noqa: BLE001
-                log.warning("calendar fetch failed: %s — using demo", exc)
-                cal = _demo_calendar()
+                log.warning("calendar fetch failed: %s — using empty", exc)
+                cal = []
         CACHE["calendar"] = cal
         CACHE["cal_ts"] = now_ts
         return cal
