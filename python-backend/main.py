@@ -744,8 +744,12 @@ async def _auto_trade_loop():
                     # and post-event (last 15min) blackout windows. Without this,
                     # auto-trade opens positions during NFP/FOMC/CPI → 30-50 pip
                     # spike risk. Respect user's avoid_high_impact_news setting.
+                    # Wrapped in to_thread because near_high_impact_news() calls
+                    # economic_calendar() which may do HTTP fetch (Apify/Finnhub)
+                    # — blocking the event loop + holding _order_lock for 60s.
                     if getattr(settings, "avoid_high_impact_news", True):
-                        is_blackout, news_reason = near_high_impact_news(15)
+                        is_blackout, news_reason = await asyncio.to_thread(
+                            near_high_impact_news, 15)
                         if is_blackout:
                             log.warning("auto-trade %s: BLOCKED by news filter — %s",
                                         symbol, news_reason)

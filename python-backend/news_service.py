@@ -15,7 +15,10 @@ CACHE: dict = {"news": [], "ts": 0.0, "calendar": [], "cal_ts": 0.0}
 # prevent thundering herd on cache expiry
 _news_lock = asyncio.Lock()
 _cal_lock = asyncio.Lock()
-_CAL_CACHE_TTL = 300  # 5 min for calendar (less volatile than news)
+_CAL_CACHE_TTL = 21600  # 6 hours for calendar (events scheduled days ahead,
+                        # data barely changes within hours. Was 300s/5min which
+                        # would cost $86/mo on Apify — 6h TTL = $1.20/mo, fits
+                        # the free $5/mo credit comfortably)
 
 
 async def fetch_news() -> list[dict]:
@@ -276,28 +279,26 @@ async def _fetch_apify_calendar() -> list[dict]:
                 date_str = item.get("date", "")
                 time_str = item.get("time", "")
                 if date_str:
-                    # ForexFactory date format: "Oct 8" → parse with current year
+                    # ForexFactory date format: "Oct 8" or "Oct 8, 2026"
+                    # Strip year if present so time-combining works correctly
                     try:
                         from datetime import datetime as _dt
                         year = _dt.now(timezone.utc).year
-                        # parse "Oct 8, 2026" or "Oct 8"
-                        for fmt in ("%b %d, %Y", "%b %d"):
+                        # normalize: extract date part without year
+                        # "Oct 8, 2026" → "Oct 8"; "Oct 8" → "Oct 8"
+                        date_no_year = date_str.split(",")[0].strip()
+                        # parse date (with current year for ISO8601)
+                        parsed = _dt.strptime(f"{date_no_year} {year}", "%b %d %Y")
+                        # if time is provided and not "All Day"/"Tentative",
+                        # combine date + time for accurate event timestamp
+                        if time_str and time_str.lower() not in ("all day", "tentative"):
                             try:
-                                parsed = _dt.strptime(f"{date_str}, {year}" if "," not in date_str else date_str, fmt)
-                                if time_str and time_str.lower() not in ("all day", "tentative"):
-                                    # time like "8:30am"
-                                    try:
-                                        from datetime import datetime as _dt2
-                                        full = _dt2.strptime(f"{date_str} {time_str}", "%b %d %I:%M%p")
-                                        parsed = full
-                                    except Exception:
-                                        pass
-                                iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
+                                # "Oct 8" + "8:30am" → datetime
+                                full = _dt.strptime(f"{date_no_year} {time_str}", "%b %d %I:%M%p")
+                                parsed = full
                             except Exception:
-                                continue
-                            break
-                        else:
-                            continue
+                                pass  # keep date-only parsed (midnight)
+                        iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
                     except Exception:
                         continue
                 else:
