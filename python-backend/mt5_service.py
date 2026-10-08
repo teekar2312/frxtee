@@ -101,8 +101,17 @@ def get_margin_level() -> float | None:
         return None
 
 
-def get_recent_deals(minutes: int = 10) -> list[dict]:
-    """Get deals closed in the last N minutes (for reconcile P&L tracking)."""
+def get_recent_deals(minutes: int = 1440) -> list[dict]:
+    """Get deals closed in the last N minutes (for reconcile P&L tracking).
+
+    Default window is 24 hours (was 10 min) so backend restarts don't miss
+    closes that happened while offline. Returns deals with computed pips
+    (was hardcoded 0 — caused trade history to show 0 pips for broker-side
+    closes like SL/TP hits).
+
+    Handles both DEAL_ENTRY_OUT (1 = full close) and DEAL_ENTRY_INOUT (2 =
+    partial close) — some brokers use INOUT for position reduction.
+    """
     if not _state["connected"] or not MT5_AVAILABLE:
         return []
     try:
@@ -114,15 +123,47 @@ def get_recent_deals(minutes: int = 10) -> list[dict]:
             return []
         out = []
         for d in deals:
-            if d.entry != 1:  # DEAL_ENTRY_OUT = position closed
+            # DEAL_ENTRY_OUT=1 (full close), DEAL_ENTRY_INOUT=2 (partial)
+            if d.entry not in (1, 2):
                 continue
+            # compute pips from symbol digits (was hardcoded 0)
+            info = _get_symbol_info(d.symbol)
+            pip = _pip_for_digits(info.digits) if info else 0.0001
+            # need the opening price to compute pips — fetch from position
+            # history. d.price is the close price. We approximate pips using
+            # the deal profit + contract size if open price unavailable.
+            pips = 0.0
+            try:
+                # try to get the position's open price via history_orders
+                pos_deals = mt5.history_deals_get_by_position(d.position_id)  # type: ignore
+                if pos_deals:
+                    # find the DEAL_ENTRY_IN (0) deal = the opening deal
+                    for pd in pos_deals:
+                        if pd.entry == 0:  # DEAL_ENTRY_IN
+                            open_price = pd.price
+                            if d.symbol and open_price:
+                                if d.symbol.endswith("JPY") or d.symbol.startswith("XAG"):
+                                    pips_val = (d.price - open_price) / 0.01
+                                elif d.symbol.startswith("XAU"):
+                                    pips_val = (d.price - open_price) / 0.1
+                                else:
+                                    pips_val = (d.price - open_price) / pip
+                                # for SELL positions, pips are inverted
+                                if d.type == 1:  # DEAL_TYPE_SELL (closing a BUY)
+                                    pips_val = -pips_val
+                                pips = round(pips_val, 1)
+                            break
+            except Exception:  # noqa: BLE001
+                pass
             out.append({
                 "ticket": d.position_id,
                 "symbol": d.symbol,
                 "volume": d.volume,
                 "price": d.price,
                 "profit": d.profit,
+                "pips": pips,
                 "time": d.time,
+                "entry": d.entry,  # 1=OUT, 2=INOUT (for debugging)
             })
         return out
     except Exception as exc:  # noqa: BLE001

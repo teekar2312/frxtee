@@ -144,6 +144,82 @@ async def _alert_loop():
 _processed_deal_tickets: set = set()
 
 
+def _backfill_closed_trades():
+    """Startup task: sync DB trade history with broker state.
+
+    Checks all DB trades with close_time=None (still "open" in DB). If the
+    position no longer exists in MT5 (closed broker-side while backend was
+    offline), fetches close price + P&L + pips from deal history and
+    persists them via close_trade().
+
+    This fixes the bug where trade history showed empty close_price/pnl/
+    pips/close_time for trades that closed while backend was offline.
+    """
+    from db import get_trades
+    try:
+        all_trades = get_trades(limit=500)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backfill: get_trades failed: %s", exc)
+        return
+    open_in_db = [t for t in all_trades if not t.get("close_time")]
+    if not open_in_db:
+        log.info("backfill: no open trades in DB — nothing to sync")
+        return
+    # get currently open positions from broker
+    try:
+        broker_positions = mt5_positions()
+        broker_tickets = {p["ticket"] for p in broker_positions}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backfill: mt5_positions failed: %s", exc)
+        return
+    # find DB-open trades that are NOT in broker (closed while offline)
+    closed_offline = [t for t in open_in_db if t["ticket"] not in broker_tickets]
+    if not closed_offline:
+        log.info("backfill: %d open trade(s) in DB, all still open in broker",
+                 len(open_in_db))
+        return
+    log.info("backfill: %d trade(s) closed while backend offline — fetching "
+             "close data from deal history", len(closed_offline))
+    # fetch deal history (24h window covers most cases)
+    try:
+        deals = get_recent_deals(1440)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("backfill: get_recent_deals failed: %s", exc)
+        deals = []
+    # build ticket → deal mapping
+    deal_map = {}
+    for d in deals:
+        deal_map[d.get("ticket")] = d
+    # backfill each closed trade
+    backfilled = 0
+    for t in closed_offline:
+        ticket = t["ticket"]
+        d = deal_map.get(ticket)
+        if d:
+            try:
+                close_trade(ticket, d.get("price", 0),
+                           d.get("profit", 0.0), d.get("pips", 0.0))
+                log.info("backfill: ticket=%s close_price=%s pnl=%.2f pips=%.1f",
+                         ticket, d.get("price"), d.get("profit", 0.0),
+                         d.get("pips", 0.0))
+                backfilled += 1
+                _processed_deal_tickets.add(ticket)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("backfill: close_trade failed for %s: %s", ticket, exc)
+        else:
+            # deal not in 24h history — position may have closed >24h ago
+            # or deal history unavailable. Mark with zero values + note.
+            try:
+                close_trade(ticket, 0.0, 0.0, 0.0)
+                log.warning("backfill: ticket=%s — deal not found in 24h history, "
+                            "marked with zero values (close data unavailable)", ticket)
+                backfilled += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("backfill: zero-fill failed for %s: %s", ticket, exc)
+    log.info("backfill complete: %d/%d trades updated with close data",
+             backfilled, len(closed_offline))
+
+
 async def _reconcile_loop():
     """Background task: sync guard.open_count + daily_loss with broker every 10s.
 
@@ -782,6 +858,20 @@ async def lifespan(app: FastAPI):
         connect()
     except Exception as exc:  # noqa: BLE001
         log.warning("MT5 connect on boot failed: %s", exc)
+
+    # ---- startup backfill: sync trade history with broker ----
+    # On boot, check all DB trades with close_time=None (still "open" in DB).
+    # If the position no longer exists in MT5 (was closed broker-side while
+    # backend was offline), fetch close price + P&L + pips from deal history
+    # and persist them. This fixes the bug where trade history showed empty
+    # close_price/pnl/pips/close_time for trades that closed while backend
+    # was offline.
+    try:
+        import asyncio as _aio
+        await _aio.to_thread(_backfill_closed_trades)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("startup backfill failed: %s", exc)
+
     _alert_task = asyncio.create_task(_alert_loop())
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     _cleanup_task = asyncio.create_task(_cleanup_loop())
