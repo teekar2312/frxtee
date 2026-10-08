@@ -74,6 +74,9 @@ interface TradingState {
   // Ollama context window (tokens) — caps KV cache size to prevent OOM
   ollamaNumCtx: number;
   setOllamaNumCtx: (v: number) => void;
+  // Ollama request timeout (seconds) — local models on CPU can be slow
+  ollamaTimeout: number;
+  setOllamaTimeout: (v: number) => void;
   tradingStrategy: string;
   setTradingStrategy: (s: string) => void;
   autoTradeMode: boolean;
@@ -232,6 +235,8 @@ export const useTradingStore = create<TradingState>()(
     set((s) => ({ aiModels: { ...s.aiModels, [provider]: model } })),
   ollamaNumCtx: 8192,
   setOllamaNumCtx: (v) => set({ ollamaNumCtx: v }),
+  ollamaTimeout: 120,
+  setOllamaTimeout: (v) => set({ ollamaTimeout: v }),
   tradingStrategy: "auto",
   setTradingStrategy: (s) => set({ tradingStrategy: s }),
   autoTradeMode: false,
@@ -306,6 +311,7 @@ export const useTradingStore = create<TradingState>()(
         autoTradeMinConfidence: s.autoTradeMinConfidence,
         aiModels: s.aiModels,
         ollamaNumCtx: s.ollamaNumCtx,
+        ollamaTimeout: s.ollamaTimeout,
         tradingStrategy: s.tradingStrategy,
         autoTradeMode: s.autoTradeMode,
         autoIndicators: s.autoIndicators,

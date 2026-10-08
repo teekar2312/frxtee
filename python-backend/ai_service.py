@@ -210,13 +210,12 @@ def _call_openrouter(symbol: str, user_msg: str) -> dict:
 
 
 # ---------- Local AI (Ollama) ----------
-# Timeout for Ollama calls — local models on CPU can be slow (30-60s).
-# Without a timeout, the auto-trade loop blocks indefinitely. With a timeout,
-# the cascade can fall through to the next provider.
-_OLLAMA_TIMEOUT = 45  # seconds
+# Default timeout if not configured in settings. Local models on CPU can be
+# slow — 8B models typically take 20-120s depending on CPU speed and context.
+# Override via OLLAMA_TIMEOUT env var (in python-backend/.env).
 
 def _call_ollama(symbol: str, user_msg: str) -> dict:
-    """Call local Ollama server with bounded context window + timeout.
+    """Call local Ollama server with bounded context window + configurable timeout.
 
     The `num_ctx` option caps the KV cache size — without it, Ollama's
     newer defaults (128k+ tokens) can try to allocate 40GB+ of RAM and
@@ -224,16 +223,17 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
     errors specifically so the cascade can cleanly fall through to the
     next provider instead of retrying a doomed call.
 
-    A timeout (_OLLAMA_TIMEOUT=45s) ensures the auto-trade loop doesn't
-    block indefinitely when Ollama is slow (CPU-only inference of large
-    models can take 30-60+ seconds per request).
+    Timeout is configurable via settings.ollama_timeout (default 120s).
+    If the model is too slow for CPU, the cascade falls through to cloud
+    providers. Increase the timeout or use a smaller model if needed.
     """
     if not settings.ollama_model:
         raise RuntimeError("no ollama_model configured")
+    timeout = getattr(settings, "ollama_timeout", 120)
     log.info("Ollama calling model: %s (num_ctx=%d, timeout=%ds)",
-             settings.ollama_model, settings.ollama_num_ctx, _OLLAMA_TIMEOUT)
+             settings.ollama_model, settings.ollama_num_ctx, timeout)
     import ollama
-    client = ollama.Client(host=settings.ollama_url, timeout=_OLLAMA_TIMEOUT)
+    client = ollama.Client(host=settings.ollama_url, timeout=timeout)
     try:
         resp = client.chat(
             model=settings.ollama_model,
@@ -246,13 +246,6 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
             },
         )
     except Exception as exc:
-        # Detect OOM / memory allocation failures and raise a clean
-        # RuntimeError so the cascade knows to skip to the next provider
-        # instead of retrying. Common signatures:
-        #   - "failed to allocate buffer"
-        #   - "out of memory"
-        #   - "failed to allocate CPU buffer"
-        #   - "failed to initialize the context"
         msg = str(exc).lower()
         if any(kw in msg for kw in (
             "failed to allocate", "out of memory", "oom",
@@ -267,19 +260,23 @@ def _call_ollama(symbol: str, user_msg: str) -> dict:
                 f"num_ctx={settings.ollama_num_ctx}) — try a smaller model "
                 f"or reduce ollama_num_ctx in settings"
             ) from exc
-        # Detect timeout — common signatures from httpx/requests
         if any(kw in msg for kw in ("timeout", "timed out", "read timeout")):
-            log.warning("⚠ Ollama timeout: model=%s didn't respond within %ds "
-                        "— falling through to next provider (try a smaller "
-                        "model or increase OLLAMA_NUM_CTX)",
-                        settings.ollama_model, _OLLAMA_TIMEOUT)
+            log.warning("⚠ Ollama timeout: model=%s didn't respond within %ds. "
+                        "Options: 1) increase OLLAMA_TIMEOUT in .env "
+                        "(currently %d) 2) use a smaller model (llama3 instead "
+                        "of llama3.3) 3) reduce OLLAMA_NUM_CTX (currently %d) "
+                        "4) use a cloud provider instead — falling through.",
+                        settings.ollama_model, timeout, timeout,
+                        settings.ollama_num_ctx)
             raise RuntimeError(
                 f"Ollama timeout (model={settings.ollama_model}, "
-                f"timeout={_OLLAMA_TIMEOUT}s) — model too slow for CPU"
+                f"timeout={timeout}s) — increase OLLAMA_TIMEOUT or use a "
+                f"smaller model"
             ) from exc
         raise
     content = resp["message"]["content"]
-    log.info("Ollama response received: %d chars", len(content))
+    log.info("Ollama response received: %d chars (model=%s)",
+             len(content), settings.ollama_model)
     return _parse(content, symbol)
 
 

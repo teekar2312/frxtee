@@ -1344,6 +1344,7 @@ async def api_ai_config():
             "local": settings.ollama_model,
         },
         "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
+        "ollama_timeout": getattr(settings, "ollama_timeout", 120),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
         "auto_trade_mode": settings.auto_trade_mode,
@@ -1398,6 +1399,13 @@ async def api_ai_config_update(request: Request):
             log.info("🧠 ollama_num_ctx set to: %d", settings.ollama_num_ctx)
         except (ValueError, TypeError):
             log.warning("invalid ollama_num_ctx value: %r", body["ollama_num_ctx"])
+    if "ollama_timeout" in body:
+        try:
+            settings.ollama_timeout = int(body["ollama_timeout"])
+            updated.append(f"ollama_timeout={settings.ollama_timeout}")
+            log.info("⏱ ollama_timeout set to: %ds", settings.ollama_timeout)
+        except (ValueError, TypeError):
+            log.warning("invalid ollama_timeout value: %r", body["ollama_timeout"])
     if "ai_min_confidence" in body:
         settings.ai_min_confidence = int(body["ai_min_confidence"])
         updated.append(f"ai_min_confidence={settings.ai_min_confidence}")
@@ -1437,6 +1445,7 @@ async def api_ai_config_update(request: Request):
             "local": settings.ollama_model,
         },
         "ollama_num_ctx": getattr(settings, "ollama_num_ctx", 8192),
+        "ollama_timeout": getattr(settings, "ollama_timeout", 120),
         "ai_min_confidence": settings.ai_min_confidence,
         "auto_trade_min_confidence": settings.auto_trade_min_confidence,
     }}
