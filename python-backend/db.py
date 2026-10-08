@@ -178,11 +178,25 @@ def get_open_trade_sl_tp(ticket: int) -> tuple[float, float]:
 
 
 def close_trade(ticket: int, close_price: float, pnl: float, pips: float) -> None:
+    """Update a trade's close data (close_price, pnl, pips, close_time).
+
+    Logs a warning if 0 rows affected (trade not in DB — save_trade() was
+    never called or ticket mismatch). Previously silent failure left trade
+    history showing empty close data with no diagnostic.
+    """
     with _lock, _conn() as c:
-        c.execute(
+        cur = c.execute(
             "UPDATE trades SET close_price=?, pnl=?, pips=?, close_time=? WHERE ticket=?",
             (close_price, pnl, pips, datetime.now(timezone.utc).isoformat(), ticket),
         )
+        if cur.rowcount == 0:
+            import logging as _log
+            _log.getLogger("db").warning(
+                "close_trade: UPDATE affected 0 rows — ticket=%s not in DB "
+                "(save_trade() was never called or ticket mismatch). "
+                "Close data (price=%s, pnl=%s, pips=%s) NOT persisted.",
+                ticket, close_price, pnl, pips,
+            )
 
 
 def get_trades(limit: int = 100) -> list[dict]:

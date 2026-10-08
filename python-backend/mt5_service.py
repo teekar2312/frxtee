@@ -101,6 +101,68 @@ def get_margin_level() -> float | None:
         return None
 
 
+def _fetch_deal_by_ticket(ticket: int) -> dict | None:
+    """Fetch a single deal by position ticket from MT5 deal history.
+
+    Used by close_position() when the position no longer exists (broker
+    already closed it via SL/TP) — we need the ACTUAL close price + P&L
+    instead of returning zeros.
+
+    Returns dict with: price, profit, pips, volume, symbol, time
+    or None if deal not found in 24h history.
+    """
+    if not MT5_AVAILABLE or not _state["connected"]:
+        return None
+    try:
+        from datetime import datetime, timezone, timedelta
+        utc_to = datetime.now(timezone.utc)
+        utc_from = utc_to - timedelta(hours=24)
+        deals = mt5.history_deals_get(utc_from, utc_to)  # type: ignore
+        if not deals:
+            return None
+        for d in deals:
+            if d.position_id != ticket:
+                continue
+            if d.entry not in (1, 2):  # DEAL_ENTRY_OUT or INOUT
+                continue
+            # found the closing deal for this ticket
+            info = _get_symbol_info(d.symbol)
+            pip = _pip_for_digits(info.digits) if info else 0.0001
+            # compute pips from opening deal
+            pips = 0.0
+            try:
+                pos_deals = mt5.history_deals_get_by_position(ticket)  # type: ignore
+                if pos_deals:
+                    for pd in pos_deals:
+                        if pd.entry == 0:  # DEAL_ENTRY_IN (opening deal)
+                            open_price = pd.price
+                            if d.symbol and open_price:
+                                if d.symbol.endswith("JPY") or d.symbol.startswith("XAG"):
+                                    pips_val = (d.price - open_price) / 0.01
+                                elif d.symbol.startswith("XAU"):
+                                    pips_val = (d.price - open_price) / 0.1
+                                else:
+                                    pips_val = (d.price - open_price) / pip
+                                if d.type == 1:  # SELL close (closing BUY)
+                                    pips_val = -pips_val
+                                pips = round(pips_val, 1)
+                            break
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "price": d.price,
+                "profit": d.profit,
+                "pips": pips,
+                "volume": d.volume,
+                "symbol": d.symbol,
+                "time": d.time,
+            }
+        return None  # not found in 24h window
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_fetch_deal_by_ticket failed: %s", exc)
+        return None
+
+
 def get_recent_deals(minutes: int = 1440) -> list[dict]:
     """Get deals closed in the last N minutes (for reconcile P&L tracking).
 
@@ -537,16 +599,37 @@ def send_order(symbol: str, side: str, volume: float, sl_pips: float,
 
 
 def close_position(ticket: int) -> dict:
+    """Close a position by ticket. Returns ok=True with close data.
+
+    If the position no longer exists (broker already closed it via SL/TP),
+    returns ok=True with already_closed=True. In that case, we fetch the
+    ACTUAL close price + P&L + pips from deal history (was returning zeros
+    which caused trade history to show empty close_price/pnl/pips).
+    """
     if not _ensure_connected():
         return {"ok": False, "error": "MT5 not connected"}
     pos = mt5.positions_get(ticket=ticket)  # type: ignore
     if not pos:
         # Position no longer exists — broker already closed it (SL/TP hit
-        # broker-side). This is SUCCESS, not an error. Return ok=True with
-        # already_closed=True so callers don't retry pointlessly.
-        log.info("close_position: ticket=%s not found — broker already closed it", ticket)
+        # broker-side). Fetch ACTUAL close data from deal history instead
+        # of returning zeros (was causing trade history to show empty
+        # close_price/pnl/pips for broker-closed trades).
+        log.info("close_position: ticket=%s not found — fetching deal history", ticket)
+        deal_data = _fetch_deal_by_ticket(ticket)
+        if deal_data:
+            log.info("close_position: deal found — price=%s pnl=%.2f pips=%.1f",
+                     deal_data["price"], deal_data["profit"], deal_data["pips"])
+            return {"ok": True, "already_closed": True,
+                    "price": deal_data["price"],
+                    "pnl": deal_data["profit"],
+                    "pips": deal_data["pips"],
+                    "volume": deal_data.get("volume", 0.0)}
+        # Deal not found in history — return zeros with clear reason
+        log.warning("close_position: ticket=%s — deal not found in 24h history, "
+                    "close data unavailable (position may be >24h old)", ticket)
         return {"ok": True, "already_closed": True, "price": 0.0,
-                "pnl": 0.0, "pips": 0.0, "volume": 0.0}
+                "pnl": 0.0, "pips": 0.0, "volume": 0.0,
+                "reason": "deal not found in history"}
     p = pos[0]
     info = _get_symbol_info(p.symbol)  # cached
     tick = mt5.symbol_info_tick(p.symbol)  # type: ignore
