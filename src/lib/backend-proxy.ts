@@ -26,12 +26,14 @@ export interface ProxyResult<T> {
  *
  * @param path     backend path, e.g. "/api/trading/ticks"
  * @param init     fetch init (method, body, headers)
- * @param timeoutMs connection/read timeout (default 1500ms)
+ * @param timeoutMs connection/read timeout (default 3000ms — was 1500ms
+ *                  which was too short when backend is busy with Ollama
+ *                  inference or MT5 reconnects)
  */
 export async function proxyBackend<T>(
   path: string,
   init: RequestInit = {},
-  timeoutMs = 1500
+  timeoutMs = 3000
 ): Promise<ProxyResult<T>> {
   const url = `${BACKEND_URL}${path}`;
   const controller = new AbortController();
