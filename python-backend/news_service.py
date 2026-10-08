@@ -174,13 +174,22 @@ async def economic_calendar() -> list[dict]:
             return CACHE["calendar"]
 
         # ---- provider 1: Apify (preferred — free ForexFactory scraper) ----
-        if getattr(settings, "apify_token", ""):
+        apify_token = getattr(settings, "apify_token", "")
+        if apify_token:
+            log.info("📊 Calendar: trying Apify (token=%s...%s)",
+                     apify_token[:6], apify_token[-4:])
             cal = await _fetch_apify_calendar()
             if cal:
+                log.info("📊 Calendar: Apify SUCCESS — %d high-impact events", len(cal))
                 CACHE["calendar"] = cal
                 CACHE["cal_ts"] = now_ts
+                CACHE["cal_403_logged"] = False  # reset Finnhub 403 flag
                 return cal
-            # Apify failed — fall through to Finnhub
+            # Apify failed — log WHY and fall through to Finnhub
+            log.warning("📊 Calendar: Apify returned empty (check token/credit/actor). "
+                        "Falling through to Finnhub as backup...")
+        else:
+            log.info("📊 Calendar: APIFY_TOKEN not set — using Finnhub/demo")
 
         # ---- provider 2: Finnhub (needs paid plan — free = 403) ----
         if settings.finnhub_api_key:

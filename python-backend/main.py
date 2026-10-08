@@ -1255,6 +1255,39 @@ async def api_news():
     return {"news": n, "calendar": cal, "sentiment": sentiment, "demo": not n}
 
 
+@app.get("/api/trading/calendar/test")
+async def api_calendar_test():
+    """Diagnostic endpoint — test Apify + Finnhub calendar connectivity.
+
+    Returns which providers are configured + which succeed. Use this to
+    debug 'Finnhub 403' errors when APIFY_TOKEN is set but not working.
+    """
+    from config import settings as _s
+    result = {
+        "apify_token_set": bool(getattr(_s, "apify_token", "")),
+        "apify_token_preview": "",
+        "finnhub_key_set": bool(_s.finnhub_api_key),
+        "apify_result": None,
+        "finnhub_result": None,
+    }
+    if getattr(_s, "apify_token", ""):
+        t = _s.apify_token
+        result["apify_token_preview"] = f"{t[:6]}...{t[-4:]}"
+        try:
+            from news_service import _fetch_apify_calendar
+            cal = await _fetch_apify_calendar()
+            result["apify_result"] = {
+                "ok": bool(cal),
+                "events": len(cal),
+                "sample": cal[:3] if cal else [],
+            }
+        except Exception as exc:  # noqa: BLE001
+            result["apify_result"] = {"ok": False, "error": str(exc)}
+    if _s.finnhub_api_key:
+        result["finnhub_result"] = "will return 403 on free plan (expected)"
+    return result
+
+
 @app.get("/api/trading/sentiment")
 async def api_sentiment(symbol: str | None = None):
     """Get aggregate sentiment, optionally filtered by symbol."""
