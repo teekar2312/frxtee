@@ -6872,3 +6872,64 @@ Stage Summary:
       not .env.txt). Verify APIFY_TOKEN= line has no surrounding quotes/whitespace.
 
 No code changes made — read-only audit.
+
+---
+Task ID: DOC-UPDATE-4
+Agent: doc-contributing
+Task: Update CONTRIBUTING.md
+
+Work Log:
+- Updated AI providers (removed Z.AI/Google/OpenRouter)
+- Updated Python version (3.14→3.13+)
+- Updated dependencies (removed google-generativeai)
+- Updated env var setup
+
+Stage Summary:
+- 1 file updated
+
+---
+Task ID: DOC-UPDATE-1
+Agent: doc-readme
+Task: Update README.md + python-backend/README.md
+
+Work Log:
+- Updated AI providers (removed Z.AI/Google/OpenRouter)
+- Updated economic calendar (Apify + 6h cache)
+- Updated views count (12)
+- Added overlap sessions + close-at-session-end
+- Added circuit breaker + strategy SL/TP
+- Updated tech stack + Python version
+- Updated python-backend/README modules table
+
+Stage Summary:
+- 2 files updated
+
+---
+Task ID: DOC-UPDATE-2
+Agent: doc-api-arch
+Task: Update API.md + ARCHITECTURE.md
+
+Work Log:
+- Updated provider examples (zai→groq, removed google/openrouter)
+- Added new endpoints (calendar/test, ml/info with symbol, ml/train with params)
+- Updated config fields (added APIFY_TOKEN, OLLAMA_NUM_CTX, OLLAMA_TIMEOUT)
+- Updated architecture diagrams (cascade, calendar, ML per-symbol)
+- Added position management + auto-trade safety features
+
+Stage Summary:
+- 2 files updated
+
+---
+Task ID: DOC-UPDATE-3
+Agent: doc-deploy-security-changelog
+Task: Update DEPLOYMENT.md + SECURITY.md + CHANGELOG.md
+
+Work Log:
+- Updated env vars (removed ZAI/Google/OpenRouter, added APIFY_TOKEN/OLLAMA_*)
+- Updated Python version (3.14→3.13+)
+- Updated AI providers text
+- Updated docker instructions
+- Added CHANGELOG section for all recent changes
+
+Stage Summary:
+- 3 files updated

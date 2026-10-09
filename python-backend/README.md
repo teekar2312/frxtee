@@ -2,7 +2,7 @@
 
 Production backend for the ZeniTrade AI forex trading terminal.
 
-**Stack:** Python 3.14 · FastAPI · MetaTrader5 · scikit-learn/xgboost · pandas/ta · Z.AI / Groq / Google AI / Ollama
+**Stack:** Python 3.13+ · FastAPI · MetaTrader5 · scikit-learn/xgboost · pandas/ta · Groq / Ollama
 
 ## Platform
 - **OS:** Windows 11 (MetaTrader 5 terminal required)
@@ -13,8 +13,8 @@ Production backend for the ZeniTrade AI forex trading terminal.
 ## Setup
 
 ```powershell
-# 1. Create venv (Python 3.14)
-python -3.14 -m venv .venv
+# 1. Create venv (Python 3.13+)
+python -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 # 2. Install deps
@@ -23,7 +23,8 @@ pip install -r requirements.txt
 # 3. Configure
 copy config.example.env .env
 #   edit .env with your FINEX login, server, password,
-#   and API keys (Finnhub, MARKETAUX, Z.AI, Groq, Google, Ollama URL)
+#   and API keys (Finnhub, MARKETAUX, Apify, Groq, Ollama URL)
+#   set APIFY_TOKEN for the free ForexFactory calendar scraper
 
 # 4. Run
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -40,10 +41,10 @@ with realistic synthetic data.
 |-------------------|--------------------------------------------------------|
 | `main.py`         | FastAPI app, REST routes, CORS, lifespan               |
 | `mt5_service.py`  | MT5 connect/auto-launch, account, ticks, candles, orders |
-| `ai_service.py`   | Z.AI / Groq / Google AI Studio / Ollama local inference |
-| `news_service.py`  | Finnhub + MARKETAUX feeds, economic calendar           |
+| `ai_service.py`   | Groq cloud + Ollama local inference                     |
+| `news_service.py`  | Apify ForexFactory calendar + Finnhub + MARKETAUX feeds |
 | `indicators.py`   | 30 technical indicators (EMA, RSI, MACD, ATR, ...)     |
-| `ml_model.py`     | Self-learning classifier + nightly retrain              |
+| `ml_model.py`     | Self-learning classifier + nightly retrain (per-symbol models) |
 | `risk_manager.py` | Money management, position sizing, trailing stop       |
 | `backtest.py`     | Historical strategy simulation                         |
 | `notifier.py`     | Email alerts (SMTP) + price alerts                     |

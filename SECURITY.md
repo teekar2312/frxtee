@@ -33,7 +33,7 @@ X-API-Token: your-secret-token
 | `POST /positions/{ticket}/modify` | 20/min | Trailing needs frequent updates |
 | `POST /positions/{ticket}/partial` | 10/min | Scale-out limit |
 | `POST /email/test` | 3/min | Prevent SMTP abuse |
-| `POST /ml/train` | 1/hour | CPU-intensive training |
+| `POST /ml/train` | 3/hour | CPU-intensive training |
 | `POST /accounts/switch` | 5/min | Account switching |
 | `POST /connect` | — | No limit (startup operation) |
 
@@ -67,9 +67,11 @@ class OrderReq(BaseModel):
 | Secret | Location | Purpose |
 |--------|----------|---------|
 | MT5 password | `.env` | Broker login |
-| API keys (Finnhub, MARKETAUX, Z.AI, Groq, Google) | `.env` | External API auth |
+| API keys (Finnhub, MARKETAUX, Apify, Groq) | `.env` | External API auth |
+| `OLLAMA_URL` | `.env` | Local Ollama daemon endpoint |
 | SMTP password | `.env` | Email notifications |
 | Telegram bot token | `.env` | Push notifications |
+| Discord webhook URL | `.env` | Push notifications |
 | `ZENITRADE_API_TOKEN` | `.env` | API auth |
 
 ### What's NOT Stored
@@ -184,6 +186,14 @@ CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 3. **No CSRF protection** — not needed (API uses token auth, not cookies)
 4. **No SQL injection risk** — uses parameterized queries via sqlite3
 5. **No SSRF** — news service URLs are hardcoded (not user-controllable)
+6. **Finnhub free tier returns 403 on `/calendar/economic`** — the Finnhub free plan
+   no longer grants access to the economic calendar endpoint. `APIFY_TOKEN` enables
+   the free Apify ForexFactory scraper as the calendar source (Finnhub remains as
+   a fallback for news + sentiment). Without `APIFY_TOKEN`, the calendar silently
+   returns an empty list (news blackout will not fire on calendar events).
+7. **AI provider keys are local-only** — Groq + Ollama are the only supported AI
+   providers. Z.AI / Google AI Studio / OpenRouter API keys are no longer read;
+   remove them from `.env` to avoid confusion.
 
 ---
 

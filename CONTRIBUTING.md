@@ -33,14 +33,36 @@ copy config.example.env .env
 # Edit .env — at minimum set MT5 credentials + one AI API key
 ```
 
+#### Environment Variables (key ones)
+
+| Variable | Purpose |
+| --- | --- |
+| `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` | MetaTrader 5 / FINEX credentials |
+| `APIFY_TOKEN` | Economic calendar scraper (Apify) — free alternative to Finnhub paid calendar |
+| `GROQ_API_KEY` | Groq (cloud AI provider) |
+| `OLLAMA_URL` | Local Ollama endpoint (default `http://127.0.0.1:11434`) |
+| `OLLAMA_NUM_CTX` | Ollama context window size (default `4096`) |
+| `OLLAMA_TIMEOUT` | Ollama request timeout in seconds (default `120`) |
+| `ZENITRADE_API_TOKEN` | API auth token (leave empty for localhost dev) |
+
+> **AI Providers:** ZeniTrade supports only **2 providers** — **Groq** (cloud) and **Local (Ollama)**. Z.AI, Google AI Studio, and OpenRouter have been removed.
+
+#### Run the backend
+
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Backend API tersedia di http://127.0.0.1:8000
+
 ### Frontend Development
 
 ```bash
 bun install
-bun run dev
+bun run dev    # or: npm run dev
 ```
 
-Dashboard tersedia di http://localhost:3000
+Dashboard tersedia di http://localhost:3000 (frontend) — backend berjalan di port 8000.
 
 ---
 
@@ -143,7 +165,7 @@ python-backend/
 
 3. **Lint** — pastikan lolos:
    ```bash
-   bun run lint          # Frontend (0 errors required)
+   bun run lint          # Frontend (0 errors, 0 warnings required)
    # Python: pastikan `python -c "import ast; ..."` pass untuk semua file
    ```
 
@@ -191,7 +213,7 @@ Configurable via trailing_use_atr + trailing_atr_multiplier.
 Saat ini tidak ada automated tests (trading system memerlukan MT5 untuk test penuh). Verifikasi manual:
 
 1. **Backend** — `python -c "import ast; ast.parse(open('file.py').read())"` untuk semua file
-2. **Frontend** — `bun run lint` (0 errors)
+2. **Frontend** — `bun run lint` (0 errors, 0 warnings)
 3. **Dashboard** — buka di browser, navigate semua views, verify no console errors
 4. **Order flow** — place order via Trading view, verify toast + position appears
 5. **Close flow** — click Close, verify AlertDialog + toast + position removed

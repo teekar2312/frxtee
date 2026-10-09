@@ -1,4 +1,4 @@
-# Core — use >= to get prebuilt wheels for Python 3.14
+# Core — use >= to get prebuilt wheels for Python 3.13+
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.6
 pydantic>=2.10.0

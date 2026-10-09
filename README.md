@@ -18,10 +18,11 @@
 - **Partial close / scale-out** — tutup 50% posisi di +1.5R
 - **Trailing stop** — fixed pips atau ATR-based dynamic (adaptif volatilitas)
 - **Break-even** — SL otomatis pindah ke entry+buffer di +1R
+- **Close all at session end** — auto-flatten posisi sebelum session close
 - **30 indikator teknikal** — EMA, RSI, MACD, Bollinger Bands, Supertrend, Ichimoku, dll
 
 ### AI & Machine Learning
-- **4 AI providers** — Z.AI, Groq, Google AI Studio, Local AI (Ollama) dengan provider cascade
+- **2 AI providers** — Groq (cloud) + Local AI (Ollama) dengan provider cascade
 - **Multi-pair analysis** — batch endpoint, semua pair dianalisis dalam 1 request
 - **Self-learning ML** — XGBoost classifier, walk-forward validation, drift detection, class balancing
 - **7-dimension analysis** — Bank Sentral, Data Ekonomi, Politik, Fiskal, Komoditas, Sentimen, Breaking News
@@ -35,17 +36,19 @@
 - **Weekend gap protection** — no new entries Fri 21:00 UTC – Sunday
 - **Spread filter** — refuse orders saat spread > 5 pips
 - **Correlation risk check** — detect EURUSD + EURGBP + EURJPY open bersamaan
+- **Auto-trade circuit breaker** — disables after 3 consecutive failures
+- **Strategy-specific SL/TP** — per-strategy risk params
 
 ### News & Sentiment
 - **Finnhub + MARKETAUX** — real-time news feed dengan 429 backoff
 - **Sentiment aggregation** — time-weighted, currency-specific filtering
-- **Economic calendar** — cached 5 min, high-impact event detection
+- **Economic calendar** — cached 6 hours, high-impact event detection (Apify ForexFactory scraper sebagai free alternative ke Finnhub paid plan)
 
 ### Dashboard & UX
 - **3 density modes** — Compact, Dense, Minimal (persisted)
-- **DST-aware session clock** — Sydney, Tokyo, London, New York
+- **DST-aware session clock** — Sydney, Tokyo, London, New York + overlap windows (Tokyo × London, London × New York)
 - **Dark + Light theme** — dengan next-themes
-- **Code splitting** — 11 views lazy-loaded via next/dynamic
+- **Code splitting** — 12 views lazy-loaded via next/dynamic
 - **PWA** — installable sebagai mobile app
 - **Real-time WebSocket** — <50ms tick push (optional, via mini-service)
 
@@ -56,7 +59,7 @@
 - **Non-blocking** — notify_async() tidak block trading loop
 
 ### Reporting & Analytics
-- **Trade history** — semua order lifecycle tersimpan di SQLite
+- **Trade history** — order lifecycle tersimpan di SQLite dengan P&L analytics, win rate, profit factor, CSV export
 - **CSV export** — trades + logs
 - **Tax report** — yearly P&L summary
 - **Currency strength meter** — 8 major currencies
@@ -123,8 +126,8 @@ Lihat [`python-backend/config.example.env`](python-backend/config.example.env) u
 | Kategori | Variabel |
 |----------|----------|
 | MT5 | `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_TERMINAL_PATH`, `MT5_AUTO_LAUNCH` |
-| News | `FINNHUB_API_KEY`, `MARKETAUX_API_KEY` |
-| AI | `ZAI_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OLLAMA_URL` |
+| News | `FINNHUB_API_KEY`, `MARKETAUX_API_KEY`, `APIFY_TOKEN` |
+| AI | `GROQ_API_KEY`, `OLLAMA_URL` |
 | Email | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_TO` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 | Discord | `DISCORD_WEBHOOK_URL` |
@@ -145,7 +148,7 @@ Lihat [`python-backend/config.example.env`](python-backend/config.example.env) u
 | Backend | Python 3.13+, FastAPI, uvicorn |
 | Trading | MetaTrader5 Python library |
 | ML | XGBoost, scikit-learn, pandas, ta |
-| AI | Z.AI, Groq, Google AI Studio, Ollama |
+| AI | Groq, Local (Ollama) |
 | Database | SQLite (WAL mode, thread-safe) |
 | Deployment | Docker, docker-compose |
 | Real-time | Socket.io (optional mini-service) |
@@ -167,7 +170,7 @@ my-project/
 ├── python-backend/              # FastAPI + MT5 + AI + ML
 │   ├── main.py                  # FastAPI app, 25+ endpoints
 │   ├── mt5_service.py           # MT5 connect, ticks, orders, SL/TP
-│   ├── ai_service.py            # 4-provider AI with cascade
+│   ├── ai_service.py            # 2-provider AI with cascade (Groq + Ollama)
 │   ├── ml_model.py              # XGBoost + walk-forward + drift
 │   ├── risk_manager.py          # Daily loss, margin, drawdown, news
 │   ├── indicators.py            # 30 technical indicators

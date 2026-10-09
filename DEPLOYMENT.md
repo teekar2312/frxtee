@@ -58,6 +58,27 @@ HOST=127.0.0.1
 PORT=8000
 ```
 
+**Optional .env settings (news + AI):**
+```ini
+# News / economic calendar
+FINNHUB_API_KEY=your_finnhub_key
+MARKETAUX_API_KEY=your_marketaux_key
+# Apify = free ForexFactory calendar scraper (Finnhub free tier 403s on /calendar/economic)
+APIFY_TOKEN=
+
+# AI providers — only Groq (cloud) + Local (Ollama) are supported.
+# Z.AI / Google / OpenRouter have been removed.
+GROQ_API_KEY=your_groq_key
+OLLAMA_URL=http://127.0.0.1:11434
+# Ollama tuning (local AI on CPU — num_ctx caps KV cache to prevent OOM)
+OLLAMA_NUM_CTX=4096
+OLLAMA_TIMEOUT=120
+```
+
+> **Note:** `ZAI_API_KEY` / `GOOGLE_API_KEY` / `OPENROUTER_API_KEY` / `ZAI_MODEL` /
+> `GOOGLE_MODEL` / `OPENROUTER_MODEL` are no longer used — remove them from any
+> existing `.env` to avoid confusion.
+
 ### Step 3: Frontend Setup
 
 ```powershell
@@ -120,8 +141,15 @@ docker compose up --build
 ZENITRADE_API_TOKEN: ${ZENITRADE_API_TOKEN}
 FINNHUB_API_KEY: ${FINNHUB_API_KEY}
 MARKETAUX_API_KEY: ${MARKETAUX_API_KEY}
+APIFY_TOKEN: ${APIFY_TOKEN}
+GROQ_API_KEY: ${GROQ_API_KEY}
+OLLAMA_URL: ${OLLAMA_URL:-http://127.0.0.1:11434}
 # ... all env vars in .env
 ```
+
+> `APIFY_TOKEN` and `OLLAMA_URL` are passed through so the container can use
+> the Apify calendar scraper and reach a host-side Ollama daemon. `OLLAMA_NUM_CTX`
+> and `OLLAMA_TIMEOUT` default to `4096` / `120` if not set.
 
 ---
 
@@ -182,8 +210,8 @@ Before deploying to a live account:
 | "Spread too wide" | Spread > 5 pips. Normal during news. Wait or increase `max_spread_pips`. |
 | "Daily risk limit reached" | `daily_loss >= 3%`. Resets at UTC midnight. Check `/metrics`. |
 | "Rate limit exceeded" | Too many requests. Check `/metrics` for counts. |
-| News feed empty | `FINNHUB_API_KEY` / `MARKETAUX_API_KEY` not set or exhausted. |
-| AI analysis "heuristic" | No AI API key configured. Set `ZAI_API_KEY` or `GROQ_API_KEY`. |
+| News feed empty | `FINNHUB_API_KEY` / `MARKETAUX_API_KEY` not set or exhausted. Calendar also needs `APIFY_TOKEN` (Finnhub free tier 403s on `/calendar/economic`). |
+| AI analysis "heuristic" | No AI API key configured. Set `GROQ_API_KEY` (or run local Ollama via `OLLAMA_URL`). |
 | ML "not trained" | Run `POST /api/trading/ml/train?symbol=EURUSD`. |
 | DB locked | SQLite under heavy concurrent writes. Use single worker (`UVICORN_WORKERS=1`). |
 | Multi-worker error | Set `MULTI_WORKER_SAFE=1` only if you understand the risk. |

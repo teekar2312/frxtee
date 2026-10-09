@@ -6,6 +6,50 @@ Format: `[Keep a Changelog](https://keepachangelog.com/)` + Semantic Versioning.
 
 ---
 
+## [Unreleased] — 2026-10
+
+### Added
+- Apify economic calendar (free ForexFactory scraper — alternative to Finnhub paid plan)
+- Trade History view with P&L analytics (Net P&L, Win Rate, Profit Factor, Avg Pips)
+- Tokyo × London and London × New York overlap trading sessions
+- Close all positions at session end (configurable toggle)
+- Auto-trade circuit breaker (disables after 3 consecutive failures)
+- Per-symbol ML models (each symbol gets its own model file)
+- Ollama timeout + context window configurable via UI/API
+- Diagnostic endpoint: GET /api/trading/calendar/test
+- Startup trade backfill (sync DB with broker on restart)
+- Position pips + SL/TP pips in positions response
+- Frontend sends tpPips to backend (TP follows UI risk-reward)
+- All 14 pairs realtime in header ticker (useAllTicks)
+- Graceful CancelledError handling (no scary traceback on Ctrl+C)
+
+### Changed
+- AI providers reduced from 5 to 2 (Groq + Local/Ollama only)
+- Z.AI, Google AI Studio, OpenRouter removed
+- Economic calendar cache TTL: 5 min → 6 hours (Apify cost optimization)
+- Backend proxy timeout: 1500ms → 3000ms
+- Default ollama_num_ctx: 8192 → 4096
+- Default ai_provider: "zai" → "groq"
+- Favicon: local /logo.svg (was z-ai CDN URL)
+- ML model default: max_depth 4→3, added regularization (L1/L2, gamma, min_child_weight)
+- ML walk-forward: non-overlapping folds (was overlapping → leakage)
+- ML early stopping (early_stopping_rounds=20)
+
+### Fixed
+- SL/TP positions stay open — 3-layer fix (stops_level guard + DB fallback + already_closed handling)
+- Order ticket ≠ position ticket — send_order returns position ticket
+- Trade history missing close data — _fetch_deal_by_ticket() fetches real deal data
+- Auto-trade bypasses news filter — now calls near_high_impact_news()
+- Strategy SL/TP overrides dead-code — now converted to pips + passed to send_order
+- Partial fill volume accounting — uses filled volume, not requested
+- Ollama OOM — num_ctx cap prevents 40GB KV cache allocation
+- Ollama JSON parse — multi-strategy parser handles conversational text around JSON
+- Demo calendar always blocking — returns empty list (was fake high-impact events)
+- Finnhub 403 cache poisoning — separate backoff key, Apify retried on every cache-miss
+- Session changes lost when navigating to Settings — toggleSession now pushes to backend
+
+---
+
 ## [1.5.0] — 2025-03-10
 
 ### Added — 12 New Features
