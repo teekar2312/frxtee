@@ -237,25 +237,37 @@ async def _reconcile_loop():
                          guard.open_count, real_count)
                 # fetch recently closed deals to get their P&L
                 deals = await asyncio.to_thread(get_recent_deals, 15)
-                for d in deals:
-                    ticket = d.get("ticket")
-                    if ticket and ticket not in _processed_deal_tickets:
-                        _processed_deal_tickets.add(ticket)
-                        pnl = d.get("profit", 0.0)
-                        log.info("broker-side close detected: ticket=%s pnl=%.2f",
-                                 ticket, pnl)
-                        # register realized P&L for daily risk tracking
-                        guard.register_close(pnl)
-                        # persist to trade history DB
-                        try:
-                            close_trade(ticket, d.get("price", 0), pnl,
-                                        d.get("pips", 0))
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # keep set bounded
-                        if len(_processed_deal_tickets) > 200:
-                            _processed_deal_tickets.clear()
-                guard.open_count = real_count
+                if not deals:
+                    # Deals list empty — might be MT5 disconnect or deal history
+                    # unavailable. DON'T reset open_count (preserves drift for
+                    # next iteration retry). Was silently "correcting" without
+                    # persisting close data → trades stuck with close_time=NULL.
+                    log.warning("reconcile: drift=%d but deals list empty — "
+                                "NOT resetting open_count (will retry next cycle)",
+                                drift)
+                else:
+                    for d in deals:
+                        ticket = d.get("ticket")
+                        if ticket and ticket not in _processed_deal_tickets:
+                            _processed_deal_tickets.add(ticket)
+                            pnl = d.get("profit", 0.0)
+                            log.info("broker-side close detected: ticket=%s pnl=%.2f",
+                                     ticket, pnl)
+                            # persist to DB BEFORE register_close (so if DB fails,
+                            # open_count isn't decremented → reconcile retries)
+                            try:
+                                close_trade(ticket, d.get("price", 0), pnl,
+                                            d.get("pips", 0))
+                            except Exception as exc:  # noqa: BLE001
+                                log.error("close_trade failed (reconcile): %s — "
+                                          "NOT decrementing open_count", exc)
+                                continue  # skip register_close — will retry next cycle
+                            # only register close AFTER DB persist succeeds
+                            guard.register_close(pnl)
+                            # keep set bounded
+                            if len(_processed_deal_tickets) > 200:
+                                _processed_deal_tickets.clear()
+                    guard.open_count = real_count
         except Exception as exc:  # noqa: BLE001
             log.debug("reconcile loop: %s", exc)
         await asyncio.sleep(10)
@@ -361,11 +373,14 @@ async def _manage_positions_loop():
                         r = await asyncio.to_thread(close_position, ticket)
                         if r.get("ok"):
                             pnl = r.get("pnl", 0.0)
-                            guard.register_close(pnl)
+                            # persist to DB BEFORE register_close (so if DB
+                            # fails, open_count isn't decremented → reconcile
+                            # will retry on next cycle)
                             try:
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
                             except Exception as exc:  # noqa: BLE001
                                 log.error("close_trade DB failed: %s", exc)
+                            guard.register_close(pnl)
                             if r.get("already_closed"):
                                 log.info("ticket=%s already closed broker-side (SL)", ticket)
                             else:
@@ -383,10 +398,25 @@ async def _manage_positions_loop():
                             if r2.get("ok"):
                                 pnl = r2.get("pnl", 0.0)
                                 guard.register_close(pnl)
-                                log.info("SL close retry SUCCESS: ticket=%s", ticket)
+                                # CRITICAL: persist close data to DB (was missing
+                                # → trade history showed empty close fields)
+                                try:
+                                    close_trade(ticket, r2.get("price", 0),
+                                                pnl, r2.get("pips", 0))
+                                except Exception as exc:  # noqa: BLE001
+                                    log.error("close_trade DB failed (retry): %s", exc)
+                                log.info("SL close retry SUCCESS: ticket=%s pnl=%.2f pips=%.1f",
+                                         ticket, pnl, r2.get("pips", 0))
                             else:
                                 log.error("❌ SL close retry FAILED: ticket=%s error=%s",
                                           ticket, r2.get("error"))
+                                # Persist with zeros so at least close_time is set
+                                # (close_trade will log rowcount warning if ticket
+                                # not in DB — better than leaving close_time=NULL)
+                                try:
+                                    close_trade(ticket, 0.0, 0.0, 0.0)
+                                except Exception:  # noqa: BLE001
+                                    pass
                         continue  # skip trailing/BE — position is closed
 
                 if tp and tp > 0:
@@ -398,11 +428,12 @@ async def _manage_positions_loop():
                         r = await asyncio.to_thread(close_position, ticket)
                         if r.get("ok"):
                             pnl = r.get("pnl", 0.0)
-                            guard.register_close(pnl)
+                            # persist to DB BEFORE register_close (same as SL handler)
                             try:
                                 close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
                             except Exception as exc:  # noqa: BLE001
                                 log.error("close_trade DB failed: %s", exc)
+                            guard.register_close(pnl)
                             if r.get("already_closed"):
                                 log.info("ticket=%s already closed broker-side (TP)", ticket)
                             else:
@@ -420,10 +451,22 @@ async def _manage_positions_loop():
                             if r2.get("ok"):
                                 pnl = r2.get("pnl", 0.0)
                                 guard.register_close(pnl)
-                                log.info("TP close retry SUCCESS: ticket=%s", ticket)
+                                # CRITICAL: persist close data to DB (was missing)
+                                try:
+                                    close_trade(ticket, r2.get("price", 0),
+                                                pnl, r2.get("pips", 0))
+                                except Exception as exc:  # noqa: BLE001
+                                    log.error("close_trade DB failed (retry): %s", exc)
+                                log.info("TP close retry SUCCESS: ticket=%s pnl=%.2f pips=%.1f",
+                                         ticket, pnl, r2.get("pips", 0))
                             else:
                                 log.error("❌ TP close retry FAILED: ticket=%s error=%s",
                                           ticket, r2.get("error"))
+                                # Persist with zeros so at least close_time is set
+                                try:
+                                    close_trade(ticket, 0.0, 0.0, 0.0)
+                                except Exception:  # noqa: BLE001
+                                    pass
                         continue  # skip trailing/BE — position is closed
 
                 # Log SL/TP status for debugging (only if BOTH broker and DB
@@ -1184,13 +1227,14 @@ async def api_close(ticket: int, request: Request, _auth=Depends(require_token))
     log.info("manual close requested: ticket=%s", ticket)
     r = await asyncio.to_thread(close_position, ticket)
     if r.get("ok"):
-        # persist closed trade + register realized P&L for daily risk
+        # persist closed trade BEFORE register_close (so if DB fails,
+        # open_count isn't decremented → reconcile retries)
         pnl = r.get("pnl", 0.0)
         pips = r.get("pips", 0.0)
         try:
             close_trade(ticket, r.get("price", 0), pnl, pips)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.error("close_trade DB failed (manual): %s", exc)
         guard.register_close(pnl)
         log.info("trade closed: ticket=%s pnl=%.2f pips=%.1f", ticket, pnl, pips)
         # email notification for manual close (was missing)

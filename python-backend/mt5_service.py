@@ -143,7 +143,13 @@ def _fetch_deal_by_ticket(ticket: int) -> dict | None:
                                     pips_val = (d.price - open_price) / 0.1
                                 else:
                                     pips_val = (d.price - open_price) / pip
-                                if d.type == 1:  # SELL close (closing BUY)
+                                # d.type: 0=BUY deal (closing a SELL position),
+                                #         1=SELL deal (closing a BUY position)
+                                # For a BUY position: profit = (close - open), so if
+                                # d.type==1 (SELL close), pips_val is already correct
+                                # For a SELL position: profit = (open - close), so if
+                                # d.type==0 (BUY close), invert pips_val
+                                if d.type == 0:  # BUY deal = closing SELL position
                                     pips_val = -pips_val
                                 pips = round(pips_val, 1)
                             break
@@ -210,8 +216,13 @@ def get_recent_deals(minutes: int = 1440) -> list[dict]:
                                     pips_val = (d.price - open_price) / 0.1
                                 else:
                                     pips_val = (d.price - open_price) / pip
-                                # for SELL positions, pips are inverted
-                                if d.type == 1:  # DEAL_TYPE_SELL (closing a BUY)
+                                # d.type: 0=BUY deal (closing SELL position),
+                                #         1=SELL deal (closing BUY position)
+                                # For BUY position: profit = (close - open) —
+                                #   d.type==1 (SELL close) → pips_val already correct
+                                # For SELL position: profit = (open - close) —
+                                #   d.type==0 (BUY close) → invert pips_val
+                                if d.type == 0:  # BUY deal = closing SELL position
                                     pips_val = -pips_val
                                 pips = round(pips_val, 1)
                             break

@@ -7145,3 +7145,51 @@ Verification: This is an audit-only task — NO code changes made.
 All findings reference exact file:line for downstream fix agents.
 
 ---
+
+---
+Task ID: AUDIT-HISTORY-CLOSE
+Agent: audit-history-close-data
+Task: Deep audit — why trade history still missing close data for today's trades
+
+Work Log:
+- Read worklog.md context (7147 lines). Searched for prior fixes — no entries for commits 421efa0, 42d7462, f96d432 in worklog; retrieved full commit messages via `git show --stat` to confirm scope of prior fixes.
+- Verified presence + correctness of all 5 prior fixes in current code:
+  * Fix #1 (421efa0): _fetch_deal_by_ticket() exists at mt5_service.py:104-163 ✓
+  * Fix #2 (421efa0): close_trade() rowcount warning at db.py:192-199 ✓
+  * Fix #3 (42d7462): send_order returns position_ticket at mt5_service.py:596-612 ✓
+  * Fix #4 (f96d432): _backfill_closed_trades() on startup at main.py:147-220, 873-877 ✓
+  * Fix #5 (f96d432): get_recent_deals 24h window + INOUT + pip calc at mt5_service.py:166-233 ✓
+- Audited close_position() manual close path (mt5_service.py:615-675): pip + pnl computation correct; uses p.profit (floating, not realized) — acceptable.
+- Audited _fetch_deal_by_ticket() (mt5_service.py:104-163): 24h window, position_id match, DEAL_ENTRY_OUT/INOUT filter — all correct.
+- Audited all 7 close_trade() call sites in main.py:
+  * L200 _backfill_closed_trades (deal found)
+  * L213 _backfill_closed_trades (zero-fill fallback)
+  * L251 _reconcile_loop (broker-side close detected)
+  * L366 _manage_positions_loop SL hit handler (first attempt)
+  * L403 _manage_positions_loop TP hit handler (first attempt)
+  * L557 _manage_positions_loop session-end close
+  * L1191 api_close (manual close endpoint)
+- Audited db.py save_trade (L148-161, INSERT OR REPLACE), close_trade (L180-199), get_trades (L202-207 SELECT *), trades schema (L62-77) — all 14 columns present including close_price, pnl, pips, close_time.
+- Audited /api/trading/trades endpoint (main.py:1619-1626): returns get_trades(200) directly, no field transformation.
+- Audited frontend proxy (src/app/api/trading/trades/route.ts): pure passthrough via proxyBackend.
+- Audited useTrades hook (src/lib/trading-hooks.ts:164-171): 30s refetch, types as Trade[].
+- Audited history-view.tsx (full read 1-299): renders close_price (L262-264), pips (L265-267), pnl (L268-270), close_time (L272) with proper null checks ("—" when null). Field names match backend snake_case. Frontend is correct.
+- Cross-checked Trade interface in trading-data.ts:221-236 — field names match DB schema exactly.
+
+Stage Summary:
+- ROOT CAUSE (PRIMARY): close_trade() is NEVER called in the SL/TP retry path of _manage_positions_loop (main.py:380-389 SL, main.py:417-426 TP). When the first close_position() call fails (requote, MT5 blip, retcode != DONE), the 1s retry calls close_position() again. On retry success, the code calls guard.register_close(pnl) (decrementing open_count) but FORGETS to call close_trade() — so close_price/pnl/pips/close_time are never persisted. Worse: because register_close already decremented open_count, _reconcile_loop sees zero drift on its next 10s pass and ALSO skips the trade. The row stays with close_time=NULL until next backend restart, when _backfill_closed_trades() picks it up. This is the direct cause of "missing close data for today's trades".
+- SECONDARY BUG #1: send_order() position_ticket fallback (mt5_service.py:596-601). If `pos_check = mt5.positions_get(ticket=r.order)` returns None (broker delay > 300ms, terminal hiccup), position_ticket silently falls back to `r.order` (the ORDER ticket). save_trade stores order ticket. Later close_trade(position_ticket) — where position_ticket comes from positions() list — runs UPDATE trades WHERE ticket=position_ticket, affecting 0 rows. The rowcount=0 warning is logged but the data is lost.
+- SECONDARY BUG #2: Pips SIGN INVERSION in deal-history code paths. Both _fetch_deal_by_ticket (mt5_service.py:146-148) and get_recent_deals (mt5_service.py:214-216) compute `pips_val = (d.price - open_price) / pip` then negate `if d.type == 1` (DEAL_TYPE_SELL). For closing a BUY (d.type=1=SELL), winning close (close>open) → pips_val>0 → negated → NEGATIVE. For closing a SELL (d.type=0=BUY), winning close (close<open) → pips_val<0 → not negated → NEGATIVE. Both winning trades show negative pips; both losing trades show positive pips. Manual-close path (close_position when position exists, mt5_service.py:669-670) is correct — only the deal-history path is wrong. Affects: broker-side SL/TP closes via reconcile_loop, _backfill_closed_trades on startup, and close_position's already_closed branch.
+- SECONDARY BUG #3: _reconcile_loop "corrects" drift even when no deals are found (main.py:258 `guard.open_count = real_count` runs unconditionally after the for loop). If get_recent_deals(15) returns [] (MT5 disconnect, history_deals_get failed, or all deals >15min old), the loop body is skipped but open_count is still reset to real_count. The drifted ticket's close_trade is never called, and on next iteration drift=0 so it's never retried. Trade stays with close_time=NULL until backend restart.
+- SECONDARY BUG #4: close_trade exception handling in SL/TP handler (main.py:366-368, 403-405). guard.register_close(pnl) is called BEFORE close_trade, so if close_trade raises (DB locked, disk full), open_count is already decremented and reconcile_loop can't recover. Same pattern in api_close (main.py:1191-1194) — register_close after close_trade, but close_trade exception is silently swallowed (`except Exception: pass`) so the trade stays open AND the user sees no error.
+- SECONDARY BUG #5 (potential, low frequency): If settings.partial_close_enabled is True, a partial close generates a DEAL_ENTRY_INOUT (2) deal. get_recent_deals includes entry=2 in its filter. If reconcile_loop then processes this partial-close deal, it calls close_trade for a ticket whose position is STILL OPEN (just reduced volume). This incorrectly marks the trade as closed in DB while the position is still live. Probably not user's current issue (partial_close_enabled defaults to False), but a real latent bug.
+
+- FIX RECOMMENDATIONS:
+  1. PRIMARY FIX (main.py:380-389 SL retry, 417-426 TP retry): Add `close_trade(ticket, r2.get("price", 0), r2.get("pnl", 0.0), r2.get("pips", 0))` after `guard.register_close(pnl)` in the retry-success branch. Also add close_trade call in the retry-failure branch (using zeros so at least close_time is set + warning logged).
+  2. send_order position_ticket robustness (mt5_service.py:596-601): If pos_check is None after 300ms, retry positions_get up to 3 times with 200ms delays before falling back to r.order. Log a warning when falling back so operator knows ticket may mismatch.
+  3. Pip sign fix (mt5_service.py:146-148 and 214-216): The inversion logic is wrong. Correct formula: for closing a BUY (d.type==DEAL_TYPE_SELL=1), pips should be `(d.price - open_price) / pip` (positive when close > open). For closing a SELL (d.type==DEAL_TYPE_BUY=0), pips should be `(open_price - d.price) / pip` (positive when close < open). Simplest fix: `pips_val = (d.price - open_price) / pip; if d.type == 0: pips_val = -pips_val` (invert for BUY deal = closing a SELL), removing the current `if d.type == 1: pips_val = -pips_val` line.
+  4. reconcile_loop drift protection (main.py:230-261): Only reset `guard.open_count = real_count` AFTER confirming at least one close_trade was successfully called for each drifted ticket. Track expected_close_tickets = {tickets_in_db_open but not in real_positions} and only clear drift when all have been processed. Failing that, log a CRITICAL warning when drift > 0 but deals list is empty so operator knows to investigate.
+  5. close_trade exception handling (main.py:366, 403, 1191): Move guard.register_close AFTER close_trade, so if close_trade raises, open_count stays incremented and reconcile_loop can retry. Or wrap close_trade in its own retry (3x with 100ms backoff) before giving up.
+  6. Partial close safety (mt5_service.py:189 filter or main.py:242 check): In _reconcile_loop, skip deals where d.entry == 2 (INOUT) when the position is still open in MT5 — verify with mt5.positions_get(ticket=d.position_id) before calling close_trade. Or only process deals whose position is no longer in mt5.positions().
+
+Verification: This is an audit-only task — NO code changes made. All findings reference exact file:line for downstream fix agents. Recommended fix order: PRIMARY (#1) first — this alone will resolve the user's reported issue for the majority of today's trades.
