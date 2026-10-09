@@ -495,6 +495,7 @@ export function AIEngineView() {
                         symbol: focus,
                         side,
                         slPips: store.stopLossPips,
+                        tpPips: store.stopLossPips * store.rrRatio,
                         comment: "AI:auto",
                       }),
                     });

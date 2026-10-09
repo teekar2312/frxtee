@@ -1167,7 +1167,7 @@ async def api_order(body: OrderReq, request: Request, _auth=Depends(require_toke
             notify_async(
                 f"Trade opened: {body.side} {body.symbol}",
                 f"<p>{body.side} {body.symbol} {volume} lot @ {r.get('price')}</p>"
-                f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>"
+                f"<p>SL {body.slPips}p · TP {eff_tp_pips:.1f}p · Risk ${ps.risk_amount:.2f}</p>"
                 f"<p>Pip value: ${pip_value:.2f}/pip/lot</p>",
             )
         else:
@@ -1460,7 +1460,7 @@ async def api_ml_info(symbol: str | None = None):
 
 @app.get("/api/trading/ai/config")
 async def api_ai_config():
-    """Return current AI provider config (models + confidence thresholds).
+    """Return current AI provider config + risk management settings.
     Frontend reads this to sync its UI with backend state."""
     return {
         "models": {
@@ -1482,6 +1482,14 @@ async def api_ai_config():
             "groq": bool(settings.groq_api_key),
             "local": True,
         },
+        # ---- risk management settings (synced from frontend) ----
+        "risk_per_trade_pct": settings.risk_per_trade_pct,
+        "stop_loss_pips": settings.stop_loss_pips,
+        "rr_ratio": settings.rr_ratio,
+        "max_open_positions": settings.max_open_positions,
+        "daily_risk_limit_pct": settings.daily_risk_limit_pct,
+        "daily_target_pct": settings.daily_target_pct,
+        "avoid_high_impact_news": settings.avoid_high_impact_news,
     }
 
 
@@ -1549,6 +1557,35 @@ async def api_ai_config_update(request: Request):
         settings.trading_strategy = body["trading_strategy"]
         updated.append(f"trading_strategy={settings.trading_strategy}")
         log.info("📈 strategy set to: %s", body["trading_strategy"])
+
+    # ---- risk management settings (synced from frontend Risk Mgmt view) ----
+    # These were previously NOT synced — backend always used .env defaults.
+    # Now the user's UI-configured rr_ratio, stop_loss_pips, etc. are pushed
+    # to backend via POST /api/trading/ai/config, so auto-trade and manual
+    # orders use the ACTUAL configured values, not frozen .env defaults.
+    if "risk_per_trade_pct" in body:
+        settings.risk_per_trade_pct = float(body["risk_per_trade_pct"])
+        updated.append(f"risk_per_trade_pct={settings.risk_per_trade_pct}")
+    if "stop_loss_pips" in body:
+        settings.stop_loss_pips = int(body["stop_loss_pips"])
+        updated.append(f"stop_loss_pips={settings.stop_loss_pips}")
+        log.info("🛡 stop_loss_pips set to: %d", settings.stop_loss_pips)
+    if "rr_ratio" in body:
+        settings.rr_ratio = float(body["rr_ratio"])
+        updated.append(f"rr_ratio={settings.rr_ratio}")
+        log.info("📊 rr_ratio set to: %.2f", settings.rr_ratio)
+    if "max_open_positions" in body:
+        settings.max_open_positions = int(body["max_open_positions"])
+        updated.append(f"max_open_positions={settings.max_open_positions}")
+    if "daily_risk_limit_pct" in body:
+        settings.daily_risk_limit_pct = float(body["daily_risk_limit_pct"])
+        updated.append(f"daily_risk_limit_pct={settings.daily_risk_limit_pct}")
+    if "daily_target_pct" in body:
+        settings.daily_target_pct = float(body["daily_target_pct"])
+        updated.append(f"daily_target_pct={settings.daily_target_pct}")
+    if "avoid_high_impact_news" in body:
+        settings.avoid_high_impact_news = bool(body["avoid_high_impact_news"])
+        updated.append(f"avoid_high_impact_news={settings.avoid_high_impact_news}")
 
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {

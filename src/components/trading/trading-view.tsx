@@ -350,7 +350,11 @@ function OrderTicket() {
   const [symbol, setSymbol] = React.useState(symbols[0] ?? "EURUSD");
   const [side, setSide] = React.useState<"BUY" | "SELL">("BUY");
   const [volume, setVolume] = React.useState(0.1);
-  const [slPips, setSlPips] = React.useState(10);
+  // SL pips from store (synced with Risk Mgmt slider), with local override
+  const storeSlPips = useTradingStore((s) => s.stopLossPips);
+  const [slPips, setSlPips] = React.useState(storeSlPips);
+  // Sync local slPips when store changes (Risk Mgmt slider)
+  React.useEffect(() => { setSlPips(storeSlPips); }, [storeSlPips]);
   const rr = useTradingStore((s) => s.rrRatio);
   const riskPct = useTradingStore((s) => s.riskPerTrade);
   const equity = useTradingStore((s) => s.accountEquity);

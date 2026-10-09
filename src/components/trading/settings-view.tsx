@@ -78,6 +78,28 @@ export function SettingsView() {
         if (d.trading_strategy != null) {
           store.setTradingStrategy(d.trading_strategy);
         }
+        // sync risk management settings from backend
+        if (d.risk_per_trade_pct != null) {
+          useTradingStore.setState({ riskPerTrade: d.risk_per_trade_pct });
+        }
+        if (d.stop_loss_pips != null) {
+          useTradingStore.setState({ stopLossPips: d.stop_loss_pips });
+        }
+        if (d.rr_ratio != null) {
+          useTradingStore.setState({ rrRatio: d.rr_ratio });
+        }
+        if (d.max_open_positions != null) {
+          useTradingStore.setState({ maxOpenPositions: d.max_open_positions });
+        }
+        if (d.daily_risk_limit_pct != null) {
+          useTradingStore.setState({ dailyRiskLimit: d.daily_risk_limit_pct });
+        }
+        if (d.daily_target_pct != null) {
+          useTradingStore.setState({ dailyTarget: d.daily_target_pct });
+        }
+        if (d.avoid_high_impact_news != null) {
+          useTradingStore.setState({ avoidNews: !!d.avoid_high_impact_news });
+        }
       })
       .catch(() => {});
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
@@ -100,6 +122,15 @@ export function SettingsView() {
           trading_strategy: store.tradingStrategy,
           ollama_num_ctx: store.ollamaNumCtx,
           ollama_timeout: store.ollamaTimeout,
+          // risk management settings — synced so backend uses UI values,
+          // not frozen .env defaults
+          risk_per_trade_pct: store.riskPerTrade,
+          stop_loss_pips: store.stopLossPips,
+          rr_ratio: store.rrRatio,
+          max_open_positions: store.maxOpenPositions,
+          daily_risk_limit_pct: store.dailyRiskLimit,
+          daily_target_pct: store.dailyTarget,
+          avoid_high_impact_news: store.avoidNews,
         }),
       });
     } catch {
@@ -108,7 +139,10 @@ export function SettingsView() {
   }, [store.aiModels, store.aiMinConfidence, store.autoTradeMinConfidence,
       store.aiProvider, store.autoTradeMode, store.symbols,
       store.sessions, store.closeAtSessionEnd, store.tradingStrategy,
-      store.ollamaNumCtx, store.ollamaTimeout]);
+      store.ollamaNumCtx, store.ollamaTimeout,
+      store.riskPerTrade, store.stopLossPips, store.rrRatio,
+      store.maxOpenPositions, store.dailyRiskLimit, store.dailyTarget,
+      store.avoidNews]);
   const [login, setLogin] = React.useState("");
   const [server, setServer] = React.useState("FINEX-Real");
   const [password, setPassword] = React.useState("");

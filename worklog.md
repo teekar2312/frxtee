@@ -6933,3 +6933,215 @@ Work Log:
 
 Stage Summary:
 - 3 files updated
+
+---
+Task ID: AUDIT-SLTP-RR
+Agent: audit-sltp-risk-reward
+Task: Deep audit — why SL/TP don't follow risk-reward ratio from Risk Management
+
+Work Log:
+- Read /home/z/my-project/worklog.md (full history incl. A3, A4, A5, R5, O1, prior SL/TP fixes)
+- Read /home/z/my-project/python-backend/config.py (Settings dataclass + .env defaults)
+- Read /home/z/my-project/python-backend/config.example.env (STOP_LOSS_PIPS=10, RR_RATIO=1.5)
+- Read /home/z/my-project/src/lib/trading-store.ts (frontend Zustand store: rrRatio/stopLossPips)
+- Read /home/z/my-project/src/components/trading/risk-view.tsx (RR/SL sliders + onAuto handler)
+- Read /home/z/my-project/src/components/trading/settings-view.tsx (pushAiConfig + on-mount GET sync)
+- Read /home/z/my-project/src/components/trading/trading-view.tsx (OrderTicket + manual order POST)
+- Read /home/z/my-project/src/components/trading/ai-engine-view.tsx lines 450-540 (Execute button)
+- Read /home/z/my-project/python-backend/main.py (api_order, _auto_trade_loop, /api/trading/ai/config GET+POST)
+- Read /home/z/my-project/python-backend/risk_manager.py (size_position uses settings.rr_ratio)
+- Read /home/z/my-project/python-backend/mt5_service.py (send_order stops_level guard + positions() display)
+- Read /home/z/my-project/python-backend/db.py (save_trade signature — only stores sl/tp as PRICE levels)
+- Grep'd frontend + backend for every reference to rrRatio/rr_ratio/stopLossPips/stop_loss_pips/tpPips
+
+Stage Summary:
+
+ROOT CAUSE (CRITICAL — frontend store never syncs to backend):
+  The user-configurable money-management fields (`stop_loss_pips`, `rr_ratio`,
+  `risk_per_trade_pct`, `max_open_positions`, `daily_risk_limit_pct`,
+  `daily_target_pct`, `avoid_high_impact_news`, `trailing_enabled`,
+  `trailing_pips`) are NEVER pushed from the frontend Zustand store to the
+  Python backend `settings.*`. The backend reads them once from .env at boot
+  (STOP_LOSS_PIPS=10, RR_RATIO=1.5) and uses those frozen defaults for the
+  lifetime of the process — regardless of what the user changes in the Risk
+  Management UI.
+
+  Concretely:
+  - trading-store.ts setRrRatio/setStopLossPips (lines 270, 272) only do
+    `set({ rrRatio: v })` / `set({ stopLossPips: v })` — no fetch.
+  - risk-view.tsx sliders call these setters directly (lines 131, 142) — no fetch.
+  - settings-view.tsx pushAiConfig (lines 86-111) body omits ALL money-mgmt
+    fields; on-mount GET sync (lines 35-83) reads none of them either.
+  - main.py POST /api/trading/ai/config (lines 1488-1551) accepts ONLY:
+    models, ollama_num_ctx, ollama_timeout, ai_min_confidence,
+    auto_trade_min_confidence, active_provider, auto_trade_mode,
+    auto_trade_symbols, active_sessions, close_at_session_end,
+    trading_strategy — no money-mgmt keys.
+  - main.py GET /api/trading/ai/config (lines 1461-1485) returns NONE of
+    the money-mgmt fields either — so even if a user wanted to verify what
+    the backend is actually using, they cannot.
+
+DIRECT IMPACT:
+  Manual orders from OrderTicket (trading-view.tsx) DO send `tpPips` in the
+  POST body (line 385), so they bypass `settings.rr_ratio` and TP is
+  computed correctly from local slPips * store.rrRatio. The OrderTicket
+  itself DOES respect the user's RR slider change.
+
+  BUT everything else falls back to .env defaults:
+  - AI Engine "Execute" button (ai-engine-view.tsx lines 491-500): sends
+    ONLY slPips, NOT tpPips → backend computes tp = slPips * settings.rr_ratio
+    = slPips * 1.5. If user changed rrRatio to 2.0 in Risk Management, the
+    Execute button silently uses 1.5.
+  - _auto_trade_loop (main.py 762-774): SL = settings.stop_loss_pips (10),
+    TP = SL * settings.rr_ratio (10 * 1.5 = 15) — ALWAYS uses .env defaults,
+    never the user's configured values.
+  - size_position (risk_manager.py 145-152): `rr = settings.rr_ratio if rr
+    is None else rr` and `tp_pips = sl_pips * rr` — used by both api_order
+    fallback (main.py 1121) and the auto-trade loop.
+
+FINDINGS (numbered, severity-ordered):
+
+[F-01] CRITICAL — Money-mgmt config NEVER synced frontend → backend
+  Files: src/lib/trading-store.ts:269-272 (setStopLossPips/setRrRatio no fetch),
+         src/components/trading/risk-view.tsx:131,142 (sliders call setters only),
+         src/components/trading/settings-view.tsx:86-111 (pushAiConfig omits mgmt fields),
+         python-backend/main.py:1461-1485 (GET /ai/config returns no mgmt fields),
+         python-backend/main.py:1488-1551 (POST /ai/config accepts no mgmt fields)
+  Impact: User changes RR from 1.5 → 2.0 in Risk Management UI. Frontend
+    store updates, persists to localStorage, sliders reflect change — but
+    backend `settings.rr_ratio` stays at 1.5 forever. EVERY auto-trade order
+    AND every AI-Engine Execute order uses 1.5, NOT the user's 2.0. Manual
+    OrderTicket works ONLY because tpPips is sent in the body.
+  Severity: CRITICAL — silent risk-parameter drift on real money.
+
+[F-02] HIGH — AI Engine "Execute" button omits tpPips → falls back to backend default
+  File: src/components/trading/ai-engine-view.tsx:491-500
+  Problem: POST body sends `{ symbol, side, slPips: store.stopLossPips,
+    comment: "AI:auto" }` — NO `tpPips` field. Backend (main.py:1121)
+    falls back to `ps.tp_pips` = `slPips * settings.rr_ratio` = `slPips *
+    1.5`. If user changed rrRatio, the AI Execute order's TP won't match
+    the displayed "1 : {store.rrRatio}" panel (line 467).
+  Severity: HIGH — same root cause as F-01 but specific to AI Execute path.
+
+[F-03] HIGH — OrderTicket slPips is LOCAL state, NOT bound to store.stopLossPips
+  File: src/components/trading/trading-view.tsx:353
+  Problem: `const [slPips, setSlPips] = React.useState(10)` — local state,
+    default 10. If user changes Risk Management "Stop Loss" slider from 10
+    → 12, the OrderTicket still shows SL=10p and computes TP=10*rrRatio (NOT
+    12*rrRatio). The displayed "TP = 15.0p" in OrderTicket (line 505) will
+    disagree with the "TP = 18.0 pips" shown in risk-view.tsx (line 249).
+  Severity: HIGH — user-visible inconsistency, silent wrong sizing.
+
+[F-04] MEDIUM — Dashboard "Risk/Reward" tile hardcoded "1 : 1.5"
+  File: src/components/trading/dashboard-view.tsx:271
+  Problem: `<StatTile label="Risk/Reward" value="1 : 1.5" sub="configured" />`
+    — never reflects store.rrRatio, never fetched from backend. Misleading
+    if user changed RR.
+  Severity: MEDIUM — display only, no money impact.
+
+[F-05] MEDIUM — Order notification email shows wrong TP (uses ps.tp_pips not eff_tp_pips)
+  File: python-backend/main.py:1170
+  Problem: `f"<p>SL {body.slPips}p · TP {ps.tp_pips:.1f}p · Risk ..."`
+    uses `ps.tp_pips` (computed from settings.rr_ratio) NOT `eff_tp_pips`
+    (the value actually sent to broker, which may be the frontend-supplied
+    body.tpPips). User receives email with wrong TP — debugging confusion.
+  Severity: MEDIUM — cosmetic in notification, but masks F-01/F-02.
+
+[F-06] LOW — OrderTicket "AI: <autoLot>" auto-lot button uses hardcoded $10/pip/lot
+  File: src/components/trading/trading-view.tsx:364
+  Problem: `autoLot = Math.max(0.01, +(riskAmount / (slPips * 10)).toFixed(2))`
+    — the `* 10` assumes USD-quoted pair. For USDJPY (~$9.13/pip/lot),
+    XAGUSD ($50/pip/lot) etc., the suggested lot size is wrong. Same bug
+    in risk-view.tsx:246. (Already noted in prior audit O1-F15.)
+  Severity: LOW — sizing only, separate from RR mismatch.
+
+[F-07] LOW — No client-side verification of backend's actual rr_ratio / stop_loss_pips
+  Problem: GET /api/trading/ai/config (main.py:1461) returns no money-mgmt
+    fields. GET /api/trading/status (main.py:1050) returns no money-mgmt
+    fields. User has no way to confirm what the backend is using. Even if
+    F-01 is fixed, there's no read-back path to surface drift.
+  Severity: LOW — observability gap, compounding F-01.
+
+SECONDARY OBSERVATIONS (not bugs, just context):
+
+- send_order (mt5_service.py:519-527) DOES bump sl_pips/tp_pips to broker
+  min when stops_level is too tight, AND logs a warning. This is correct
+  behaviour, not a bug. positions() (mt5_service.py:432-442) computes
+  slPips/tpPips from the ACTUAL broker position's sl/tp — so if broker
+  bumped, the displayed values reflect bumped values (also correct).
+
+- size_position's signature accepts optional `rr` and `risk_pct` params
+  (risk_manager.py:138) — but neither api_order nor _auto_trade_loop pass
+  them, so they always fall back to settings.* defaults. Could be a
+  future fix surface: pass body-provided values directly.
+
+- Pydantic OrderReq (main.py:979-985) correctly added `tpPips: float |
+  None = None` (was the recent fix). Default None → fallback path. If
+  this were `default=None` plus required `rrRatio`, frontend could send
+  rrRatio instead of pre-computed tpPips — cleaner contract.
+
+- The strategy-override path (main.py:690-720, 762-774) DOES correctly
+  extract strategy SL/TP price levels and convert to pips — but ONLY
+  overrides when a non-auto strategy is selected AND the strategy returns
+  non-NEUTRAL signal. Falls back to settings.stop_loss_pips otherwise.
+
+OVERALL VERDICT:
+  PRIMARY ROOT CAUSE = F-01 (no frontend → backend sync for money-mgmt
+  fields). This is why "SL/TP don't follow risk-reward ratio from Risk
+  Management settings": the backend doesn't even know the user changed
+  the ratio. The manual OrderTicket works by accident (it pre-computes
+  tpPips and sends it in the body), but AI Execute and the entire auto-
+  trade loop use .env defaults forever.
+
+SUGGESTED FIXES (priority order):
+
+1. [CRITICAL] Extend /api/trading/ai/config to accept money-mgmt fields:
+   python-backend/main.py POST handler (lines 1488-1551) should add:
+     if "risk_per_trade_pct" in body: settings.risk_per_trade_pct = float(...)
+     if "stop_loss_pips" in body: settings.stop_loss_pips = int(...)
+     if "rr_ratio" in body: settings.rr_ratio = float(...)
+     if "max_open_positions" in body: settings.max_open_positions = int(...)
+     if "daily_risk_limit_pct" in body: settings.daily_risk_limit_pct = float(...)
+     if "daily_target_pct" in body: settings.daily_target_pct = float(...)
+     if "avoid_high_impact_news" in body: settings.avoid_high_impact_news = bool(...)
+     if "trailing_enabled" in body: settings.trailing_enabled = bool(...)
+     if "trailing_pips" in body: settings.trailing_pips = int(...)
+   Also extend GET (lines 1461-1485) to echo back the same fields so the
+   frontend can verify on mount.
+
+2. [CRITICAL] Update pushAiConfig in src/components/trading/settings-view.tsx
+   (lines 86-111) to include the new fields. Also add an onChange handler
+   in risk-view.tsx sliders that pushes each money-mgmt change immediately
+   (or add a single "Apply Risk Settings to Backend" button like the AI
+   Config one).
+
+3. [HIGH] Fix AI Engine Execute (ai-engine-view.tsx:491-500): add
+   `tpPips: store.stopLossPips * store.rrRatio` to the POST body so it
+   matches the OrderTicket pattern.
+
+4. [HIGH] Bind OrderTicket slPips to store.stopLossPips:
+   src/components/trading/trading-view.tsx:353 — change
+   `const [slPips, setSlPips] = React.useState(10)` to
+   `const [slPips, setSlPips] = React.useState(store.stopLossPips)` and
+   sync on store.stopLossPips changes via useEffect.
+
+5. [MEDIUM] Fix notify_async TP at main.py:1170 — change `ps.tp_pips` to
+   `eff_tp_pips` so the email shows the actual TP sent.
+
+6. [MEDIUM] Dashboard "Risk/Reward" tile (dashboard-view.tsx:271) should
+   read from `useTradingStore((s) => s.rrRatio)` instead of hardcoded
+   "1 : 1.5".
+
+7. [LOW] Fix auto-lot hardcoded $10/pip/lot in trading-view.tsx:364 and
+   risk-view.tsx:246 — fetch via /api/trading/pip_value (or use
+   get_pip_value_per_lot proxy endpoint) per symbol.
+
+8. [LOW] Persist money-mgmt changes to backend .env on next restart
+   (similar to how ai_models / ollama_* are persisted) so they survive
+   process restarts. Currently they're runtime-only mutations on the
+   settings singleton.
+
+Verification: This is an audit-only task — NO code changes made.
+All findings reference exact file:line for downstream fix agents.
+
+---

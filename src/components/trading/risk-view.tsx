@@ -104,6 +104,19 @@ export function RiskView() {
                   s.setMaxOpenPositions(2);
                   s.setDailyRiskLimit(2.5);
                   s.setDailyTarget(2);
+                  // Push AI-optimized risk settings to backend
+                  fetch("/api/trading/ai/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      risk_per_trade_pct: 0.8,
+                      stop_loss_pips: 10,
+                      rr_ratio: 1.5,
+                      max_open_positions: 2,
+                      daily_risk_limit_pct: 2.5,
+                      daily_target_pct: 2,
+                    }),
+                  }).catch(() => {});
                   toast.success("AI optimized money management");
                 }}
                 onManual={() => s.setAutoRisk(false)}
@@ -117,7 +130,14 @@ export function RiskView() {
             max={1}
             step={0.1}
             unit="%"
-            onChange={s.setRiskPerTrade}
+            onChange={(v) => {
+              s.setRiskPerTrade(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ risk_per_trade_pct: v }),
+              }).catch(() => {});
+            }}
             hint={`${fmtMoney(riskAmount)} per position`}
           />
           <Separator />
@@ -128,7 +148,14 @@ export function RiskView() {
             max={15}
             step={1}
             unit="p"
-            onChange={s.setStopLossPips}
+            onChange={(v) => {
+              s.setStopLossPips(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ stop_loss_pips: v }),
+              }).catch(() => {});
+            }}
             hint="5–15 pips (scalping)"
           />
           <Separator />
@@ -139,7 +166,16 @@ export function RiskView() {
             max={3}
             step={0.1}
             unit=":1"
-            onChange={s.setRrRatio}
+            onChange={(v) => {
+              s.setRrRatio(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ rr_ratio: v }),
+              }).then(() => {
+                toast.success(`RR 1:${v.toFixed(1)} applied to backend — TP = ${(s.stopLossPips * v).toFixed(1)}p`);
+              }).catch(() => {});
+            }}
             hint={`TP = ${s.stopLossPips * s.rrRatio} pips`}
           />
           <Separator />
@@ -150,7 +186,14 @@ export function RiskView() {
             max={3}
             step={1}
             unit=""
-            onChange={s.setMaxOpenPositions}
+            onChange={(v) => {
+              s.setMaxOpenPositions(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ max_open_positions: v }),
+              }).catch(() => {});
+            }}
             hint="1–3 concurrent (anti-MC)"
           />
         </Card>
@@ -164,7 +207,14 @@ export function RiskView() {
             max={3}
             step={0.1}
             unit="%"
-            onChange={s.setDailyRiskLimit}
+            onChange={(v) => {
+              s.setDailyRiskLimit(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ daily_risk_limit_pct: v }),
+              }).catch(() => {});
+            }}
             hint={`${fmtMoney(dailyRiskAmt)} — halt new trades if exceeded`}
           />
           <SliderRow

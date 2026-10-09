@@ -57,6 +57,7 @@ export function DashboardView() {
   const aiProvider = useActiveProvider();
   const autoTrade = useTradingStore((s) => s.autoTradeMode);
   const trailingEnabled = useTradingStore((s) => s.trailingEnabled);
+  const rrRatio = useTradingStore((s) => s.rrRatio);
   const dailyTarget = useTradingStore((s) => s.dailyTarget);
   const dailyRisk = useTradingStore((s) => s.dailyRiskLimit);
 
@@ -268,7 +269,7 @@ export function DashboardView() {
           </Card>
 
           <div className="grid grid-cols-2 gap-2">
-            <StatTile label="Risk/Reward" value="1 : 1.5" sub="configured" icon={Target} className="" />
+            <StatTile label="Risk/Reward" value={`1 : ${rrRatio.toFixed(1)}`} sub="configured" icon={Target} className="" />
             <StatTile label="Max Drawdown" value="-2.4%" sub="today" tone="down" />
           </div>
         </div>
