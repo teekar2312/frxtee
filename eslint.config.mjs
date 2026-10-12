@@ -32,6 +32,7 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "python-backend/.venv/**",  // Python venv (site-packages contains .js files)
     "python-backend/**/__pycache__/**",
     "mini-services/**",  // standalone Bun services (own lint configs)
+    "examples/**",  // example/demo files (not part of trading app)
   ],
 }];
 

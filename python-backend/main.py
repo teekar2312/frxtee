@@ -220,13 +220,23 @@ def _backfill_closed_trades():
              backfilled, len(closed_offline))
 
 
+# track consecutive empty-deal cycles for reconcile fallback
+_reconcile_empty_count: int = 0
+_RECONCILE_MAX_EMPTY = 6  # after 6 cycles (~60s), force-reset
+
+
 async def _reconcile_loop():
     """Background task: sync guard.open_count + daily_loss with broker every 10s.
 
     Broker-side closes (SL/TP hit, margin call) bypass our register_close(),
     so open_count drifts upward AND daily_loss is undercounted. This polls
     real positions + recent deal history to correct both.
+
+    If deals list is empty (MT5 disconnect, deal history unavailable), we
+    retry for up to 6 cycles (~60s). After that, we force-reset open_count
+    to prevent permanent stuck state + trigger backfill.
     """
+    global _reconcile_empty_count
     while True:
         try:
             pos = await asyncio.to_thread(mt5_positions)
@@ -235,17 +245,32 @@ async def _reconcile_loop():
             if drift > 0:
                 log.info("position reconcile: guard=%d real=%d → correcting",
                          guard.open_count, real_count)
-                # fetch recently closed deals to get their P&L
-                deals = await asyncio.to_thread(get_recent_deals, 15)
+                # fetch deals from 24h window (was 15 min — too short,
+                # missed deals from >15min ago or during backend restart)
+                deals = await asyncio.to_thread(get_recent_deals, 1440)
                 if not deals:
-                    # Deals list empty — might be MT5 disconnect or deal history
-                    # unavailable. DON'T reset open_count (preserves drift for
-                    # next iteration retry). Was silently "correcting" without
-                    # persisting close data → trades stuck with close_time=NULL.
-                    log.warning("reconcile: drift=%d but deals list empty — "
-                                "NOT resetting open_count (will retry next cycle)",
-                                drift)
+                    _reconcile_empty_count += 1
+                    if _reconcile_empty_count < _RECONCILE_MAX_EMPTY:
+                        log.warning("reconcile: drift=%d, deals empty (attempt %d/%d) — "
+                                    "will retry next cycle",
+                                    drift, _reconcile_empty_count, _RECONCILE_MAX_EMPTY)
+                    else:
+                        # After 6 consecutive empty cycles (~60s), force-reset
+                        # to prevent permanent stuck state. Try backfill to
+                        # recover close data from DB trades.
+                        log.warning("reconcile: drift=%d, deals empty for %d cycles — "
+                                    "FORCE resetting open_count to %d. Triggering backfill...",
+                                    drift, _reconcile_empty_count, real_count)
+                        guard.open_count = real_count
+                        _reconcile_empty_count = 0
+                        # Try backfill from DB (catches trades that closed
+                        # while deals were unavailable)
+                        try:
+                            await asyncio.to_thread(_backfill_closed_trades)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("reconcile backfill failed: %s", exc)
                 else:
+                    _reconcile_empty_count = 0
                     for d in deals:
                         ticket = d.get("ticket")
                         if ticket and ticket not in _processed_deal_tickets:
@@ -253,18 +278,15 @@ async def _reconcile_loop():
                             pnl = d.get("profit", 0.0)
                             log.info("broker-side close detected: ticket=%s pnl=%.2f",
                                      ticket, pnl)
-                            # persist to DB BEFORE register_close (so if DB fails,
-                            # open_count isn't decremented → reconcile retries)
+                            # persist to DB BEFORE register_close
                             try:
                                 close_trade(ticket, d.get("price", 0), pnl,
                                             d.get("pips", 0))
                             except Exception as exc:  # noqa: BLE001
                                 log.error("close_trade failed (reconcile): %s — "
                                           "NOT decrementing open_count", exc)
-                                continue  # skip register_close — will retry next cycle
-                            # only register close AFTER DB persist succeeds
+                                continue
                             guard.register_close(pnl)
-                            # keep set bounded
                             if len(_processed_deal_tickets) > 200:
                                 _processed_deal_tickets.clear()
                     guard.open_count = real_count
