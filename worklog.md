@@ -7193,3 +7193,72 @@ Stage Summary:
   6. Partial close safety (mt5_service.py:189 filter or main.py:242 check): In _reconcile_loop, skip deals where d.entry == 2 (INOUT) when the position is still open in MT5 — verify with mt5.positions_get(ticket=d.position_id) before calling close_trade. Or only process deals whose position is no longer in mt5.positions().
 
 Verification: This is an audit-only task — NO code changes made. All findings reference exact file:line for downstream fix agents. Recommended fix order: PRIMARY (#1) first — this alone will resolve the user's reported issue for the majority of today's trades.
+
+---
+Task ID: AUDIT-SETTINGS-RESET
+Agent: audit-settings-reset
+Task: Deep audit — why settings reset to defaults after backend restart
+
+Work Log:
+- Read worklog.md for context (prior audits + project structure).
+- Step 1 — Read /home/z/my-project/python-backend/config.py (full, 130 lines). Confirmed: `Settings` is a pydantic-settings `BaseSettings` subclass with `model_config = SettingsConfigDict(env_file=".env", ...)`. Module instantiates a singleton at the bottom: `settings = Settings()` (config.py:129). Pydantic-settings reads `.env` ONCE at construction; it has NO writer API. All runtime mutations like `settings.groq_model = ...` happen on the in-memory singleton and are lost when the process exits. NO persistence layer (DB / JSON / .env write-back) is wired in.
+- Step 2 — Read POST /api/trading/ai/config handler (main.py:1562–1666). All field updates mutate the in-memory `settings` singleton only. Examples: `settings.groq_model = models["groq"]` (1581), `settings.auto_trade_mode = bool(body["auto_trade_mode"])` (1608), `settings.active_sessions = body["active_sessions"]` (1615), `settings.rr_ratio = float(body["rr_ratio"])` (1640), `settings.stop_loss_pips = int(body["stop_loss_pips"])` (1636), `settings.risk_per_trade_pct = ...` (1633), `settings.max_open_positions = ...` (1644), `settings.daily_risk_limit_pct = ...` (1647), `settings.daily_target_pct = ...` (1650), `settings.avoid_high_impact_news = ...` (1653), `settings.ollama_num_ctx = ...` (1586), `settings.ollama_timeout = ...` (1593), `settings.ai_provider = ...` (1605), `settings.trading_strategy = ...` (1623), `settings.close_at_session_end = ...` (1619), `settings.auto_trade_symbols = ...` (1612), `settings.auto_trade_min_confidence = ...` (1602). NONE of these call any DB write, json.dump, dotenv.set_key, or file write. Grep across python-backend/ for `set_key|dotenv|write.*\.env|settings_table|key_value|save_config|persist_config|runtime_config` → zero matches. Misleading docstring on settings-view.tsx:468 ("Changes also persist in backend .env on next restart") is FALSE — pydantic-settings cannot write .env.
+- Step 3 — Read /home/z/my-project/src/lib/trading-store.ts (full, 339 lines). Zustand `create<TradingState>()(persist(...))` with `name: "zenitrade-store"` and a `partialize` that includes ALL config fields: symbols, timeframes, sessions, closeAtSessionEnd, indicators, aiProvider, aiMinConfidence, autoTradeMinConfidence, aiModels, ollamaNumCtx, ollamaTimeout, tradingStrategy, autoTradeMode, autoIndicators, autoTrailing, autoRisk, autoPair, autoTimeframe, autoSession, riskPerTrade, stopLossPips, rrRatio, maxOpenPositions, dailyRiskLimit, dailyTarget, avoidNews, trailingEnabled, trailingPips, keys, emailEnabled, emailTo, density (trading-store.ts:294–330). So localStorage ALONE correctly persists every setting across browser refresh — the frontend's own persistence is healthy.
+- Step 4 — Read /home/z/my-project/src/components/trading/settings-view.tsx:34–105 (on-mount useEffect). The handler does `fetch("/api/trading/ai/config")` then UNCONDITIONALLY overwrites the Zustand store with backend response values: `store.setAiMinConfidence(d.ai_min_confidence)` (47), `store.setAutoTradeMinConfidence(...)` (50), `useTradingStore.setState({ ollamaNumCtx: d.ollama_num_ctx })` (54), `useTradingStore.setState({ ollamaTimeout: ... })` (58), `store.setAutoTradeMode(d.auto_trade_mode)` (62), `useTradingStore.setState({ sessions })` (72), `useTradingStore.setState({ closeAtSessionEnd })` (76), `store.setTradingStrategy(...)` (79), `useTradingStore.setState({ riskPerTrade })` (83), `stopLossPips` (86), `rrRatio` (89), `maxOpenPositions` (92), `dailyRiskLimit` (95), `dailyTarget` (98), `avoidNews` (101). Only `models` (line 41) has a real conditional `if (model && store.aiModels[provider] !== model)`. Every other `if (d.X != null)` is effectively always-true because the backend always returns a non-null value (either .env default or runtime-mutated). After backend restart, backend returns .env defaults → frontend overwrites its localStorage with .env defaults → user's runtime config is LOST in the UI (and on the next "Apply to Backend" click, those .env defaults get pushed back to backend, fully re-anchoring to .env).
+- Step 5 — Listed all affected settings (see Stage Summary below).
+- Step 6 — Read /home/z/my-project/python-backend/db.py (full, 322 lines) and confirmed tables are: `trades`, `alerts`, `logs`, `risk_state`, `ml_models` (db.py:62–115). NO settings / config / key-value table exists. `save_risk_state(daily_loss, open_count)` (db.py:281–287) persists ONLY daily_loss + open_count + date — nothing about AI provider, models, sessions, risk mgmt %, or auto-trade mode. lifespan startup (main.py:899–942) calls only `init_db()` + `_backfill_closed_trades()`; no settings rehydration. NO persistence mechanism for runtime config exists in the backend.
+- Step 7 — Confirmed NO reverse sync on mount. `pushAiConfig()` (settings-view.tsx:108–145) is referenced ONLY at the "Apply to Backend (Runtime)" button click handler (settings-view.tsx:460). It is NOT called from any useEffect, NOT called after the GET, NOT auto-fired on mount. The trading-view.tsx:160 comment ("settings-view on-mount sync doesn't overwrite it") proves the dev team knew about the destructive overwrite — but only patched the `active_sessions` field (trading-view.tsx:165–169 immediate POST) rather than the root cause.
+- Verified the Next.js proxy route /api/trading/ai/config/route.ts is a pure passthrough (no persistence layer there either). When backend is offline, route returns `{ demo: true }` and the `if (d.models)` guard correctly skips overwrite — but when backend is ONLINE (the normal/restart case), every field is overwritten with backend's .env defaults.
+
+Stage Summary:
+- ROOT CAUSE (PRIMARY): Two compounding flaws.
+  (A) Backend: pydantic-settings `Settings` (config.py:7) reads `.env` once at process startup. POST /api/trading/ai/config (main.py:1562–1666) only mutates the in-memory singleton. There is NO persistence layer — no DB table, no JSON file, no .env write-back (verified via grep: zero `set_key|save_config|persist_config|runtime_config|settings_table` matches in python-backend/). So every Ctrl+C + restart re-reads .env defaults and the previous session's runtime changes are gone from the backend.
+  (B) Frontend: settings-view.tsx on-mount useEffect (lines 34–105) calls GET /api/trading/ai/config and UNCONDITIONALLY overwrites the Zustand-persisted localStorage store with backend values, using `if (d.X != null)` guards that are effectively always-true. Because the backend just restarted with .env defaults, the frontend's correct localStorage values (which DID survive the browser refresh) get clobbered by backend's .env defaults. The UI now displays and re-pushes .env defaults — the user perceives this as "settings reset on restart" even though localStorage was fine. pushAiConfig() (settings-view.tsx:108–145) is bound ONLY to the manual "Apply to Backend (Runtime)" button (line 460); no reverse sync runs on mount.
+
+- ALL AFFECTED SETTINGS (revert to .env defaults after backend restart, on next frontend mount):
+  • ai_provider → "groq" (config.py:108)
+  • groq_model → "llama-3.3-70b-versatile" (config.py:31)
+  • ollama_model → "llama3" (config.py:32)
+  • ollama_num_ctx → 4096 (config.py:38)  [NB frontend default is 8192 — see *]
+  • ollama_timeout → 120 (config.py:46)
+  • ai_min_confidence → 60 (config.py:49)
+  • auto_trade_min_confidence → 75 (config.py:51)
+  • auto_trade_mode → False (config.py:106)
+  • auto_trade_symbols → "EURUSD,GBPUSD" (config.py:107)
+  • active_sessions → "london,newyork" (config.py:67)
+  • close_at_session_end → False (config.py:72)
+  • trading_strategy → "auto" (config.py:113)
+  • risk_per_trade_pct → 1.0 (config.py:54)
+  • stop_loss_pips → 10 (config.py:55)
+  • rr_ratio → 1.5 (config.py:56)
+  • max_open_positions → 3 (config.py:57)
+  • daily_risk_limit_pct → 3.0 (config.py:58)
+  • daily_target_pct → 2.0 (config.py:59)
+  • avoid_high_impact_news → True (config.py:60)
+  [*] Note: ollama_num_ctx also has a frontend/backend default mismatch — frontend default is 8192 (trading-store.ts:230) while backend .env default is 4096 (config.py:38). After restart the UI shows 4096 even if the user never changed it.
+
+- SEVERITY: HIGH. (1) Real-money risk: auto_trade_mode silently flips to False on restart (auto-trade stops working without notice), OR if user had it off and backend restarts, the UI shows False (correct) but if the user's localStorage had autoTradeMode=true (and they had NOT yet restarted the browser), the on-mount sync would disable it in the UI but the auto_trade_loop on backend already started with .env default (False) — so backend never starts auto-trading even though UI might briefly show it on until refresh. (2) Risk-parameter drift: rr_ratio / stop_loss_pips / risk_per_trade_pct reset to .env values, so new orders sized for .env risk instead of the user's tuned risk. (3) Session filter reset: active_sessions revert, possibly trading outside intended windows. (4) Strategy resets to "auto".
+
+- FIX RECOMMENDATIONS (file:line refs):
+
+  FIX #1 (root cause — backend persistence): Add a `settings_kv` table to db.py and a load/save pair. Suggested schema:
+    `CREATE TABLE IF NOT EXISTS settings_kv (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);`
+    with `save_setting(key, value)` and `load_all_settings() -> dict[str,str]` helpers in db.py.
+    In config.py, AFTER `settings = Settings()` (line 129), add a function `apply_runtime_overrides()` that calls `load_all_settings()` and `setattr(settings, k, v)` for each known runtime field — guarded by try/except for type coercion. Call it from lifespan startup in main.py right after `init_db()` (main.py:918) so the singleton rehydrates from DB on every boot.
+
+  FIX #2 (root cause — POST handler writes through to DB): In main.py POST /api/trading/ai/config (main.py:1562–1666), after each successful mutation call `save_setting(key, str(value))` (or batch them in a single UPDATE at the end). Wrap mutations in a helper like `_set_setting(key, value)` that does `setattr(settings, key, value); save_setting(key, str(value))` so persistence is automatic and future fields don't silently lose persistence.
+
+  FIX #3 (frontend — stop destructive overwrite on mount): In settings-view.tsx:34–105, change every `if (d.X != null)` to a conditional that ONLY overwrites the local store if the field was actually modified server-side. Three viable strategies:
+    (a) Simplest — invert the direction: REMOVE the GET overwrite on mount entirely (frontend localStorage is the source of truth), then ADD a reverse sync that calls `pushAiConfig()` once on mount to push frontend values → backend. This matches the comment in trading-view.tsx:160.
+    (b) Compromise — keep GET sync but only run it on FIRST ever mount (no localStorage yet). Detect via `localStorage.getItem("zenitrade-store") === null`. After that, frontend is authoritative.
+    (c) Smartest — backend GET response includes a flag like `is_default` per field (or a version hash), and frontend only overwrites when backend has been explicitly modified by user (write-through flag in settings_kv).
+
+  FIX #4 (frontend — add reverse sync on mount): In settings-view.tsx, add a second useEffect that fires ONCE after the GET sync completes (or unconditionally if adopting strategy 3a), calling `pushAiConfig()` to push localStorage values to backend. This ensures that on first mount after backend restart, frontend's persisted values become the backend's runtime values, restoring the user's intent.
+
+  FIX #5 (defensive — disable auto-trade on startup): Even with persistence fixed, if backend crashes while auto-trade is ON and restarts, the auto_trade_loop should NOT resume auto-trading without explicit user re-confirmation (settings.auto_trade_mode = False on first boot after crash). Detect via a "clean_shutdown" flag file written on lifespan shutdown; if absent on next startup, force auto_trade_mode = False. Prevents runaway trading after a crash mid-position.
+
+  FIX #6 (UX — remove misleading docstring): Correct settings-view.tsx:468 ("Changes also persist in backend .env on next restart") to reflect reality: "Changes apply at runtime only. Backend .env is NOT modified — values revert on backend restart unless persisted via DB (pending Fix #1/#2)." This prevents user false confidence.
+
+  RECOMMENDED FIX ORDER: #1 + #2 first (backend persistence — closes the data-loss hole). Then #3 + #4 (frontend sync direction — prevents UI from clobbering its own persisted values). Then #5 (safety). #6 is cosmetic.
+
+Verification: Read-only audit. NO code changes made. All findings reference exact file:line for downstream fix agents. Verified by: full read of config.py, db.py, trading-store.ts, settings-view.tsx; targeted grep across python-backend/ for any persistence/write patterns (zero matches); cross-check of trading-view.tsx:160 comment confirming the dev team was aware of the destructive overwrite for `active_sessions` only.

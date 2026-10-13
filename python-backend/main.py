@@ -918,6 +918,26 @@ async def lifespan(app: FastAPI):
         init_db()
     except Exception as exc:  # noqa: BLE001
         log.warning("DB init failed: %s — persistence disabled", exc)
+
+    # ---- apply runtime settings from DB (survives restart) ----
+    # Load all persisted settings_kv values and apply to the settings
+    # singleton. This restores user's UI-configured values (rr_ratio,
+    # stop_loss_pips, ai_provider, auto_trade_mode, etc.) that were
+    # changed via POST /api/trading/ai/config before the restart.
+    try:
+        from db import get_all_settings, save_setting
+        overrides = get_all_settings()
+        if overrides:
+            log.info("📋 Restoring %d runtime settings from DB: %s",
+                     len(overrides), list(overrides.keys()))
+            for key, value in overrides.items():
+                if hasattr(settings, key):
+                    setattr(settings, key, value)
+                    log.debug("  %s = %s", key, value)
+        else:
+            log.info("📋 No runtime settings in DB — using .env defaults")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to load runtime settings from DB: %s", exc)
     # security warning if no token set
     if not API_TOKEN:
         log.warning("⚠ ZENITRADE_API_TOKEN not set — API is unauthenticated! "
@@ -1565,8 +1585,10 @@ async def api_ai_config_update(request: Request):
     """Update AI model config at runtime (no restart needed).
 
     Frontend sends {models: {groq: "llama-3.3-70b-versatile", local: "llama3"}, ...}
-    and backend applies immediately to settings singleton.
+    and backend applies immediately to settings singleton + persists to DB
+    so settings survive restart.
     """
+    from db import save_setting as _save_setting
     import json as _json
     try:
         raw = await request.body()
@@ -1579,12 +1601,15 @@ async def api_ai_config_update(request: Request):
         models = body["models"]
         if "groq" in models:
             settings.groq_model = models["groq"]; updated.append(f"groq={models['groq']}")
+            _save_setting("groq_model", settings.groq_model)
         if "local" in models:
             settings.ollama_model = models["local"]; updated.append(f"ollama={models['local']}")
+            _save_setting("ollama_model", settings.ollama_model)
     if "ollama_num_ctx" in body:
         try:
             settings.ollama_num_ctx = int(body["ollama_num_ctx"])
             updated.append(f"ollama_num_ctx={settings.ollama_num_ctx}")
+            _save_setting("ollama_num_ctx", settings.ollama_num_ctx)
             log.info("🧠 ollama_num_ctx set to: %d", settings.ollama_num_ctx)
         except (ValueError, TypeError):
             log.warning("invalid ollama_num_ctx value: %r", body["ollama_num_ctx"])
@@ -1592,36 +1617,45 @@ async def api_ai_config_update(request: Request):
         try:
             settings.ollama_timeout = int(body["ollama_timeout"])
             updated.append(f"ollama_timeout={settings.ollama_timeout}")
+            _save_setting("ollama_timeout", settings.ollama_timeout)
             log.info("⏱ ollama_timeout set to: %ds", settings.ollama_timeout)
         except (ValueError, TypeError):
             log.warning("invalid ollama_timeout value: %r", body["ollama_timeout"])
     if "ai_min_confidence" in body:
         settings.ai_min_confidence = int(body["ai_min_confidence"])
         updated.append(f"ai_min_confidence={settings.ai_min_confidence}")
+        _save_setting("ai_min_confidence", settings.ai_min_confidence)
     if "auto_trade_min_confidence" in body:
         settings.auto_trade_min_confidence = int(body["auto_trade_min_confidence"])
         updated.append(f"auto_trade_min_confidence={settings.auto_trade_min_confidence}")
+        _save_setting("auto_trade_min_confidence", settings.auto_trade_min_confidence)
     if "active_provider" in body:
         settings.ai_provider = body["active_provider"]
         updated.append(f"provider={body['active_provider']}")
+        _save_setting("ai_provider", settings.ai_provider)
     if "auto_trade_mode" in body:
         settings.auto_trade_mode = bool(body["auto_trade_mode"])
         updated.append(f"auto_trade_mode={settings.auto_trade_mode}")
+        _save_setting("auto_trade_mode", settings.auto_trade_mode)
         log.info("🤖 auto-trade %s", "ENABLED" if settings.auto_trade_mode else "DISABLED")
     if "auto_trade_symbols" in body:
         settings.auto_trade_symbols = body["auto_trade_symbols"]
         updated.append(f"auto_trade_symbols={settings.auto_trade_symbols}")
+        _save_setting("auto_trade_symbols", settings.auto_trade_symbols)
     if "active_sessions" in body:
         settings.active_sessions = body["active_sessions"]
         updated.append(f"active_sessions={settings.active_sessions}")
+        _save_setting("active_sessions", settings.active_sessions)
         log.info("📅 trading sessions set to: %s", body["active_sessions"])
     if "close_at_session_end" in body:
         settings.close_at_session_end = bool(body["close_at_session_end"])
         updated.append(f"close_at_session_end={settings.close_at_session_end}")
+        _save_setting("close_at_session_end", settings.close_at_session_end)
         log.info("🔚 close_at_session_end set to: %s", settings.close_at_session_end)
     if "trading_strategy" in body:
         settings.trading_strategy = body["trading_strategy"]
         updated.append(f"trading_strategy={settings.trading_strategy}")
+        _save_setting("trading_strategy", settings.trading_strategy)
         log.info("📈 strategy set to: %s", body["trading_strategy"])
 
     # ---- risk management settings (synced from frontend Risk Mgmt view) ----
@@ -1632,26 +1666,33 @@ async def api_ai_config_update(request: Request):
     if "risk_per_trade_pct" in body:
         settings.risk_per_trade_pct = float(body["risk_per_trade_pct"])
         updated.append(f"risk_per_trade_pct={settings.risk_per_trade_pct}")
+        _save_setting("risk_per_trade_pct", settings.risk_per_trade_pct)
     if "stop_loss_pips" in body:
         settings.stop_loss_pips = int(body["stop_loss_pips"])
         updated.append(f"stop_loss_pips={settings.stop_loss_pips}")
+        _save_setting("stop_loss_pips", settings.stop_loss_pips)
         log.info("🛡 stop_loss_pips set to: %d", settings.stop_loss_pips)
     if "rr_ratio" in body:
         settings.rr_ratio = float(body["rr_ratio"])
         updated.append(f"rr_ratio={settings.rr_ratio}")
+        _save_setting("rr_ratio", settings.rr_ratio)
         log.info("📊 rr_ratio set to: %.2f", settings.rr_ratio)
     if "max_open_positions" in body:
         settings.max_open_positions = int(body["max_open_positions"])
         updated.append(f"max_open_positions={settings.max_open_positions}")
+        _save_setting("max_open_positions", settings.max_open_positions)
     if "daily_risk_limit_pct" in body:
         settings.daily_risk_limit_pct = float(body["daily_risk_limit_pct"])
         updated.append(f"daily_risk_limit_pct={settings.daily_risk_limit_pct}")
+        _save_setting("daily_risk_limit_pct", settings.daily_risk_limit_pct)
     if "daily_target_pct" in body:
         settings.daily_target_pct = float(body["daily_target_pct"])
         updated.append(f"daily_target_pct={settings.daily_target_pct}")
+        _save_setting("daily_target_pct", settings.daily_target_pct)
     if "avoid_high_impact_news" in body:
         settings.avoid_high_impact_news = bool(body["avoid_high_impact_news"])
         updated.append(f"avoid_high_impact_news={settings.avoid_high_impact_news}")
+        _save_setting("avoid_high_impact_news", settings.avoid_high_impact_news)
 
     log.info("AI config updated: %s", ", ".join(updated))
     return {"ok": True, "updated": updated, "config": {

@@ -101,6 +101,12 @@ def init_db() -> None:
                 open_count  INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS settings_kv (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ml_models (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 version     TEXT NOT NULL,
@@ -319,3 +325,65 @@ def get_active_ml_model(symbol: str | None = None) -> dict | None:
 def update_drift_score(model_id: int, drift_score: float) -> None:
     with _lock, _conn() as c:
         c.execute("UPDATE ml_models SET drift_score=? WHERE id=?", (drift_score, model_id))
+
+
+# ---------- runtime settings persistence (survives backend restart) ----
+# Stores key-value pairs for all runtime-mutable settings (ai_provider,
+# groq_model, rr_ratio, stop_loss_pips, auto_trade_mode, etc.) so that
+# POST /api/trading/ai/config changes persist across restarts.
+
+# Mapping: settings field name → type converter for loading back
+_SETTING_TYPES = {
+    "ai_provider": str,
+    "groq_model": str,
+    "ollama_model": str,
+    "ollama_num_ctx": int,
+    "ollama_timeout": int,
+    "ai_min_confidence": int,
+    "auto_trade_min_confidence": int,
+    "auto_trade_mode": lambda v: v.lower() in ("true", "1", "yes"),
+    "auto_trade_symbols": str,
+    "active_sessions": str,
+    "close_at_session_end": lambda v: v.lower() in ("true", "1", "yes"),
+    "trading_strategy": str,
+    "risk_per_trade_pct": float,
+    "stop_loss_pips": int,
+    "rr_ratio": float,
+    "max_open_positions": int,
+    "daily_risk_limit_pct": float,
+    "daily_target_pct": float,
+    "avoid_high_impact_news": lambda v: v.lower() in ("true", "1", "yes"),
+}
+
+
+def save_setting(key: str, value: Any) -> None:
+    """Persist a single runtime setting to DB (INSERT OR REPLACE)."""
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (key, str(value), datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def get_all_settings() -> dict[str, Any]:
+    """Load all persisted runtime settings from DB.
+
+    Returns dict with typed values (int, float, bool, str) — ready to
+    apply to the settings singleton via setattr().
+    """
+    with _lock, _conn() as c:
+        rows = c.execute("SELECT key, value FROM settings_kv").fetchall()
+    out: dict[str, Any] = {}
+    for r in rows:
+        key = r["key"]
+        raw = r["value"]
+        converter = _SETTING_TYPES.get(key)
+        if converter:
+            try:
+                out[key] = converter(raw)
+            except (ValueError, TypeError):
+                out[key] = raw  # fallback to string
+        else:
+            out[key] = raw  # unknown setting — keep as string
+    return out

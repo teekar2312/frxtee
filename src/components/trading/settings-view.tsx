@@ -101,6 +101,13 @@ export function SettingsView() {
           useTradingStore.setState({ avoidNews: !!d.avoid_high_impact_news });
         }
       })
+      .then(() => {
+        // REVERSE SYNC: push frontend values to backend after GET.
+        // If backend has DB-persisted settings, GET already applied them.
+        // If backend returned .env defaults (no DB), this restores user's
+        // localStorage values to backend.
+        pushAiConfig();
+      })
       .catch(() => {});
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
