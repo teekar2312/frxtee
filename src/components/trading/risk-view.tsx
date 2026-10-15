@@ -204,8 +204,8 @@ export function RiskView() {
             label="Daily Risk Limit"
             value={s.dailyRiskLimit}
             min={1}
-            max={5}
-            step={0.1}
+            max={50}
+            step={0.5}
             unit="%"
             onChange={(v) => {
               s.setDailyRiskLimit(v);
