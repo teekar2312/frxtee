@@ -225,7 +225,14 @@ export function RiskView() {
             max={5}
             step={0.1}
             unit="%"
-            onChange={s.setDailyTarget}
+            onChange={(v) => {
+              s.setDailyTarget(v);
+              fetch("/api/trading/ai/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ daily_target_pct: v }),
+              }).catch(() => {});
+            }}
             hint={`${fmtMoney(dailyTargetAmt)} realistic daily goal`}
           />
           <SwitchRow

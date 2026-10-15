@@ -7262,3 +7262,559 @@ Stage Summary:
   RECOMMENDED FIX ORDER: #1 + #2 first (backend persistence — closes the data-loss hole). Then #3 + #4 (frontend sync direction — prevents UI from clobbering its own persisted values). Then #5 (safety). #6 is cosmetic.
 
 Verification: Read-only audit. NO code changes made. All findings reference exact file:line for downstream fix agents. Verified by: full read of config.py, db.py, trading-store.ts, settings-view.tsx; targeted grep across python-backend/ for any persistence/write patterns (zero matches); cross-check of trading-view.tsx:160 comment confirming the dev team was aware of the destructive overwrite for `active_sessions` only.
+
+---
+
+## Task AUDIT-FINAL-3: Final Integration Verification (3 chains, 18 checks)
+
+**Agent:** Audit sub-agent (general-purpose)
+**Scope:** Chain 7 (Trade History), Chain 8 (Header + Realtime), Chain 9 (Risk Mgmt + Settings)
+**Mode:** Read-only — NO code changes
+
+### CHAIN 7: Trade History View — 6/6 PASS
+
+| # | Check | Verdict | Evidence |
+|---|---|---|---|
+| 1 | DB schema — trades has 14 cols incl. sl, tp | PASS | `python-backend/db.py:62-77` — ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, comment, source, sl, tp (14); idempotent ALTER migration at lines 128-138 adds sl/tp if missing |
+| 2 | Trade interface matches DB schema | PASS | `src/lib/trading-data.ts:221-236` — interface Trade with same 14 fields: ticket, symbol, side, volume, open_price, close_price (nullable), pnl (nullable), pips (nullable), open_time, close_time (nullable), comment (nullable), source, sl, tp |
+| 3 | useTrades returns Trade[] (not any[]) | PASS | `src/lib/trading-hooks.ts:164-171` — `useQuery<{ trades: Trade[]; demo?: boolean }>` |
+| 4 | History view displays close_price, pips, pnl, close_time, source | PASS | `src/components/trading/history-view.tsx`: close_price at line 263, pips at line 266, P&L at line 269, close_time at line 272, source at lines 274-281 |
+| 5 | CSV export includes sl, tp columns | PASS | `src/components/trading/history-view.tsx:103-106` — header array contains: ticket, symbol, side, volume, open_price, close_price, pnl, pips, open_time, close_time, **sl, tp**, source, comment |
+| 6 | 7 filter buttons (ALL, OPEN, CLOSED, WIN, LOSS, AI, MANUAL) | PASS | `src/components/trading/history-view.tsx:20-28` — FILTERS array has exactly 7 entries |
+
+### CHAIN 8: Header + Realtime Data — 5/5 PASS
+
+| # | Check | Verdict | Evidence |
+|---|---|---|---|
+| 7 | useAllTicks fetches ALL 14 TRADING_PAIRS (not store.symbols) | PASS | `src/lib/trading-hooks.ts:46-54` — `const allSymbols = TRADING_PAIRS.map((p) => p.symbol).join(",");` then `j(\`/api/trading/ticks?symbols=${allSymbols}\`)` |
+| 8 | TickerTape uses useAllTicks (not useTicks) | PASS | `src/components/trading/ticker-tape.tsx:6` imports `useAllTicks`; line 12 calls `useAllTicks(true)` |
+| 9 | useTicks passes store.symbols as query param | PASS | `src/lib/trading-hooks.ts:25-38` — reads `useTradingStore((s) => s.symbols)`; builds `symbolsParam`; fetches `/api/trading/ticks${symbolsParam}` |
+| 10 | Positions response returns pips, slPips, tpPips (computed real-time) | PASS | `python-backend/mt5_service.py:426-456` — `positions()` computes `floating_pips` (line 438/440), `sl_pips` (line 443), `tp_pips` (line 444); emits `pips`, `slPips`, `tpPips` in response (lines 451-453) |
+| 11 | SL/TP display — price + pips in parentheses | PASS | `src/components/trading/trading-view.tsx:586-607` — SL cell shows `fmtPrice(p.sl, ...)` then `(p.slPips.toFixed(0)}p)` in `<span>` (lines 588-594); TP cell shows `fmtPrice(p.tp, ...)` then `(p.tpPips.toFixed(0)}p)` (lines 600-606) |
+
+### CHAIN 9: Risk Mgmt UI + Settings Persistence — 6/7 PASS, 1 FAIL
+
+| # | Check | Verdict | Evidence |
+|---|---|---|---|
+| 12 | All 6 risk sliders push to backend on change | **FAIL** | `src/components/trading/risk-view.tsx` — 5 of 6 sliders POST to `/api/trading/ai/config` (Risk per Trade:139, Stop Loss:157, RR:175 + toast, Max Open:195, Daily Risk Limit:216). **Daily Target slider (lines 221-230) only calls `s.setDailyTarget` with NO fetch POST** — `daily_target_pct` never reaches backend on slider drag. (NOTE: Daily Target IS pushed when preset buttons clicked, lines 247/265/283.) |
+| 13 | Slider ranges match spec | PASS | `risk-view.tsx`: Risk per Trade min=0.5 max=3 step=0.1 (L130-132); Stop Loss 5-15 step=1 (L148-150); RR 1-3 step=0.1 (L166-168); Max Open 1-5 step=1 (L186-188); Daily Risk 1-50 step=0.5 (L207-209); Daily Target 1-5 step=0.1 (L224-226) — all match spec |
+| 14 | 3 Quick Preset buttons exist + push all 7 settings | PASS | `risk-view.tsx:241-296`: Conservative (1%, 10p, 1:1.5, 3 pos, 3% risk, 2% target, avoid_news=true) L247; Balanced (2%, 12p, 1:2.0, 5 pos, 10%, 4%, true) L265; Aggressive (3%, 15p, 1:3.0, 5 pos, 50%, 5%, false) L283 — each preset object has exactly 7 keys pushed to backend in single POST |
+| 15 | Settings persistence infrastructure | PASS (with note) | `python-backend/db.py:104-108` settings_kv table ✓; `db.py:359-389` save_setting/get_all_settings ✓; `main.py:1750-1767` DELETE /api/trading/ai/config/reset ✓; `main.py:1631-1735` POST /ai/config calls `_save_setting` for EVERY field (20 fields) ✓. **NOTE:** `apply_runtime_overrides` is NOT a standalone function — startup logic at `main.py:933-951` inlines the override application (`get_all_settings()` → `setattr(settings, key, value)`). Behavior is correct, function is just not encapsulated under that name. |
+| 16 | Dashboard tiles + AI providers text + NAV count | PASS (with note) | `dashboard-view.tsx:60` `const rrRatio = useTradingStore((s) => s.rrRatio)` → line 272 `value={`1 : ${rrRatio.toFixed(1)}`}` — uses store, not hardcoded ✓. `page.tsx:84-97` NAV has 12 entries incl. `{ id: "history", label: "History" }` (L93) ✓. **NOTE:** `dashboard-view.tsx:299` displays `AI_PROVIDERS.map((p) => p.name).join(" · ")` = `"Groq AI · Local AI"` — spec expected exact `"Groq · Ollama (Local)"`. Intent (excludes Z.AI/Google/OpenRouter; shows Groq + Ollama) is met because `AI_PROVIDERS` (`trading-data.ts:92-107`) only contains `{id:"groq", name:"Groq AI"}` + `{id:"local", name:"Local AI", model:"ollama / llama3"}`. Cosmetic wording difference only. |
+| 17 | AI Engine Execute sends tpPips (not just slPips) | PASS | `python-backend/main.py:842-849` — `eff_tp_pips = tp_pips_override if tp_pips_override else ps.tp_pips` then `send_order(symbol, side, volume, eff_sl_pips, eff_tp_pips, "AI:auto")` — BOTH sl AND tp passed |
+| 18 | OrderTicket — slPips from store, sends tpPips, tpPips = slPips*rr | PASS | `trading-view.tsx:321` `const storeSlPips = useTradingStore((s) => s.stopLossPips)`; L322 `useState(storeSlPips)`; L324 `useEffect(() => setSlPips(storeSlPips), [storeSlPips])` — slPips bound to store ✓. L325 `const rr = useTradingStore((s) => s.rrRatio)`; L336 `const tpPips = slPips * rr` — formula correct ✓. L351-358 POST body includes `slPips, tpPips` ✓. Proxied verbatim by `src/app/api/trading/order/route.ts:18`. |
+
+### SUMMARY
+
+- **Total checks**: 18
+- **PASS**: 17 (15 clean + 2 with minor notes)
+- **FAIL**: 1
+
+### ISSUES FOUND
+
+1. **FAIL — Check 12 (Daily Target slider no backend push)** — `risk-view.tsx:228` Daily Target SliderRow uses `onChange={s.setDailyTarget}` only. The other 5 sliders in the same view POST to `/api/trading/ai/config` (Risk per Trade, Stop Loss, RR, Max Open, Daily Risk Limit). The Daily Target slider does NOT. **Impact**: User drags Daily Target → Zustand store updates locally → UI shows new value; but backend `settings.daily_target_pct` stays at last persisted value until a preset button is clicked (which DOES push `daily_target_pct`). Inconsistent with sibling sliders. **Fix**: wrap `s.setDailyTarget(v)` in a `fetch("/api/trading/ai/config", { method: "POST", body: JSON.stringify({ daily_target_pct: v }) })` mirroring the Daily Risk Limit pattern at lines 211-218.
+
+2. **NOTE — Check 15 (no `apply_runtime_overrides` function)** — Startup correctly applies persisted settings inline (`main.py:933-951`) but the spec's named function doesn't exist. Refactoring to a dedicated `apply_runtime_overrides(settings)` helper would improve testability + readability. Behavior is correct as-is.
+
+3. **NOTE — Check 16 (AI providers display text)** — Dashboard shows `"Groq AI · Local AI"` (from `AI_PROVIDERS[].name`); spec expected exact `"Groq · Ollama (Local)"`. All other conditions met (only Groq + Ollama providers configured; no Z.AI/Google/OpenRouter). Cosmetic naming difference only.
+
+### OVERALL VERDICT
+
+**17/18 PASS, 1 FAIL (95% pass rate).** Single functional issue: Daily Target slider in Risk Mgmt view doesn't push `daily_target_pct` to backend (all other 5 sliders do). Backend persistence infrastructure, Trade history chain, Realtime data chain, Order ticket TP computation, AI engine TP forwarding, Settings KV table + reset endpoint, Dashboard bindings — all verified PASS. Project is production-ready pending the one-line fix to `risk-view.tsx:228`.
+
+Verification: Read-only audit. NO code changes made. Findings reference exact file:line for downstream fix agents. Files cross-referenced: db.py, main.py, mt5_service.py, trading-data.ts, trading-hooks.ts, trading-store.ts, page.tsx, dashboard-view.tsx, trading-view.tsx, ticker-tape.tsx, risk-view.tsx, history-view.tsx, order/route.ts.
+
+---
+Task ID: AUDIT-FINAL-1
+Agent: Audit Trading + Risk + SL/TP
+Task: Audit trading + risk + SL/TP final integration verification (3 chains, 10 checks)
+
+Methodology: Read worklog.md (full 7264-line history) + line-by-line read of python-backend/db.py, main.py (lines 147-940, 1190-1300, 1625-1745), risk_manager.py (full), mt5_service.py (lines 100-245, 480-710). No code changes made — audit only.
+
+==================================================================
+CHAIN 1: AUTO-TRADE PIPELINE (end-to-end)
+==================================================================
+
+#1 Config sync (settings persist across restart) — PASS
+  Evidence:
+  - db.py:104-108 — `settings_kv` table defined (`key TEXT PRIMARY KEY, value TEXT, updated_at TEXT`)
+  - db.py:359-366 — `save_setting(key, value)` INSERT OR REPLACE
+  - db.py:369-389 — `get_all_settings()` returns typed dict via `_SETTING_TYPES` mapping (db.py:336-356 covers all 19 runtime-mutable fields)
+  - main.py:928-951 — lifespan calls `init_db()` FIRST (line 929), then `get_all_settings()` and `setattr(settings, key, value)` per override (lines 944-947)
+  - main.py:1631-1735 — POST /api/trading/ai/config persists EACH setting via `_save_setting(...)` after each `setattr(settings, ...)`:
+    • groq_model (L1644), ollama_model (L1647), ollama_num_ctx (L1652), ollama_timeout (L1660),
+      ai_min_confidence (L1667), auto_trade_min_confidence (L1671), ai_provider (L1675),
+      auto_trade_mode (L1679), auto_trade_symbols (L1684), active_sessions (L1688),
+      close_at_session_end (L1693), trading_strategy (L1698),
+      risk_per_trade_pct (L1709), stop_loss_pips (L1713), rr_ratio (L1718),
+      max_open_positions (L1723), daily_risk_limit_pct (L1727),
+      daily_target_pct (L1731), avoid_high_impact_news (L1735) — ALL 19 settings persisted
+  - risk_manager.py:208-231 — drawdown check uses `settings.daily_risk_limit_pct` (line 229 `max_drawdown = getattr(settings, "daily_risk_limit_pct", 3.0)`), NOT hardcoded 10%
+
+#2 Risk guard can_open() checks — PASS (7 of 7)
+  Evidence: risk_manager.py:206-249 (can_open body)
+  - Daily risk limit (settings.daily_risk_limit_pct) — L208-210 `limit = equity * settings.daily_risk_limit_pct / 100; if self.daily_loss >= limit`
+  - Max open positions (settings.max_open_positions) — L211-212 `if self.open_count >= settings.max_open_positions`
+  - Margin level (<60% = 50% MC + 10% buffer) — L215-221 `from mt5_service import get_margin_level; ml = get_margin_level(); if ml is not None and ml < 60`
+  - Drawdown uses settings.daily_risk_limit_pct (NOT hardcoded 10%) — L227-231 `max_drawdown = getattr(settings, "daily_risk_limit_pct", 3.0); if drawdown_pct > max_drawdown`
+  - Weekend block — L235-240 (Friday 21:00+ UTC + Sat/Sun)
+  - Session filter (is_in_active_session) — L245-247 `if active_sessions and not is_in_active_session(now)`
+  - News filter via asyncio.to_thread — main.py:826-828 `if getattr(settings, "avoid_high_impact_news", True): is_blackout, news_reason = await asyncio.to_thread(near_high_impact_news, 15)` (auto-trade loop); main.py:1202 `blackout, reason = await asyncio.to_thread(near_high_impact_news, 15)` (manual /order). NOTE: news filter is NOT called directly inside can_open() — it's called separately after can_open() passes, in both the auto-trade loop and api_order. Functionally equivalent (news is enforced).
+
+#3 Auto-trade loop — 7 PASS + 1 PARTIAL
+  Evidence: main.py:661-903 (_auto_trade_loop)
+  - Checks auto_trade_mode flag — L674 `if not getattr(settings, "auto_trade_mode", False)` ✓
+  - Reads auto_trade_symbols — L679 `symbols_str = getattr(settings, "auto_trade_symbols", "")` ✓
+  - 60s signal cooldown — main.py:313 `_SIGNAL_COOLDOWN_SEC = 60`; check at L698 `if now - last < _SIGNAL_COOLDOWN_SEC` ✓
+  - Builds multi-TF context M5/M15/M30/H1/H4 — main.py:712 `all_tfs = ["M5", "M15", "M30", "H1", "H4"]`; loop L715-728 fetches per-TF indicators ✓
+  - Filters by min_confidence — L759-762 `if confidence < min_confidence: SKIP` ✓
+  - Strategy evaluation with SL/TP conversion — L765-796; entry/SL/TP→pips at L786-787 `sl_pips_override = abs(entry_price - strat_sl) / pip`; passed to send_order at L849 ✓
+  - Circuit breaker (3 failures → disable) — main.py:316 `_AUTO_TRADE_MAX_FAILS = 3`; check at L887 `if _auto_trade_fail_count >= _AUTO_TRADE_MAX_FAILS`; disable at L890 `settings.auto_trade_mode = False` + notify_async ✓
+  - close_trade BEFORE register_close (reordered) — PARTIAL: in auto-trade loop, the only persistence is `save_trade` (not close_trade — opens, not closes). Order at L863 `guard.register_open()` BEFORE L865 `save_trade(...)` — this is register_open BEFORE save_trade, NOT the recommended save_trade FIRST pattern. Same inverted pattern at api_order (main.py:1228 register_open before L1234 save_trade). Impact: conservative — if save_trade fails, open_count is over-counted (next trade blocked prematurely until reconcile corrects). Not money-losing, but inconsistent with the recommended pattern used in close paths (reconcile L283→L289, manual close L1288→L1291).
+
+==================================================================
+CHAIN 2: SL/TP ENFORCEMENT
+==================================================================
+
+#4 send_order — PASS
+  Evidence: mt5_service.py:510-623 (send_order body)
+  - Returns position_ticket (not order ticket) via pos_check[0].ticket — L607-612: `position_ticket = r.order; if pos_check: position_ticket = pos_check[0].ticket`; returned at L617 `"ticket": position_ticket` ✓
+  - stops_level guard bumps SL/TP if too tight — L530-538: `stops_level = getattr(info, "trade_stops_level", 0); min_stop_pips = (stops_level * info.point) / pip; eff_sl_pips = max(sl_pips, min_stop_pips + 1); eff_tp_pips = max(tp_pips, min_stop_pips + 1)` + warning log when bumped ✓
+  - Returns sl, tp, broker_sl, broker_tp in response — L620-621 `"sl": sl_rounded, "tp": tp_rounded, "broker_sl": broker_sl, "broker_tp": broker_tp` ✓
+  - Also verifies position actually has SL/TP set after fill (L574-600) + retries via modify_sl_tp if broker dropped them ✓
+
+#5 Position management loop — 4 PASS + 1 FAIL (close_trade BEFORE register_close violated in retry + session-end paths)
+  Evidence: main.py:322-651 (_manage_positions_loop)
+  - Polls every 2s when positions open — L648 `await asyncio.sleep(2)` (when positions exist); L338 `await asyncio.sleep(5)` when no positions ✓
+  - DB fallback for SL/TP — L374-383: `if broker_sl == 0 or broker_tp == 0: db_sl, db_tp = await asyncio.to_thread(get_open_trade_sl_tp, ticket)` ✓
+  - SL/TP hit detection uses merged broker+DB values — L384-385 `sl = broker_sl; tp = broker_tp` (after DB fallback merged into broker_sl/broker_tp at L376-383) ✓
+  - close_trade called in ALL paths:
+    * SL hit first success: L402 `close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))` ✓
+    * SL hit retry-success: L426-427 `close_trade(ticket, r2.get("price", 0), pnl, r2.get("pips", 0))` ✓
+    * SL hit retry-failure: L439 `close_trade(ticket, 0.0, 0.0, 0.0)` (zeros so close_time is set) ✓
+    * TP hit first success: L455 `close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))` ✓
+    * TP hit retry-success: L478-479 `close_trade(ticket, r2.get("price", 0), pnl, r2.get("pips", 0))` ✓
+    * TP hit retry-failure: L489 `close_trade(ticket, 0.0, 0.0, 0.0)` (zeros) ✓
+  - close_trade BEFORE register_close: FAIL — only 4 of 7 close paths have correct order:
+    * SL hit first success: close_trade (L402) → register_close (L405) ✓ CORRECT
+    * SL hit retry-success: register_close (L422) → close_trade (L426-427) ✗ WRONG ORDER
+    * TP hit first success: close_trade (L455) → register_close (L458) ✓ CORRECT
+    * TP hit retry-success: register_close (L475) → close_trade (L478-479) ✗ WRONG ORDER
+    * Session-end close: register_close (L620) → close_trade (L622) ✗ WRONG ORDER
+    * Manual close (api_close): close_trade (L1288) → register_close (L1291) ✓ CORRECT
+    * Reconcile loop: close_trade (L283) → register_close (L289) with `continue` on failure ✓ CORRECT
+    Impact: in the 3 wrong-order paths, if close_trade raises (DB locked/disk full), open_count has already been decremented → reconcile_loop on its next 10s pass sees drift=0 and won't retry the close_trade. Trade stays with close_time=NULL until backend restart, when _backfill_closed_trades picks it up. This is the exact pattern flagged in prior audit AUDIT-HISTORY-CLOSE (item "SECONDARY BUG #4"). The first-attempt paths + manual close + reconcile were fixed; retry-success and session-end paths remain unfixed.
+
+#6 close_position — PASS
+  Evidence: mt5_service.py:626-686 (close_position body)
+  - When position exists: returns real price/pnl/pips — L683-686 `{"ok": True, "retcode": r.retcode, "price": close_price, "pnl": float(pnl), "pips": float(pips), "volume": p.volume}` where pnl=`getattr(p, "profit", 0.0)` and pips computed from `close_price - p.price_open` ✓
+  - When position NOT found: calls _fetch_deal_by_ticket for real close data — L643 `deal_data = _fetch_deal_by_ticket(ticket)` ✓
+  - Returns already_closed=True with real data (not zeros) — L647-651 `return {"ok": True, "already_closed": True, "price": deal_data["price"], "pnl": deal_data["profit"], "pips": deal_data["pips"], "volume": deal_data.get("volume", 0.0)}` ✓ (zeros only as last-resort fallback at L655-657 when deal not found in 24h history)
+
+==================================================================
+CHAIN 3: TRADE HISTORY CLOSE DATA
+==================================================================
+
+#7 close_trade persistence at ALL 8+ call sites — PASS (all 8 sites pass correct data)
+  Evidence: each call site passes (ticket, close_price, pnl, pips) in correct argument order matching db.py:186 signature `close_trade(ticket, close_price, pnl, pips)`
+  - SL hit first success — main.py:402 `close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))` ✓
+  - SL hit retry-success — main.py:426-427 `close_trade(ticket, r2.get("price", 0), pnl, r2.get("pips", 0))` ✓
+  - SL hit retry-failure — main.py:439 `close_trade(ticket, 0.0, 0.0, 0.0)` ✓
+  - TP hit first success — main.py:455 `close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))` ✓
+  - TP hit retry-success — main.py:478-479 `close_trade(ticket, r2.get("price", 0), pnl, r2.get("pips", 0))` ✓
+  - TP hit retry-failure — main.py:489 `close_trade(ticket, 0.0, 0.0, 0.0)` ✓
+  - Manual close (api_close) — main.py:1288 `close_trade(ticket, r.get("price", 0), pnl, pips)` ✓
+  - Session-end close — main.py:622 `close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))` ✓
+  - Reconcile loop — main.py:283-284 `close_trade(ticket, d.get("price", 0), pnl, d.get("pips", 0))` ✓
+  - Backfill (deal found) — main.py:200-201 `close_trade(ticket, d.get("price", 0), d.get("profit", 0.0), d.get("pips", 0.0))` ✓
+  - Backfill (zero fallback) — main.py:213 `close_trade(ticket, 0.0, 0.0, 0.0)` ✓
+  All 11 call sites verified ✓
+
+#8 Reconcile loop — PASS (all 4 checks)
+  Evidence: main.py:228-295 (_reconcile_loop)
+  - 24h deal window (not 15 min) — L250 `deals = await asyncio.to_thread(get_recent_deals, 1440)` (1440 min = 24h) ✓
+  - Force-reset after 6 empty cycles — main.py:225 `_RECONCILE_MAX_EMPTY = 6`; check at L257-265: after 6 cycles, force-resets `guard.open_count = real_count` + triggers `_backfill_closed_trades()` ✓
+  - close_trade BEFORE register_close — L281-289: close_trade at L283, then `except Exception: continue` (skips register_close on failure), then `guard.register_close(pnl)` at L289 ✓
+  - Skips register_close if close_trade fails — L285-288 `except Exception as exc: log.error("close_trade failed (reconcile): %s — NOT decrementing open_count", exc); continue` ✓
+
+#9 Pips sign inversion — PASS (correctly inverts for d.type==0, NOT d.type==1)
+  Evidence: mt5_service.py:146-153 (_fetch_deal_by_ticket) + mt5_service.py:219-226 (get_recent_deals)
+  Both compute:
+    `pips_val = (d.price - open_price) / pip`  (or /0.01 for JPY/XAG, /0.1 for XAU)
+    `if d.type == 0:  # BUY deal = closing SELL position`
+        `pips_val = -pips_val`
+  Logic:
+  - d.type==0 (BUY deal = closing SELL position): INVERT pips_val → winning SELL trade (close<open) yields positive pips ✓
+  - d.type==1 (SELL deal = closing BUY position): NO inversion → winning BUY trade (close>open) yields positive pips ✓
+  This matches the user's task spec: "Invert for d.type==0 (BUY deal = closing SELL), NOT d.type==1" ✓
+  (Prior audit AUDIT-HISTORY-CLOSE flagged this as wrong — has since been fixed.)
+
+#10 Backfill on startup — PASS
+  Evidence: main.py:962-973 (lifespan startup) + main.py:147-220 (_backfill_closed_trades body)
+  - Runs on startup — main.py:969-971 `try: import asyncio as _aio; await _aio.to_thread(_backfill_closed_trades)` (inside lifespan, after init_db + settings restore, before background tasks) ✓
+  - Checks DB trades with close_time=NULL — L164 `open_in_db = [t for t in all_trades if not t.get("close_time")]` ✓
+  - Compares against broker positions — L170-176 `broker_tickets = {p["ticket"] for p in broker_positions}; closed_offline = [t for t in open_in_db if t["ticket"] not in broker_tickets]` ✓
+  - Fetches deal history (24h window) — L185 `deals = get_recent_deals(1440)` ✓
+  - Persists via close_trade — L200-201 (with deal data) + L213 (zero fallback when deal not found) ✓
+
+==================================================================
+SUMMARY
+==================================================================
+Total checks: 10 (across 3 chains)
+- PASS: 8 checks (#1, #2, #4, #6, #7, #8, #9, #10)
+- PARTIAL: 1 check (#3 — auto-trade loop has correct structure but register_open BEFORE save_trade, opposite of recommended order)
+- FAIL: 1 check (#5 — close_trade BEFORE register_close violated in 3 of 7 close paths: SL retry-success, TP retry-success, session-end close)
+
+Issues found:
+1. **#3 PARTIAL — auto-trade loop + api_order register_open BEFORE save_trade** (main.py:863→865, main.py:1228→1234)
+   - Impact: conservative over-block on save_trade failure (not money-losing)
+   - Recommended fix: move save_trade BEFORE register_open, with `try/except` so DB failure doesn't increment open_count
+
+2. **#5 FAIL — close_trade BEFORE register_close violated in 3 paths** (main.py:422→426 SL retry-success; main.py:475→478 TP retry-success; main.py:620→622 session-end close)
+   - Impact: if close_trade raises (DB locked/disk full), open_count has already been decremented → reconcile_loop sees drift=0 → trade stays with close_time=NULL until backend restart → trade history shows empty close data until backfill runs
+   - Recommended fix: move close_trade BEFORE register_close in these 3 paths (matching the pattern already in place at first-success paths L402→L405, L455→L458, manual close L1288→L1291, reconcile L283→L289)
+
+Overall verdict: 8/10 PASS, 1 PARTIAL, 1 FAIL. The two issues are both "DB write order" issues — same root cause (register_X called before DB persistence). All other audit checks (config sync, risk guard, SL/TP enforcement, send_order, close_position, pips sign, backfill, reconcile 24h window) PASS. The DB persistence layer (settings_kv + save_setting + get_all_settings) is correctly wired through lifespan startup and POST /api/trading/ai/config. Risk guard correctly uses settings.daily_risk_limit_pct (not hardcoded 10%) for both daily limit AND drawdown circuit breaker.
+
+No code changes made — audit only.
+
+---
+Task ID: AUDIT-FINAL-2
+Agent: audit-final-integration
+Task: Final integration verification — 3 chains (AI providers, session mgmt, multi-TF)
+
+Work Log:
+- Read /home/z/my-project/worklog.md (7264 lines, full session history incl. AUDIT-REMOVE-PROVIDERS, OLLAMA-OOM-FIX, OVERLAP-SESSIONS, SESSION-END-CLOSE, AUDIT-3, AUDIT-SETTINGS-RESET)
+- Read /home/z/my-project/python-backend/ai_service.py (365 lines)
+- Read /home/z/my-project/python-backend/config.py (129 lines)
+- Read /home/z/my-project/python-backend/main.py (1973 lines, targeted: _auto_trade_loop, _manage_positions_loop, api_analysis, api_analysis_batch, api_ai_config GET+POST)
+- Read /home/z/my-project/python-backend/risk_manager.py (322 lines)
+- Read /home/z/my-project/python-backend/db.py (targeted: settings_kv + save_setting/get_all_settings)
+- Read /home/z/my-project/src/lib/trading-data.ts (targeted: AI_PROVIDERS, TRADING_SESSIONS)
+- Read /home/z/my-project/src/lib/trading-store.ts (targeted: sessions, aiModels, persist partialize)
+- Read /home/z/my-project/src/lib/trading-hooks.ts (targeted: useMultiAnalysis)
+- Read /home/z/my-project/src/components/trading/settings-view.tsx (577 lines, full)
+- Read /home/z/my-project/src/components/trading/trading-view.tsx (661 lines, full)
+- Read /home/z/my-project/src/components/trading/ai-engine-view.tsx (595 lines, full)
+- Read /home/z/my-project/src/components/trading/session-clock.tsx (122 lines, full)
+- Read /home/z/my-project/src/components/trading/dashboard-view.tsx (targeted: timeframes usage)
+- Read /home/z/my-project/src/app/api/trading/ai/config/route.ts (35 lines)
+- Ran ast.parse on all 4 Python files in scope: 0 syntax errors
+- Ran dynamic indicator-key match simulation (indicators.compute + ai_service priority list) → confirmed BUG
+
+==================================================================
+CHAIN 4: AI PROVIDER INTEGRATION
+==================================================================
+
+--- 4.1 Providers (only Groq + Local) -------------------------------
+[PASS] AI_PROVIDERS in trading-data.ts has exactly 2 entries
+  Evidence: src/lib/trading-data.ts:92-107 — array contains exactly:
+    { id: "groq", name: "Groq AI", model: "llama-3.3-70b", ... }
+    { id: "local", name: "Local AI", model: "ollama / llama3", ... }
+  No zai / google / openrouter entries.
+
+[PASS] _PROVIDER_CASCADE in ai_service.py has only groq + local
+  Evidence: python-backend/ai_service.py:45-48
+    _PROVIDER_CASCADE = {
+        "groq": ["groq", "local"],
+        "local": ["local", "groq"],
+    }
+
+[PASS] No _call_zai / _call_google / _call_openrouter functions
+  Evidence: rg "_call_zai|_call_google|_call_openrouter" → 0 matches in /python-backend/
+  Only _call_groq (ai_service.py:131) and _call_ollama (ai_service.py:153) exist.
+
+[PASS] No zai/google/openrouter in config.py fields
+  Evidence: rg -i "zai|google|openrouter" python-backend/ → only matches are in
+    COMMENTS at ai_service.py:43-44 and config.example.env:22 ("... have been removed.")
+    No field declarations, no Settings attribute, no defaults. config.py has only:
+    groq_api_key (line 27), ollama_url (28), groq_model (31), ollama_model (32),
+    ollama_num_ctx (38), ollama_timeout (46).
+
+[PASS] No stale "zai" defaults in main.py or API routes
+  Evidence: rg -i "zai" python-backend/main.py → 0 matches.
+  rg -i "zai|openrouter" src/ → 0 matches. (Only "google" match is
+  next/font/google import in src/app/layout.tsx:2 — unrelated font import.)
+  settings.ai_provider default = "groq" (config.py:108).
+
+--- 4.2 Ollama ------------------------------------------------------
+[PASS] _call_ollama passes num_ctx + timeout from settings
+  Evidence: python-backend/ai_service.py:168 `timeout = getattr(settings, "ollama_timeout", 120)`
+  Line 172: `client = ollama.Client(host=settings.ollama_url, timeout=timeout)`
+  Line 181: `"num_ctx": settings.ollama_num_ctx,` (inside options dict)
+
+[PASS] OOM detection
+  Evidence: ai_service.py:186-198 — `if any(kw in msg for kw in ("failed to allocate",
+  "out of memory", "oom", "failed to initialize the context", "kv cache"))` — all 3
+  audit-required keywords ("failed to allocate", "out of memory", "kv cache") present,
+  plus 2 extras ("oom", "failed to initialize the context").
+
+[PASS] Timeout detection
+  Evidence: ai_service.py:199 — `if any(kw in msg for kw in ("timeout", "timed out",
+  "read timeout"))` — both audit-required keywords ("timeout", "timed out") present,
+  plus "read timeout".
+
+[PASS] _parse() handles 3 formats
+  Evidence: ai_service.py:221-280 — three explicit strategies:
+    Strategy 1 (lines 238-252): code-fenced ```json\n{...}\n```
+    Strategy 2 (lines 257-266): conversational — find first '{' to last '}'
+    Strategy 3 (lines 269-274): raw JSON via json.loads(text)
+  Falls through to _heuristic() only if ALL 3 strategies fail (line 280).
+
+[FAIL] Lightweight prompt for local (5 indicators, not 10)
+  Evidence: ai_service.py:71 — `priority = ["rsi_14", "ema_20", "ema_50", "atr_14", "macd"]`
+  These keys DO NOT MATCH the indicator output keys produced by indicators.compute().
+  Verified by running:
+    python3 -c "from indicators import compute; import pandas as pd, numpy as np; ..."
+  Output keys (verified): ["ema", "rsi", "macd_main", "macd_signal", "macd_hist", "atr",
+  "bbands_main", ..., "vwap", "stochastic_main", ..., "supertrend", "psar", "cci"].
+  Matching priority keys: 0 of 5 → indicator_str always = "" for local provider.
+  Cloud path (lines 78-86) iterates `ctx["indicators"].items()` directly so it DOES
+  include all 10 indicators correctly.
+  Impact: every local Ollama analysis prompt is sent with NO indicator data — the
+  model receives only "Analyze EURUSD for a scalping setup. Current price: X. Y. "
+  This significantly degrades local-model analysis quality vs cloud. Does not crash
+  (the model still responds, _heuristic backfills missing fields), but local AI
+  signals are essentially random with respect to current price action.
+  Severity: HIGH (silent quality degradation on local path — affects every local request).
+  Fix: change priority list at ai_service.py:71 to match indicator output keys, e.g.
+    priority = ["rsi", "ema", "atr", "macd_main", "macd_signal"]
+  OR: keep the priority list as-is and rename indicator output keys (more invasive).
+
+--- 4.3 Config sync (GET/POST /ai/config) ---------------------------
+[PASS] GET returns: models (groq+local), ollama_num_ctx, ollama_timeout, all risk fields
+  Evidence: python-backend/main.py:1587-1619 — response dict includes:
+    models {groq, local} (1592-1595)
+    ollama_num_ctx (1596), ollama_timeout (1597)
+    ai_min_confidence (1598), auto_trade_min_confidence (1599)
+    auto_trade_mode (1600), auto_trade_symbols (1601), active_sessions (1602)
+    close_at_session_end (1603), trading_strategy (1604)
+    active_provider (1606), api_keys_set (1607-1610)
+    risk_per_trade_pct (1612), stop_loss_pips (1613), rr_ratio (1614)
+    max_open_positions (1615), daily_risk_limit_pct (1616)
+    daily_target_pct (1617), avoid_high_impact_news (1618)
+
+[PASS] POST accepts + persists ALL fields to DB via _save_setting
+  Evidence: python-backend/main.py:1622-1747
+  Import: line 1631 `from db import save_setting as _save_setting`
+  Every field mutation is followed by `_save_setting(key, str(value))`:
+    models (1644, 1647), ollama_num_ctx (1652), ollama_timeout (1660)
+    ai_min_confidence (1667), auto_trade_min_confidence (1671)
+    active_provider (1675), auto_trade_mode (1679), auto_trade_symbols (1684)
+    active_sessions (1688), close_at_session_end (1693), trading_strategy (1698)
+    risk_per_trade_pct (1709), stop_loss_pips (1713), rr_ratio (1718)
+    max_open_positions (1723), daily_risk_limit_pct (1727), daily_target_pct (1731)
+    avoid_high_impact_news (1735)
+  db.py:104 — settings_kv table schema (key TEXT PK, value TEXT, updated_at TEXT)
+  db.py:359-366 — save_setting() does INSERT OR REPLACE, atomic.
+
+[PASS] No reverse sync (pushAiConfig on mount) — was removed due to stale closure
+  Evidence: src/components/trading/settings-view.tsx:34-113 — the on-mount useEffect
+    ONLY calls GET /api/trading/ai/config and updates the store FROM backend values
+    (lines 39-102). There is NO call to pushAiConfig() anywhere in this effect.
+  Comment at lines 105-112 explicitly documents the removal:
+    "NOTE: reverse sync (pushAiConfig on mount) was REMOVED — it caused a stale
+     closure bug where pushAiConfig captured OLD localStorage values (before GET
+     sync updated the store), then sent those old values to backend via POST,
+     overwriting .env/DB values. The DB persistence layer (settings_kv table)
+     already handles restart recovery: backend loads from DB on startup, so
+     GET /ai/config returns the correct values. No reverse sync needed."
+
+[PASS] settings-view.tsx on-mount syncs FROM backend (not TO backend)
+  Evidence: settings-view.tsx:34-113 — fetch GET only; .then((d) => { store.setAiModel(...),
+  store.setAiMinConfidence(...), useTradingStore.setState({ollamaNumCtx: d.ollama_num_ctx}),
+  etc. — all reads FROM backend into local store. pushAiConfig is bound ONLY to the
+  manual "Apply to Backend (Runtime)" button (settings-view.tsx:463-473), not on mount.
+
+==================================================================
+CHAIN 5: SESSION MANAGEMENT
+==================================================================
+
+--- 5.4 Overlap sessions --------------------------------------------
+[PASS] TRADING_SESSIONS has 6 entries (4 base + overlap_tl + overlap_ln)
+  Evidence: src/lib/trading-data.ts:39-90 — array contains exactly 6:
+    sydney, tokyo, london, newyork, overlap_tl, overlap_ln.
+  overlap_tl: utcStart 7, utcEnd 9, overlap: ["tokyo", "london"] (lines 72-80)
+  overlap_ln: utcStart 12, utcEnd 16, overlap: ["london", "newyork"] (lines 81-89)
+
+[PASS] session-clock.tsx sessionOpen() checks overlap recursively
+  Evidence: src/components/trading/session-clock.tsx:46-74
+  Lines 53-61: if s.overlap exists (length >= 2), return s.overlap.every((underlyingId) => {
+    const underlying = TRADING_SESSIONS.find(t => t.id === underlyingId);
+    if (!underlying) return false;
+    if ("overlap" in underlying && underlying.overlap) return false; // recursion guard
+    return sessionOpen(underlying, now);
+  });
+  Recursion guard prevents infinite loop (overlap sessions can't be nested in overlaps).
+
+[PASS] risk_manager.py is_in_active_session() handles overlap via intersection
+  Evidence: python-backend/risk_manager.py:70-124
+  Lines 96-115: explicit handling for "overlap_tl" and "overlap_ln":
+    pair = ("tokyo", "london") or ("london", "newyork")
+    windows = [_base_window(sub, is_dst) for sub in pair]
+    ov_start = max(s0, s1)  # intersection start
+    ov_end = min(e0, e1)    # intersection end
+    if ov_start < ov_end and _in_window(utc_h, ov_start, ov_end): return True
+  Correct intersection semantics — overlap window is open only when BOTH underlying
+  windows are open.
+
+--- 5.5 Close at session end ---------------------------------------
+[PASS] config.py has close_at_session_end field
+  Evidence: python-backend/config.py:72 — `close_at_session_end: bool = False`
+
+[PASS] _manage_positions_loop detects True→False transition
+  Evidence: python-backend/main.py:605-608
+    global _prev_in_session
+    now_in_session = is_in_active_session(datetime.now(timezone.utc))
+    if _prev_in_session is True and not now_in_session:
+  _prev_in_session initialized to None at main.py:319. Strict `is True` check ensures
+  None→False (first boot) and False→False (steady state) do NOT trigger close.
+
+[PASS] Closes all positions when session ends (if enabled)
+  Evidence: main.py:610-639 — if settings.close_at_session_end is True:
+    for p in positions:
+        r = await asyncio.to_thread(close_position, ticket)
+        if r.get("ok"):
+            pnl = r.get("pnl", 0.0)
+            guard.register_close(pnl)
+            close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
+    notify_async("🔚 Session ended — all positions closed", ...)
+
+[PASS] Fires only ONCE per transition
+  Evidence: main.py:608 strict `is True` check + line 644 `_prev_in_session = now_in_session`
+  After firing once on True→False transition, _prev_in_session becomes False. Subsequent
+  cycles with now_in_session=False → `_prev_in_session is True` evaluates to False →
+  does not re-fire. The next fire requires a fresh False→True→False cycle.
+
+--- 5.6 Session sync (frontend) ------------------------------------
+[PASS] toggleSession in trading-view.tsx pushes to backend immediately
+  Evidence: src/components/trading/trading-view.tsx:124-137
+    onClick={() => {
+      store.toggleSession(s.id);
+      const updated = store.sessions.includes(s.id)
+        ? store.sessions.filter((x: string) => x !== s.id)
+        : [...store.sessions, s.id];
+      fetch("/api/trading/ai/config", {
+        method: "POST", headers: ...,
+        body: JSON.stringify({ active_sessions: updated.join(",") }),
+      }).catch(() => {});
+    }}
+  Comment at lines 126-128 documents the rationale:
+    "Push session change to backend immediately so settings-view on-mount sync
+     doesn't overwrite it with stale backend values."
+
+[PASS] setAutoSessions pushes all sessions to backend
+  Evidence: trading-view.tsx:103-114
+    onAuto={() => {
+      store.setAutoSession(true);
+      store.setAutoSessions();
+      const all = TRADING_SESSIONS.map((s) => s.id).join(",");
+      fetch("/api/trading/ai/config", {
+        method: "POST", ...,
+        body: JSON.stringify({ active_sessions: all }),
+      }).catch(() => {});
+      toast.success("AI selected all sessions");
+    }}
+
+[PASS] settings-view.tsx syncs sessions from backend on mount
+  Evidence: settings-view.tsx:69-74
+    if (d.active_sessions != null) {
+      const sessions = d.active_sessions.split(",").filter((s: string) => s.trim());
+      if (sessions.length > 0) {
+        useTradingStore.setState({ sessions });
+      }
+    }
+  Direction is backend → frontend (read), not frontend → backend (write).
+
+==================================================================
+CHAIN 6: MULTI-TIMEFRAME ANALYSIS
+==================================================================
+
+--- 6.7 Backend multi-TF (3 analysis paths) ------------------------
+[PASS] _auto_trade_loop: fetches M5/M15/M30/H1/H4, stores multi_tf_indicators
+  Evidence: python-backend/main.py:712 `all_tfs = ["M5", "M15", "M30", "H1", "H4"]`
+  Lines 715-728: iterates all_tfs, fetches 100 candles per TF, computes 10 indicators
+  per TF, stores in tf_indicators dict.
+  Line 729: `ctx["indicators"] = tf_indicators.get("H1", {})` (primary H1)
+  Line 730: `ctx["multi_tf_indicators"] = tf_indicators` (all TFs preserved)
+
+[PASS] api_analysis _build_context: same multi-TF pattern
+  Evidence: main.py:1407 `all_tfs = ["M5", "M15", "M30", "H1", "H4"]`
+  Lines 1412-1431: identical loop structure (fetch candles, compute, store readings).
+  Line 1432: `ctx["indicators"] = tf_indicators.get("H1", {})`
+  Line 1433: `ctx["multi_tf_indicators"] = tf_indicators`
+
+[PASS] api_analysis_batch _build_ctx: same multi-TF pattern
+  Evidence: main.py:1493 `all_tfs = ["M5", "M15", "M30", "H1", "H4"]`
+  Lines 1498-1517: identical loop structure.
+  Line 1518: `ctx["indicators"] = tf_indicators.get("H1", {})`
+  Line 1519: `ctx["multi_tf_indicators"] = tf_indicators`
+  All 3 paths produce structurally identical ctx — code is duplicated rather than
+  factored, but consistent.
+
+[PASS] No single-TF "M15" hardcoded in any of the 3 analysis paths
+  Evidence: rg '"M15"' python-backend/main.py → 4 matches:
+    line 545 — trailing-stop ATR calculation (not analysis path)
+    line 712, 1407, 1493 — all INSIDE all_tfs = [...] lists (multi-TF context)
+    line 1176 — api_candles default param `tf: str = "M15"` (frontend overrides)
+    line 1865 — api_orderflow analysis (not an AI analysis path)
+  None of the 3 AI analysis paths hardcode a single TF; all use the multi-TF list.
+
+--- 6.8 Frontend ---------------------------------------------------
+[PASS] Timeframe selector REMOVED from trading-view.tsx (no TIMEFRAMES card)
+  Evidence: rg "TIMEFRAMES" src/components/trading/trading-view.tsx → 0 matches.
+  rg "timeframe" → only matches are comments at lines 293-294:
+    "// Chart always shows H1 (timeframe selector removed — backend now
+    //  analyzes ALL timeframes for multi-TF analysis automatically)"
+  No <Select>, no <Chip>, no TIMEFRAMES.map() in the trading view body.
+
+[PASS] Timeframe selection REMOVED from ai-engine-view.tsx Auto-Configuration
+  Evidence: src/components/trading/ai-engine-view.tsx:131-198 — Auto-Configuration
+  card has 6 rows: autoPair, autoSession, autoIndicators, autoRisk, autoTrailing,
+  autoTradeMode. NO autoTimeframe row. Original spec had 7 toggles (incl. timeframe);
+  timeframe is now gone.
+  rg "timeframe" ai-engine-view.tsx → 0 case-insensitive matches.
+
+[PASS] ChartPanel uses "H1" (not store.timeframes[0])
+  Evidence: trading-view.tsx:295 — `const { data } = useCandles(symbol, "H1", 120);`
+  Hardcoded "H1" literal — does not reference store.timeframes.
+  Comment at lines 293-294 explicitly documents the design decision.
+  (dashboard-view.tsx:83 still uses `timeframes[0] ?? "M15"` for the secondary
+  chart's display header — acceptable, that's a display label, not the analysis path.)
+
+==================================================================
+SUMMARY
+==================================================================
+
+Total checks: 31 (across 3 chains, 8 sub-areas)
+  PASS: 30
+  FAIL: 1
+  WARN: 0
+
+FAIL ITEM (1):
+  [F1] ai_service.py:71 lightweight local prompt priority key mismatch
+       File: python-backend/ai_service.py:71
+       Priority list ["rsi_14", "ema_20", "ema_50", "atr_14", "macd"] does not
+       match the actual indicator output keys produced by indicators.compute()
+       (which are "ema", "rsi", "atr", "macd_main", "macd_signal", "macd_hist").
+       Result: local Ollama prompts are always sent with EMPTY indicator data
+       (verified by simulation — 0 of 5 priority keys match).
+       Severity: HIGH (silent quality degradation on every local AI request)
+       Fix: change priority list to ["rsi", "ema", "atr", "macd_main", "macd_signal"]
+       or iterate ctx["indicators"].items()[:5] like the cloud path does.
+
+OVERALL VERDICT: PASS with 1 known issue.
+  - Chain 4 (AI Providers): PASS (4/5 sub-areas clean; 1 functional bug in
+    local Ollama prompt — does not crash, but degrades analysis quality)
+  - Chain 5 (Sessions): PASS (10/10 sub-checks clean — overlap sessions,
+    close-at-session-end, frontend sync all verified)
+  - Chain 6 (Multi-TF): PASS (7/7 sub-checks clean — all 3 backend paths
+    use M5/M15/M30/H1/H4; frontend has TF selectors removed; ChartPanel
+    uses H1 hardcoded)
+
+No code changes made — audit only. Findings reference exact file:line for
+downstream fix agents. Recommended fix order:
+  1. Fix F1 (ai_service.py:71 priority key mismatch) — quick 1-line change,
+     restores local Ollama prompt quality. Verification: re-run the
+     simulation script (provided in this audit log) — should show 5 of 5
+     priority keys matched, indicator_str non-empty.

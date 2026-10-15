@@ -419,14 +419,13 @@ async def _manage_positions_loop():
                             r2 = await asyncio.to_thread(close_position, ticket)
                             if r2.get("ok"):
                                 pnl = r2.get("pnl", 0.0)
-                                guard.register_close(pnl)
-                                # CRITICAL: persist close data to DB (was missing
-                                # → trade history showed empty close fields)
+                                # CRITICAL: persist close data to DB BEFORE register_close
                                 try:
                                     close_trade(ticket, r2.get("price", 0),
                                                 pnl, r2.get("pips", 0))
                                 except Exception as exc:  # noqa: BLE001
                                     log.error("close_trade DB failed (retry): %s", exc)
+                                guard.register_close(pnl)
                                 log.info("SL close retry SUCCESS: ticket=%s pnl=%.2f pips=%.1f",
                                          ticket, pnl, r2.get("pips", 0))
                             else:
@@ -472,13 +471,13 @@ async def _manage_positions_loop():
                             r2 = await asyncio.to_thread(close_position, ticket)
                             if r2.get("ok"):
                                 pnl = r2.get("pnl", 0.0)
-                                guard.register_close(pnl)
-                                # CRITICAL: persist close data to DB (was missing)
+                                # CRITICAL: persist close data to DB BEFORE register_close
                                 try:
                                     close_trade(ticket, r2.get("price", 0),
                                                 pnl, r2.get("pips", 0))
                                 except Exception as exc:  # noqa: BLE001
                                     log.error("close_trade DB failed (retry): %s", exc)
+                                guard.register_close(pnl)
                                 log.info("TP close retry SUCCESS: ticket=%s pnl=%.2f pips=%.1f",
                                          ticket, pnl, r2.get("pips", 0))
                             else:
@@ -617,11 +616,11 @@ async def _manage_positions_loop():
                             r = await asyncio.to_thread(close_position, ticket)
                             if r.get("ok"):
                                 pnl = r.get("pnl", 0.0)
-                                guard.register_close(pnl)
                                 try:
                                     close_trade(ticket, r.get("price", 0), pnl, r.get("pips", 0))
                                 except Exception as exc:  # noqa: BLE001
                                     log.error("close_trade DB failed: %s", exc)
+                                guard.register_close(pnl)
                                 if not r.get("already_closed"):
                                     log.info("🔚 session-end closed: ticket=%s %s %s pnl=%.2f",
                                              ticket, p["type"], p["symbol"], pnl)

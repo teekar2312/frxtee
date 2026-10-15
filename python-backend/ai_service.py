@@ -68,7 +68,11 @@ def analyze(symbol: str, provider: str, context: dict | None = None) -> dict[str
         if "indicators" in ctx:
             ind_parts = []
             # top 5 most important indicators for local (was top 10 for cloud)
-            priority = ["rsi_14", "ema_20", "ema_50", "atr_14", "macd"]
+            # Keys must match actual indicator output from indicators.compute()
+            # which returns: ema, rsi, macd_main, macd_signal, macd_hist, atr, ...
+            # (NOT rsi_14, ema_20 etc — those are feature names for ML, not
+            # indicator output keys)
+            priority = ["rsi", "ema", "atr", "macd_main", "macd_signal"]
             ind_items = ctx["indicators"]
             for k in priority:
                 if k in ind_items and ind_items[k] is not None:
