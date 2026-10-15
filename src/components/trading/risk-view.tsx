@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
 import { toast } from "sonner";
@@ -233,6 +234,66 @@ export function RiskView() {
             checked={s.avoidNews}
             onChange={s.setAvoidNews}
           />
+        </Card>
+
+        <Card className="p-3">
+          <SectionHeader title="Quick Presets" icon={Crosshair} />
+          <div className="grid grid-cols-1 gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 justify-start text-xs"
+              onClick={() => {
+                const preset = { risk_per_trade_pct: 1.0, stop_loss_pips: 10, rr_ratio: 1.5, max_open_positions: 3, daily_risk_limit_pct: 3.0, daily_target_pct: 2.0, avoid_high_impact_news: true };
+                s.setRiskPerTrade(preset.risk_per_trade_pct);
+                s.setStopLossPips(preset.stop_loss_pips);
+                s.setRrRatio(preset.rr_ratio);
+                s.setMaxOpenPositions(preset.max_open_positions);
+                s.setDailyRiskLimit(preset.daily_risk_limit_pct);
+                s.setDailyTarget(preset.daily_target_pct);
+                s.setAvoidNews(preset.avoid_high_impact_news);
+                fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Conservative preset applied — SL 10p RR 1:1.5"); }).catch(() => {});
+              }}
+            >
+              🛡️ Conservative — Risk 1% · SL 10p · RR 1:1.5 · Max 3 pos · Daily limit 3%
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 justify-start text-xs"
+              onClick={() => {
+                const preset = { risk_per_trade_pct: 2.0, stop_loss_pips: 12, rr_ratio: 2.0, max_open_positions: 5, daily_risk_limit_pct: 10.0, daily_target_pct: 4.0, avoid_high_impact_news: true };
+                s.setRiskPerTrade(preset.risk_per_trade_pct);
+                s.setStopLossPips(preset.stop_loss_pips);
+                s.setRrRatio(preset.rr_ratio);
+                s.setMaxOpenPositions(preset.max_open_positions);
+                s.setDailyRiskLimit(preset.daily_risk_limit_pct);
+                s.setDailyTarget(preset.daily_target_pct);
+                s.setAvoidNews(preset.avoid_high_impact_news);
+                fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Balanced preset applied — SL 12p RR 1:2.0"); }).catch(() => {});
+              }}
+            >
+              ⚖️ Balanced — Risk 2% · SL 12p · RR 1:2.0 · Max 5 pos · Daily limit 10%
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 justify-start text-xs"
+              onClick={() => {
+                const preset = { risk_per_trade_pct: 3.0, stop_loss_pips: 15, rr_ratio: 3.0, max_open_positions: 5, daily_risk_limit_pct: 50.0, daily_target_pct: 5.0, avoid_high_impact_news: false };
+                s.setRiskPerTrade(preset.risk_per_trade_pct);
+                s.setStopLossPips(preset.stop_loss_pips);
+                s.setRrRatio(preset.rr_ratio);
+                s.setMaxOpenPositions(preset.max_open_positions);
+                s.setDailyRiskLimit(preset.daily_risk_limit_pct);
+                s.setDailyTarget(preset.daily_target_pct);
+                s.setAvoidNews(preset.avoid_high_impact_news);
+                fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Aggressive preset applied — SL 15p RR 1:3.0"); }).catch(() => {});
+              }}
+            >
+              🔥 Aggressive — Risk 3% · SL 15p · RR 1:3.0 · Max 5 pos · Daily limit 50%
+            </Button>
+          </div>
         </Card>
       </div>
 
