@@ -220,11 +220,15 @@ class RiskGuard:
         except Exception:  # noqa: BLE001
             pass  # backend not connected, skip margin check
 
-        # drawdown circuit breaker — halt if equity dropped >10% from day open
+        # drawdown circuit breaker — halt if equity dropped beyond daily_risk_limit_pct
+        # from day open. Was hardcoded at 10% — now uses user-configured
+        # daily_risk_limit_pct (can be up to 50%). This ensures the circuit
+        # breaker respects the user's risk tolerance, not a fixed threshold.
         day_open_equity = equity + self.daily_loss
         drawdown_pct = ((day_open_equity - equity) / day_open_equity * 100) if day_open_equity > 0 else 0
-        if drawdown_pct > 10:
-            return False, f"Max drawdown breached ({drawdown_pct:.1f}%) — halt trading"
+        max_drawdown = getattr(settings, "daily_risk_limit_pct", 3.0)
+        if drawdown_pct > max_drawdown:
+            return False, f"Max drawdown breached ({drawdown_pct:.1f}% > {max_drawdown:.1f}% limit) — halt trading"
 
         # weekend gap risk — prevent new entries on Friday after 21:00 UTC
         # or Saturday/Sunday (market closed, gap risk on Monday open)
