@@ -131,7 +131,6 @@ export function AIEngineView() {
           <SectionHeader title="Auto-Configuration" icon={Sparkles} />
           {[
             { k: "autoPair", label: "Pair selection", fn: "setAutoPair" },
-            { k: "autoTimeframe", label: "Timeframe selection", fn: "setAutoTimeframe" },
             { k: "autoSession", label: "Session selection", fn: "setAutoSession" },
             { k: "autoIndicators", label: "Indicators", fn: "setAutoIndicators" },
             { k: "autoRisk", label: "Risk management", fn: "setAutoRisk" },
