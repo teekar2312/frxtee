@@ -25,7 +25,6 @@ import {
   ArrowUpRight,
   Bot,
   Crosshair,
-  Crosshair as CrosshairIcon,
   Layers,
   ListChecks,
   RefreshCw,
@@ -35,10 +34,8 @@ import { cn } from "@/lib/utils";
 import {
   fmtMoney,
   fmtPrice,
-  TIMEFRAMES,
   TRADING_PAIRS,
   TRADING_SESSIONS,
-  type Timeframe,
 } from "@/lib/trading-data";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTicks, usePositions, useCandles } from "@/lib/trading-hooks";
@@ -55,7 +52,7 @@ import {
 
 export function TradingView() {
   const store = useTradingStore();
-  const { symbols, timeframes, sessions } = store;
+  const { symbols, sessions } = store;
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-4 gap-3">
@@ -92,36 +89,6 @@ export function TradingView() {
           </div>
           <div className="text-[10px] text-muted-foreground mt-2">
             {symbols.length} selected · {symbols.join(", ") || "none"}
-          </div>
-        </Card>
-
-        <Card className="p-3">
-          <SectionHeader
-            title="Timeframes"
-            desc="1 or more · auto or manual"
-            icon={CrosshairIcon}
-            right={
-              <ModeToggle
-                auto={store.autoTimeframe}
-                onAuto={() => {
-                  store.setAutoTimeframe(true);
-                  store.setAutoTimeframes();
-                  toast.success("AI selected optimal timeframes");
-                }}
-                onManual={() => store.setAutoTimeframe(false)}
-              />
-            }
-          />
-          <div className="flex flex-wrap gap-1.5">
-            {TIMEFRAMES.map((t) => (
-              <Chip
-                key={t.value}
-                active={timeframes.includes(t.value as Timeframe)}
-                onClick={() => store.toggleTimeframe(t.value as Timeframe)}
-              >
-                {t.label}
-              </Chip>
-            ))}
           </div>
         </Card>
 
@@ -322,10 +289,10 @@ export function TradingView() {
 
 function ChartPanel() {
   const symbols = useTradingStore((s) => s.symbols);
-  const timeframes = useTradingStore((s) => s.timeframes);
   const symbol = symbols[0] ?? "EURUSD";
-  const tf = (timeframes[0] ?? "M15") as Timeframe;
-  const { data } = useCandles(symbol, tf, 120);
+  // Chart always shows H1 (timeframe selector removed — backend now
+  // analyzes ALL timeframes for multi-TF analysis automatically)
+  const { data } = useCandles(symbol, "H1", 120);
   const { data: tickData } = useTicks();
   const tick = tickData?.ticks.find((t) => t.symbol === symbol);
   const p = TRADING_PAIRS.find((x) => x.symbol === symbol);
@@ -335,7 +302,7 @@ function ChartPanel() {
     <Card className="p-3">
       <SectionHeader
         title={`${p?.display ?? symbol}`}
-        desc={`${tf} · ${tick ? `bid ${fmtPrice(tick.bid, digits)} ask ${fmtPrice(tick.ask, digits)} spread ${tick.spreadPips.toFixed(1)}p` : "—"}`}
+        desc={`H1 · ${tick ? `bid ${fmtPrice(tick.bid, digits)} ask ${fmtPrice(tick.ask, digits)} spread ${tick.spreadPips.toFixed(1)}p` : "—"}`}
         icon={Crosshair}
         right={<Badge variant="outline" className="text-[10px]">live · demo</Badge>}
       />

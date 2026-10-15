@@ -701,23 +701,34 @@ async def _auto_trade_loop():
                               symbol, remaining)
                     continue
 
-                # build context with indicators + sentiment (was empty — hallucinated)
-                ctx = {"timeframe": "M15", "symbol": symbol}
+                # build context with multi-timeframe indicators + sentiment
+                # Uses ALL timeframes (M5, M15, M30, H1, H4) for comprehensive
+                # multi-TF analysis — timeframe selector removed from UI.
+                ctx = {"timeframe": "multi", "symbol": symbol}
                 try:
-                    rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 100)
-                    if rates:
-                        import pandas as pd
-                        from indicators import compute as ind_compute
-                        df = pd.DataFrame(rates)
-                        top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
-                                 "stochastic", "supertrend", "psar", "cci"]
-                        results = ind_compute(df, top10)
-                        readings = {}
-                        for k, v in results.items():
-                            if isinstance(v, list) and v:
-                                readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
-                        ctx["indicators"] = readings
-                        ctx["current_price"] = rates[-1]["close"]
+                    import pandas as pd
+                    from indicators import compute as ind_compute
+                    # Analyze multiple timeframes for richer context
+                    all_tfs = ["M5", "M15", "M30", "H1", "H4"]
+                    tf_indicators = {}
+                    current_price = None
+                    for tf_name in all_tfs:
+                        rates = await asyncio.to_thread(mt5_candles, symbol, tf_name, 100)
+                        if rates:
+                            df = pd.DataFrame(rates)
+                            top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                                     "stochastic", "supertrend", "psar", "cci"]
+                            results = ind_compute(df, top10)
+                            readings = {}
+                            for k, v in results.items():
+                                if isinstance(v, list) and v:
+                                    readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                            tf_indicators[tf_name] = readings
+                            if not current_price:
+                                current_price = rates[-1]["close"]
+                    ctx["indicators"] = tf_indicators.get("H1", {})  # primary: H1
+                    ctx["multi_tf_indicators"] = tf_indicators  # all TFs
+                    ctx["current_price"] = current_price
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -1387,31 +1398,42 @@ def _get_symbol_sentiment(symbol: str) -> dict:
 
 @app.get("/api/trading/analysis")
 async def api_analysis(symbol: str = "EURUSD", provider: str = "groq"):
-    # Build technical context from real indicator data (not hallucinated)
+    # Build technical context from multi-timeframe indicators
     async def _build_context():
-        ctx = {"timeframe": "M15", "symbol": symbol}
+        ctx = {"timeframe": "multi", "symbol": symbol}
         try:
-            rates = await asyncio.to_thread(mt5_candles, symbol, "M15", 100)
-            if rates:
-                import pandas as pd
-                from indicators import compute
-                df = pd.DataFrame(rates)
-                # compute top 10 indicators for AI context
-                top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
-                         "stochastic", "supertrend", "psar", "cci"]
-                results = compute(df, top10)
-                # summarize key readings (last value only, to fit prompt budget)
-                readings = {}
-                for k, v in results.items():
-                    if isinstance(v, list) and v:
-                        readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
-                    elif isinstance(v, (int, float)):
-                        readings[k] = round(v, 5)
-                ctx["indicators"] = readings
-                # current price + recent trend
-                ctx["current_price"] = rates[-1]["close"]
-                ctx["recent_high"] = max(r["high"] for r in rates[-20:])
-                ctx["recent_low"] = min(r["low"] for r in rates[-20:])
+            import pandas as pd
+            from indicators import compute
+            all_tfs = ["M5", "M15", "M30", "H1", "H4"]
+            tf_indicators = {}
+            current_price = None
+            recent_high = None
+            recent_low = None
+            for tf_name in all_tfs:
+                rates = await asyncio.to_thread(mt5_candles, symbol, tf_name, 100)
+                if rates:
+                    df = pd.DataFrame(rates)
+                    top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                             "stochastic", "supertrend", "psar", "cci"]
+                    results = compute(df, top10)
+                    readings = {}
+                    for k, v in results.items():
+                        if isinstance(v, list) and v:
+                            readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                        elif isinstance(v, (int, float)):
+                            readings[k] = round(v, 5)
+                    tf_indicators[tf_name] = readings
+                    if not current_price:
+                        current_price = rates[-1]["close"]
+                    if not recent_high:
+                        recent_high = max(r["high"] for r in rates[-20:])
+                    if not recent_low:
+                        recent_low = min(r["low"] for r in rates[-20:])
+            ctx["indicators"] = tf_indicators.get("H1", {})  # primary: H1
+            ctx["multi_tf_indicators"] = tf_indicators  # all TFs
+            ctx["current_price"] = current_price
+            ctx["recent_high"] = recent_high
+            ctx["recent_low"] = recent_low
         except Exception as exc:  # noqa: BLE001
             log.debug("indicator context build failed: %s", exc)
         # attach real sentiment (was hallucinated)
@@ -1459,27 +1481,45 @@ async def api_analysis_batch(symbols: str, provider: str = "groq"):
     sym_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]
 
     async def _build_ctx(sym: str) -> dict:
-        """Build indicator + sentiment context for a symbol."""
-        ctx = {"timeframe": "M15", "symbol": sym}
+        """Build multi-timeframe indicator + sentiment context for a symbol.
+
+        Uses ALL timeframes (M5, M15, M30, H1, H4) for comprehensive
+        multi-TF analysis — timeframe selector removed from UI.
+        """
+        ctx = {"timeframe": "multi", "symbol": sym}
         try:
-            rates = await asyncio.to_thread(mt5_candles, sym, "M15", 100)
-            if rates:
-                import pandas as pd
-                from indicators import compute
-                df = pd.DataFrame(rates)
-                top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
-                         "stochastic", "supertrend", "psar", "cci"]
-                results = compute(df, top10)
-                readings = {}
-                for k, v in results.items():
-                    if isinstance(v, list) and v:
-                        readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
-                    elif isinstance(v, (int, float)):
-                        readings[k] = round(v, 5)
-                ctx["indicators"] = readings
-                ctx["current_price"] = rates[-1]["close"]
-                ctx["recent_high"] = max(r["high"] for r in rates[-20:])
-                ctx["recent_low"] = min(r["low"] for r in rates[-20:])
+            import pandas as pd
+            from indicators import compute
+            all_tfs = ["M5", "M15", "M30", "H1", "H4"]
+            tf_indicators = {}
+            current_price = None
+            recent_high = None
+            recent_low = None
+            for tf_name in all_tfs:
+                rates = await asyncio.to_thread(mt5_candles, sym, tf_name, 100)
+                if rates:
+                    df = pd.DataFrame(rates)
+                    top10 = ["ema", "rsi", "macd", "atr", "bbands", "vwap",
+                             "stochastic", "supertrend", "psar", "cci"]
+                    results = compute(df, top10)
+                    readings = {}
+                    for k, v in results.items():
+                        if isinstance(v, list) and v:
+                            readings[k] = round(v[-1], 5) if isinstance(v[-1], (int, float)) else None
+                        elif isinstance(v, (int, float)):
+                            readings[k] = round(v, 5)
+                    tf_indicators[tf_name] = readings
+                    if not current_price:
+                        current_price = rates[-1]["close"]
+                    if not recent_high:
+                        recent_high = max(r["high"] for r in rates[-20:])
+                    if not recent_low:
+                        recent_low = min(r["low"] for r in rates[-20:])
+            ctx["indicators"] = tf_indicators.get("H1", {})  # primary: H1
+            ctx["multi_tf_indicators"] = tf_indicators  # all TFs
+            ctx["current_price"] = current_price
+            ctx["recent_high"] = recent_high
+            ctx["recent_low"] = recent_low
         except Exception as exc:  # noqa: BLE001
             log.debug("batch context build failed for %s: %s", sym, exc)
         # attach sentiment
