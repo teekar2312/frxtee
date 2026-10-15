@@ -1707,6 +1707,26 @@ async def api_ai_config_update(request: Request):
     }}
 
 
+@app.delete("/api/trading/ai/config/reset")
+async def api_reset_runtime_config(_auth=Depends(require_token)):
+    """Clear all runtime-persisted settings from DB.
+
+    After this, backend will use .env defaults on next restart.
+    Useful when DB has stale values from a previous bug or when user
+    wants to start fresh with .env defaults.
+
+    Usage: curl -X DELETE http://127.0.0.1:8000/api/trading/ai/config/reset
+    """
+    from db import _lock, _conn
+    try:
+        with _lock, _conn() as c:
+            c.execute("DELETE FROM settings_kv")
+        log.info("📋 Runtime settings cleared from DB — will use .env on next restart")
+        return {"ok": True, "message": "All runtime settings cleared. Restart backend to apply .env defaults."}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 @app.get("/api/trading/backtest")
 async def api_backtest(symbol: str = "EURUSD", trades: int = 120):
     trades = max(10, min(trades, 500))

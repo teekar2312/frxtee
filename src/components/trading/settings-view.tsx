@@ -101,14 +101,15 @@ export function SettingsView() {
           useTradingStore.setState({ avoidNews: !!d.avoid_high_impact_news });
         }
       })
-      .then(() => {
-        // REVERSE SYNC: push frontend values to backend after GET.
-        // If backend has DB-persisted settings, GET already applied them.
-        // If backend returned .env defaults (no DB), this restores user's
-        // localStorage values to backend.
-        pushAiConfig();
-      })
       .catch(() => {});
+  // NOTE: reverse sync (pushAiConfig on mount) was REMOVED — it caused a
+  // stale closure bug where pushAiConfig captured OLD localStorage values
+  // (before GET sync updated the store), then sent those old values to
+  // backend via POST, overwriting .env/DB values.
+  //
+  // The DB persistence layer (settings_kv table) already handles restart
+  // recovery: backend loads from DB on startup, so GET /ai/config returns
+  // the correct values. No reverse sync needed.
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Push AI config changes to backend (called when user edits model/confidence)
