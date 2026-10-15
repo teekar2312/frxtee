@@ -127,7 +127,7 @@ export function RiskView() {
             label="Risk per Trade"
             value={s.riskPerTrade}
             min={0.5}
-            max={1}
+            max={3}
             step={0.1}
             unit="%"
             onChange={(v) => {
@@ -183,7 +183,7 @@ export function RiskView() {
             label="Max Open Positions"
             value={s.maxOpenPositions}
             min={1}
-            max={3}
+            max={5}
             step={1}
             unit=""
             onChange={(v) => {
@@ -194,7 +194,7 @@ export function RiskView() {
                 body: JSON.stringify({ max_open_positions: v }),
               }).catch(() => {});
             }}
-            hint="1–3 concurrent (anti-MC)"
+            hint="1–5 concurrent (anti-MC)"
           />
         </Card>
 
@@ -203,8 +203,8 @@ export function RiskView() {
           <SliderRow
             label="Daily Risk Limit"
             value={s.dailyRiskLimit}
-            min={2}
-            max={3}
+            min={1}
+            max={5}
             step={0.1}
             unit="%"
             onChange={(v) => {
@@ -221,7 +221,7 @@ export function RiskView() {
             label="Daily Target"
             value={s.dailyTarget}
             min={1}
-            max={3}
+            max={5}
             step={0.1}
             unit="%"
             onChange={s.setDailyTarget}
