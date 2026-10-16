@@ -1379,6 +1379,22 @@ async def api_calendar_test():
             }
         except Exception as exc:  # noqa: BLE001
             result["apify_result"] = {"ok": False, "error": str(exc)}
+    # Test RapidAPI
+    result["rapidapi_key_set"] = bool(getattr(_s, "rapidapi_key", ""))
+    result["rapidapi_result"] = None
+    if getattr(_s, "rapidapi_key", ""):
+        rk = _s.rapidapi_key
+        result["rapidapi_token_preview"] = f"{rk[:6]}...{rk[-4:]}"
+        try:
+            from news_service import _fetch_rapidapi_calendar
+            cal = await _fetch_rapidapi_calendar()
+            result["rapidapi_result"] = {
+                "ok": bool(cal),
+                "events": len(cal),
+                "sample": cal[:3] if cal else [],
+            }
+        except Exception as exc:  # noqa: BLE001
+            result["rapidapi_result"] = {"ok": False, "error": str(exc)}
     if _s.finnhub_api_key:
         result["finnhub_result"] = "will return 403 on free plan (expected)"
     return result

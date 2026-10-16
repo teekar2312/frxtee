@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # paid /calendar/economic endpoint (which returns 403 on free tier).
     # Get token: https://console.apify.com/account-integrations
     apify_token: str = ""
+    # RapidAPI key for economic calendar (alternative to Apify)
+    # Supports multiple calendar APIs on RapidAPI marketplace.
+    # Get key: https://rapidapi.com/auth/sign-up (free tier available)
+    # Then subscribe to an economic calendar API (search "economic calendar")
+    rapidapi_key: str = ""
 
     # AI providers — API keys (only Groq + Local/Ollama supported)
     groq_api_key: str = ""

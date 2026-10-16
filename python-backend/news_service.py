@@ -167,17 +167,19 @@ async def economic_calendar() -> list[dict]:
 
     Provider priority:
       1. Apify ForexFactory scraper (if APIFY_TOKEN set) — free $5/mo credit
-      2. Finnhub /calendar/economic (if FINNHUB_API_KEY set + paid plan)
-      3. Empty list (demo mode — news filter disabled)
+      2. RapidAPI Economic Events Calendar (if RAPIDAPI_KEY set) — free 100 req/mo
+      3. Finnhub /calendar/economic (if FINNHUB_API_KEY set + paid plan)
+      4. Empty list (demo mode — news filter disabled)
 
-    Apify is preferred because Finnhub free tier returns 403 on calendar.
+    Apify is preferred because it scrapes ForexFactory directly. RapidAPI
+    is a good alternative with structured API responses. Finnhub free tier
+    returns 403 on calendar endpoint.
 
     Cache design (fixed — was poisoned by Finnhub 403):
       - CACHE["calendar"] starts as None (not []) so the first call always
-        tries Apify. If Apify succeeds, calendar is cached for 6 hours.
+        tries providers. If any succeeds, calendar is cached for 6 hours.
       - Finnhub 403 uses a SEPARATE backoff key ("finnhub_403_until") so
-        it doesn't poison the calendar cache. Apify is retried on every
-        cache-miss (every 6 hours), regardless of Finnhub's state.
+        it doesn't poison the calendar cache.
     """
     now_ts = datetime.now(timezone.utc).timestamp()
     # cache hit ONLY if calendar is not None AND not expired
@@ -202,11 +204,29 @@ async def economic_calendar() -> list[dict]:
                 CACHE["cal_403_logged"] = False
                 return cal
             log.warning("📊 Calendar: Apify returned empty (check token/credit/actor "
-                        "or date parsing). Falling through to Finnhub as backup...")
+                        "or date parsing). Falling through to RapidAPI...")
         else:
-            log.info("📊 Calendar: APIFY_TOKEN not set — using Finnhub/demo")
+            log.info("📊 Calendar: APIFY_TOKEN not set — trying RapidAPI/Finnhub")
 
-        # ---- provider 2: Finnhub (needs paid plan — free = 403) ----
+        # ---- provider 2: RapidAPI (free 100 req/month) ----
+        rapidapi_key = getattr(settings, "rapidapi_key", "")
+        if rapidapi_key:
+            log.info("📊 Calendar: trying RapidAPI (key=%s...%s)",
+                     rapidapi_key[:6], rapidapi_key[-4:])
+            cal = await _fetch_rapidapi_calendar()
+            if cal:
+                log.info("📊 Calendar: RapidAPI SUCCESS — %d high-impact events", len(cal))
+                CACHE["calendar"] = cal
+                CACHE["cal_ts"] = now_ts
+                CACHE["cal_403_logged"] = False
+                return cal
+            log.warning("📊 Calendar: RapidAPI returned empty (check key/quota/API). "
+                        "Falling through to Finnhub as backup...")
+        else:
+            if not apify_token:
+                log.info("📊 Calendar: RAPIDAPI_KEY not set — trying Finnhub/demo")
+
+        # ---- provider 3: Finnhub (needs paid plan — free = 403) ----
         # Check Finnhub 403 backoff — skip Finnhub for 1 hour after 403
         # (separate from calendar cache so Apify is NOT blocked)
         if settings.finnhub_api_key and now_ts > CACHE.get("finnhub_403_until", 0):
@@ -379,6 +399,135 @@ async def _fetch_apify_calendar() -> list[dict]:
         return []
     except Exception as exc:  # noqa: BLE001
         log.warning("Apify calendar fetch failed: %s", exc)
+        return []
+
+
+async def _fetch_rapidapi_calendar() -> list[dict]:
+    """Fetch economic calendar via RapidAPI.
+
+    Supports multiple economic calendar APIs available on the RapidAPI
+    marketplace. Uses the 'Economic Events Calendar' API by emir12 as
+    default (free tier: 100 requests/month).
+
+    RapidAPI pattern:
+      GET https://economic-events-calendar.p.rapidapi.com/events
+      Headers: X-RapidAPI-Key: {key}, X-RapidAPI-Host: {host}
+      Response: array of event objects
+
+    Get key: https://rapidapi.com/auth/sign-up
+    Subscribe: https://rapidapi.com/emir12/api/economic-events-calendar
+
+    Returns list of high-impact events in the format expected by
+    near_high_impact_news():
+      [{"event": str, "impact": "high", "time": ISO8601, "country": str}, ...]
+    """
+    key = getattr(settings, "rapidapi_key", "")
+    if not key:
+        return []
+
+    # Default RapidAPI host for economic calendar
+    rapidapi_host = "economic-events-calendar.p.rapidapi.com"
+    url = f"https://{rapidapi_host}/events"
+
+    # Query params: today's date range
+    from datetime import timedelta
+    today = datetime.now(timezone.utc)
+    tomorrow = today + timedelta(days=1)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(
+                url,
+                params={
+                    "from": today.strftime("%Y-%m-%d"),
+                    "to": tomorrow.strftime("%Y-%m-%d"),
+                },
+                headers={
+                    "X-RapidAPI-Key": key,
+                    "X-RapidAPI-Host": rapidapi_host,
+                },
+            )
+            if r.status_code == 401:
+                log.warning("📊 RapidAPI: 401 Unauthorized — invalid RAPIDAPI_KEY. "
+                            "Check key at https://rapidapi.com/developer")
+                return []
+            if r.status_code == 402:
+                log.warning("📊 RapidAPI: 402 Payment Required — free quota exceeded. "
+                            "Upgrade at https://rapidapi.com/emir12/api/economic-events-calendar/pricing")
+                return []
+            if r.status_code == 429:
+                log.warning("📊 RapidAPI: 429 Too Many Requests — rate limit exceeded. "
+                            "Will retry on next cache-miss (6h)")
+                return []
+            r.raise_for_status()
+            data = r.json()
+
+            # Handle different response formats from various RapidAPI calendar APIs
+            items = data if isinstance(data, list) else data.get("events", data.get("results", []))
+            if not isinstance(items, list):
+                log.warning("RapidAPI calendar: unexpected response type %s", type(data).__name__)
+                return []
+
+            cal = []
+            for item in items:
+                # Normalize impact — different APIs use different formats
+                impact_raw = str(item.get("impact", item.get("importance", item.get("priority", "")))).lower()
+                if impact_raw not in ("high", "3", "red", "critical"):
+                    continue
+
+                # Parse event time — handle multiple formats
+                time_str = item.get("date", item.get("time", item.get("datetime", item.get("event_time", ""))))
+                if not time_str:
+                    continue
+
+                iso_time = None
+                # Try ISO format first (most common in APIs)
+                try:
+                    iso_time = str(time_str).replace("Z", "+00:00")
+                    # Validate it's parseable
+                    from datetime import datetime as _dt
+                    _dt.fromisoformat(iso_time)
+                except Exception:
+                    pass  # Try other formats below
+
+                if not iso_time:
+                    try:
+                        from datetime import datetime as _dt
+                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+                                    "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"]:
+                            try:
+                                parsed = _dt.strptime(str(time_str), fmt)
+                                iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                if not iso_time:
+                    continue
+
+                event_name = item.get("event", item.get("title", item.get("name", "economic event")))
+                country = item.get("country", item.get("currency", item.get("currencies", "")))
+                if isinstance(country, list):
+                    country = ",".join(str(c) for c in country[:2])
+
+                cal.append({
+                    "event": str(event_name),
+                    "impact": "high",
+                    "time": iso_time,
+                    "country": str(country),
+                })
+
+            log.info("📊 RapidAPI calendar: fetched %d high-impact events", len(cal))
+            return cal[:20]
+
+    except httpx.HTTPStatusError as exc:
+        log.warning("RapidAPI calendar fetch failed (HTTP %d): %s",
+                    exc.response.status_code, exc)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("RapidAPI calendar fetch failed: %s", exc)
         return []
 
 
