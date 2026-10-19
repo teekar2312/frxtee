@@ -289,7 +289,16 @@ export function TradingView() {
 
 function ChartPanel() {
   const symbols = useTradingStore((s) => s.symbols);
-  const symbol = symbols[0] ?? "EURUSD";
+  const [activeSymbol, setActiveSymbol] = React.useState(symbols[0] ?? "EURUSD");
+
+  // Sync activeSymbol when symbols list changes
+  React.useEffect(() => {
+    if (symbols.length > 0 && !symbols.includes(activeSymbol)) {
+      setActiveSymbol(symbols[0]);
+    }
+  }, [symbols, activeSymbol]);
+
+  const symbol = activeSymbol;
   // Chart always shows H1 (timeframe selector removed — backend now
   // analyzes ALL timeframes for multi-TF analysis automatically)
   const { data } = useCandles(symbol, "H1", 120);
@@ -306,6 +315,28 @@ function ChartPanel() {
         icon={Crosshair}
         right={<Badge variant="outline" className="text-[10px]">live · demo</Badge>}
       />
+      {/* Pair selector tabs — click to switch chart between selected pairs */}
+      {symbols.length > 1 && (
+        <div className="flex flex-wrap gap-1 mb-2">
+          {symbols.map((s) => {
+            const pair = TRADING_PAIRS.find((x) => x.symbol === s);
+            return (
+              <button
+                key={s}
+                onClick={() => setActiveSymbol(s)}
+                className={cn(
+                  "px-2 py-0.5 rounded text-[10px] font-medium transition-colors",
+                  s === activeSymbol
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:bg-muted/70"
+                )}
+              >
+                {pair?.display ?? s}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <CandleChart candles={data?.candles ?? []} height={300} />
     </Card>
   );
