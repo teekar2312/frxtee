@@ -1596,7 +1596,11 @@ async def api_ml_info(symbol: str | None = None):
                If omitted, returns aggregated info with a 'models' dict
                containing per-symbol breakdowns.
     """
-    return ml_model.model_info(symbol)
+    # Wrapped in to_thread — model_info() does disk I/O (joblib.load) +
+    # DB I/O (get_active_ml_model, update_drift_score) which can block
+    # the event loop, causing /api/trading/status and other endpoints
+    # to timeout → frontend shows 'demo - backend not connected'.
+    return await asyncio.to_thread(ml_model.model_info, symbol)
 
 
 @app.get("/api/trading/ai/config")

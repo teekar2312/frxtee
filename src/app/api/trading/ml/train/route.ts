@@ -11,14 +11,14 @@ export async function POST(req: NextRequest) {
   const r = await proxyBackend<{ ok: boolean; message: string }>(
     `/api/trading/ml/train?symbol=${symbol}`,
     { method: "POST" },
-    30000 // training can take 10-30s
+    60000 // training can take 10-60s depending on data size + CPU
   );
   if (r.data) return NextResponse.json(r.data);
 
   // Demo fallback
   return NextResponse.json({
-    ok: true,
+    ok: false,
     demo: true,
-    message: `Training queued for ${symbol} (demo — backend not connected)`,
+    message: `Training failed for ${symbol} — backend not connected or timed out (60s)`,
   });
 }

@@ -3,6 +3,7 @@ import { proxyBackend } from "@/lib/backend-proxy";
 
 export const dynamic = "force-dynamic";
 
+/** Get ML model info. Proxies to Python backend; demo fallback if unreachable. */
 export async function GET() {
   const r = await proxyBackend<{
     exists: boolean;
@@ -12,7 +13,8 @@ export async function GET() {
     symbol: string | null;
     trained_at: string | null;
     n_samples: number | null;
-  }>(`/api/trading/ml/info`);
+    demo?: boolean;
+  }>(`/api/trading/ml/info`, {}, 5000);
 
   if (r.data) return NextResponse.json(r.data);
 
