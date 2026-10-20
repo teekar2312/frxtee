@@ -931,21 +931,33 @@ async def lifespan(app: FastAPI):
 
     # ---- apply runtime settings from DB (survives restart) ----
     # Load all persisted settings_kv values and apply to the settings
-    # singleton. This restores user's UI-configured values (rr_ratio,
-    # stop_loss_pips, ai_provider, auto_trade_mode, etc.) that were
+    # singleton. This restores user's UI-configured values that were
     # changed via POST /api/trading/ai/config before the restart.
+    #
+    # IMPORTANT: DB values take PRECEDENCE over .env values. If you want
+    # to force .env values (ignore DB overrides), set USE_ENV_DEFAULTS=1
+    # in .env or environment. This clears the settings_kv table on boot
+    # so .env is the sole source of truth for that restart.
     try:
         from db import get_all_settings, save_setting
-        overrides = get_all_settings()
-        if overrides:
-            log.info("📋 Restoring %d runtime settings from DB: %s",
-                     len(overrides), list(overrides.keys()))
-            for key, value in overrides.items():
-                if hasattr(settings, key):
-                    setattr(settings, key, value)
-                    log.debug("  %s = %s", key, value)
+        import os as _os2
+        if _os2.environ.get("USE_ENV_DEFAULTS", "").lower() in ("1", "true", "yes"):
+            log.info("📋 USE_ENV_DEFAULTS=1 — clearing DB settings, using .env only")
+            from db import _lock as _db_lock, _conn as _db_conn
+            with _db_lock, _db_conn() as c:
+                c.execute("DELETE FROM settings_kv")
+            log.info("📋 DB settings cleared — .env values will be used")
         else:
-            log.info("📋 No runtime settings in DB — using .env defaults")
+            overrides = get_all_settings()
+            if overrides:
+                log.info("📋 Restoring %d runtime settings from DB: %s",
+                         len(overrides), list(overrides.keys()))
+                for key, value in overrides.items():
+                    if hasattr(settings, key):
+                        setattr(settings, key, value)
+                        log.debug("  %s = %s", key, value)
+            else:
+                log.info("📋 No runtime settings in DB — using .env defaults")
     except Exception as exc:  # noqa: BLE001
         log.warning("Failed to load runtime settings from DB: %s", exc)
     # security warning if no token set
