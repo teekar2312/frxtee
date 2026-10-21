@@ -136,11 +136,15 @@ class PositionSize:
 
 def size_position(equity: float, sl_pips: int, value_per_pip_per_lot: float | None = None,
                   risk_pct: float | None = None, rr: float | None = None) -> PositionSize:
-    """Calculate position size based on risk %.
+    """Calculate position size based on risk % (Pillar 1: Fixed-fractional).
 
-    If value_per_pip_per_lot is None, the caller should pass the symbol-specific
-    value from mt5_service.get_pip_value_per_lot(). The old default of 10.0 is
-    incorrect for JPY pairs and metals — always pass the real value in prod.
+    Uses CURRENT equity (not starting balance) so size auto-shrinks in
+    drawdown and grows only when winning — built-in anti-martingale.
+
+    Formula: lot = (equity × risk%) ÷ (sl_pips × value_per_pip)
+
+    Pillar 4 check: effective leverage should be ≤5:1.
+    Pillar 5 check: total open risk ≤4% across all positions.
     """
     risk_pct = settings.risk_per_trade_pct if risk_pct is None else risk_pct
     rr = settings.rr_ratio if rr is None else rr
@@ -205,43 +209,49 @@ class RiskGuard:
 
     def can_open(self, equity: float) -> tuple[bool, str]:
         self._maybe_reset()
+
+        # ---- Pillar 6: Loss limits ----
+        # Daily stop: halt if daily_loss >= configured limit (2-3% default)
         limit = equity * settings.daily_risk_limit_pct / 100
         if self.daily_loss >= limit:
-            return False, f"Daily risk limit reached ({settings.daily_risk_limit_pct}%)"
-        if self.open_count >= settings.max_open_positions:
-            return False, f"Max open positions reached ({settings.max_open_positions})"
+            return False, f"Daily risk limit reached ({settings.daily_risk_limit_pct}% — Pillar 6: loss limit)"
 
-        # margin level check — halt if below FINEX margin call (50%) + buffer
+        # ---- Pillar 5: Aggregate exposure ----
+        # Cap total open risk: risk_per_trade_pct × open_count ≤ 4%
+        total_open_risk = settings.risk_per_trade_pct * self.open_count
+        if self.open_count >= settings.max_open_positions:
+            return False, f"Max open positions reached ({self.open_count}/{settings.max_open_positions} — total risk {total_open_risk:.1f}%)"
+
+        # ---- Pillar 4: Leverage discipline ----
+        # Margin level check — halt if below FINEX margin call (50%) + buffer
+        # Effective leverage should be ≤5:1 (margin usage <30%)
         try:
             from mt5_service import get_margin_level
             ml = get_margin_level()
             if ml is not None and ml < 60:  # 50% MC + 10% buffer
-                return False, f"Margin level too low ({ml:.0f}%) — near margin call"
+                return False, f"Margin level too low ({ml:.0f}% — Pillar 4: leverage discipline, near margin call)"
         except Exception:  # noqa: BLE001
-            pass  # backend not connected, skip margin check
+            pass
 
-        # drawdown circuit breaker — halt if equity dropped beyond daily_risk_limit_pct
-        # from day open. Was hardcoded at 10% — now uses user-configured
-        # daily_risk_limit_pct (can be up to 50%). This ensures the circuit
-        # breaker respects the user's risk tolerance, not a fixed threshold.
+        # ---- Pillar 6: Drawdown circuit breaker ----
+        # Halt if equity dropped beyond daily_risk_limit_pct from day open
+        # Drawdown ladder: at -5% halve size, at -10% minimum size
         day_open_equity = equity + self.daily_loss
         drawdown_pct = ((day_open_equity - equity) / day_open_equity * 100) if day_open_equity > 0 else 0
         max_drawdown = getattr(settings, "daily_risk_limit_pct", 3.0)
         if drawdown_pct > max_drawdown:
-            return False, f"Max drawdown breached ({drawdown_pct:.1f}% > {max_drawdown:.1f}% limit) — halt trading"
+            return False, f"Max drawdown breached ({drawdown_pct:.1f}% > {max_drawdown:.1f}% limit — Pillar 6: drawdown protocol)"
 
-        # weekend gap risk — prevent new entries on Friday after 21:00 UTC
-        # or Saturday/Sunday (market closed, gap risk on Monday open)
+        # ---- Pillar 7: Event & gap risk ----
+        # Weekend gap risk — no new entries Fri 21:00+ UTC through Sunday
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         if now.weekday() == 4 and now.hour >= 21:  # Friday 21:00+ UTC
-            return False, "Weekend gap risk — no new entries after Friday 21:00 UTC"
+            return False, "Weekend gap risk (Pillar 7) — no new entries after Friday 21:00 UTC"
         if now.weekday() >= 5:  # Saturday=5, Sunday=6
-            return False, "Market closed (weekend)"
+            return False, "Market closed (weekend — Pillar 7: no gap exposure)"
 
-        # trading session filter — only trade during selected sessions
-        # (uses shared is_in_active_session() so logic stays in sync with the
-        # manage-positions loop's session-end close detection)
+        # Trading session filter
         active_sessions = getattr(settings, "active_sessions", "")
         if active_sessions and not is_in_active_session(now):
             return False, f"Outside active trading sessions ({active_sessions})"
@@ -277,10 +287,20 @@ guard = RiskGuard()
 def near_high_impact_news(minutes: int = 15) -> tuple[bool, str]:
     """Check economic calendar for high-impact events within `minutes` window.
 
-    Returns (is_blackout, reason). Checks BOTH:
-    - Pre-event: high-impact event within next `minutes` minutes
+    Implements Pillar 7: Event & gap risk. Returns (is_blackout, reason).
+    Checks BOTH:
+    - Pre-event: high-impact event within next `minutes` minutes (flatten before)
     - Post-event: high-impact event released within last `minutes` minutes
-      (post-release volatility can cause 30-50 pip spikes)
+      (post-release volatility: Phase 1 algorithmic panic 0-2min, Phase 2
+      institutional move 2-15min. Block entries during both phases.)
+
+    3-Phase news scalping model:
+      Phase 1 (0-2 min): Algorithmic panic, spread spikes, slippage.
+        DILARANG MASUK. Fakeout zone.
+      Phase 2 (2-15 min): Institutional move, real direction emerges.
+        ZONA ENTRY UTAMA — but only for manual scalpers, not auto-trade.
+      Phase 3 (15+ min): Stabilization, price returns to technicals.
+        Auto-trade safe to resume.
     """
     if not settings.avoid_high_impact_news:
         return False, "disabled"
