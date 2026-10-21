@@ -405,17 +405,17 @@ async def _fetch_apify_calendar() -> list[dict]:
 async def _fetch_rapidapi_calendar() -> list[dict]:
     """Fetch economic calendar via RapidAPI.
 
-    Supports multiple economic calendar APIs available on the RapidAPI
-    marketplace. Uses the 'Economic Events Calendar' API by emir12 as
-    default (free tier: 100 requests/month).
+    Uses the 'Economic Trading Forex Events Calendar' API by emir12.
+    This API scrapes FXStreet economic calendar data.
 
     RapidAPI pattern:
-      GET https://economic-events-calendar.p.rapidapi.com/events
+      GET https://economic-trading-forex-events-calendar.p.rapidapi.com/fxstreet
       Headers: X-RapidAPI-Key: {key}, X-RapidAPI-Host: {host}
+      Params: countries=US,DE,GB (comma-separated country codes)
       Response: array of event objects
 
     Get key: https://rapidapi.com/auth/sign-up
-    Subscribe: https://rapidapi.com/emir12/api/economic-events-calendar
+    Subscribe: https://rapidapi.com/emir12/api/economic-trading-forex-events-calendar
 
     Returns list of high-impact events in the format expected by
     near_high_impact_news():
@@ -425,22 +425,16 @@ async def _fetch_rapidapi_calendar() -> list[dict]:
     if not key:
         return []
 
-    # Default RapidAPI host for economic calendar
-    rapidapi_host = "economic-events-calendar.p.rapidapi.com"
-    url = f"https://{rapidapi_host}/events"
-
-    # Query params: today's date range
-    from datetime import timedelta
-    today = datetime.now(timezone.utc)
-    tomorrow = today + timedelta(days=1)
+    # Correct RapidAPI host (was wrong — 'economic-events-calendar' doesn't exist)
+    rapidapi_host = "economic-trading-forex-events-calendar.p.rapidapi.com"
+    url = f"https://{rapidapi_host}/fxstreet"
 
     try:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.get(
                 url,
                 params={
-                    "from": today.strftime("%Y-%m-%d"),
-                    "to": tomorrow.strftime("%Y-%m-%d"),
+                    "countries": "US,GB,DE,JP,AU,CA,NZ,EU",
                 },
                 headers={
                     "X-RapidAPI-Key": key,
@@ -453,48 +447,52 @@ async def _fetch_rapidapi_calendar() -> list[dict]:
                 return []
             if r.status_code == 402:
                 log.warning("📊 RapidAPI: 402 Payment Required — free quota exceeded. "
-                            "Upgrade at https://rapidapi.com/emir12/api/economic-events-calendar/pricing")
+                            "Upgrade at https://rapidapi.com/emir12/api/economic-trading-forex-events-calendar/pricing")
+                return []
+            if r.status_code == 404:
+                log.warning("📊 RapidAPI: 404 Not Found — wrong endpoint or API name. "
+                            "Verify subscription at https://rapidapi.com/emir12/api/economic-trading-forex-events-calendar")
                 return []
             if r.status_code == 429:
-                log.warning("📊 RapidAPI: 429 Too Many Requests — rate limit exceeded. "
-                            "Will retry on next cache-miss (6h)")
+                log.warning("📊 RapidAPI: 429 Too Many Requests — rate limit exceeded.")
                 return []
             r.raise_for_status()
             data = r.json()
 
-            # Handle different response formats from various RapidAPI calendar APIs
-            items = data if isinstance(data, list) else data.get("events", data.get("results", []))
+            # Handle different response formats
+            items = data if isinstance(data, list) else data.get("events", data.get("results", data.get("data", [])))
             if not isinstance(items, list):
                 log.warning("RapidAPI calendar: unexpected response type %s", type(data).__name__)
                 return []
 
             cal = []
+            now_ts = datetime.now(timezone.utc).timestamp()
             for item in items:
-                # Normalize impact — different APIs use different formats
+                # Normalize impact — FXStreet uses "high"/"medium"/"low" or "1"/"2"/"3"
                 impact_raw = str(item.get("impact", item.get("importance", item.get("priority", "")))).lower()
                 if impact_raw not in ("high", "3", "red", "critical"):
                     continue
 
-                # Parse event time — handle multiple formats
+                # Parse event time — FXStreet returns various formats
                 time_str = item.get("date", item.get("time", item.get("datetime", item.get("event_time", ""))))
                 if not time_str:
                     continue
 
                 iso_time = None
-                # Try ISO format first (most common in APIs)
+                # Try ISO format first
                 try:
                     iso_time = str(time_str).replace("Z", "+00:00")
-                    # Validate it's parseable
                     from datetime import datetime as _dt
                     _dt.fromisoformat(iso_time)
                 except Exception:
-                    pass  # Try other formats below
+                    pass
 
                 if not iso_time:
                     try:
                         from datetime import datetime as _dt
                         for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
-                                    "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"]:
+                                    "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M",
+                                    "%Y-%m-%d %H:%M:%S.%f"]:
                             try:
                                 parsed = _dt.strptime(str(time_str), fmt)
                                 iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
@@ -506,6 +504,15 @@ async def _fetch_rapidapi_calendar() -> list[dict]:
 
                 if not iso_time:
                     continue
+
+                # Filter: only events within ±24h of now (pre-event + post-event window)
+                try:
+                    from datetime import datetime as _dt
+                    event_ts = _dt.fromisoformat(iso_time.replace("Z", "+00:00")).timestamp()
+                    if abs(event_ts - now_ts) > 86400:  # 24h window
+                        continue
+                except Exception:
+                    pass
 
                 event_name = item.get("event", item.get("title", item.get("name", "economic event")))
                 country = item.get("country", item.get("currency", item.get("currencies", "")))
@@ -519,7 +526,7 @@ async def _fetch_rapidapi_calendar() -> list[dict]:
                     "country": str(country),
                 })
 
-            log.info("📊 RapidAPI calendar: fetched %d high-impact events", len(cal))
+            log.info("📊 RapidAPI calendar: fetched %d high-impact events (FXStreet)", len(cal))
             return cal[:20]
 
     except httpx.HTTPStatusError as exc:
