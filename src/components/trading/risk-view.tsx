@@ -127,9 +127,9 @@ export function RiskView() {
           <SliderRow
             label="Risk per Trade"
             value={s.riskPerTrade}
-            min={0.5}
-            max={3}
-            step={0.1}
+            min={0.25}
+            max={2}
+            step={0.25}
             unit="%"
             onChange={(v) => {
               s.setRiskPerTrade(v);
@@ -139,14 +139,14 @@ export function RiskView() {
                 body: JSON.stringify({ risk_per_trade_pct: v }),
               }).catch(() => {});
             }}
-            hint={`${fmtMoney(riskAmount)} per position`}
+            hint={`${fmtMoney(riskAmount)} per position (1-2% standard)`}
           />
           <Separator />
           <SliderRow
             label="Stop Loss"
             value={s.stopLossPips}
             min={5}
-            max={15}
+            max={30}
             step={1}
             unit="p"
             onChange={(v) => {
@@ -157,15 +157,15 @@ export function RiskView() {
                 body: JSON.stringify({ stop_loss_pips: v }),
               }).catch(() => {});
             }}
-            hint="5–15 pips (scalping)"
+            hint="5-30 pips (ATR-based structure)"
           />
           <Separator />
           <SliderRow
             label="Risk : Reward"
             value={s.rrRatio}
-            min={1}
-            max={3}
-            step={0.1}
+            min={1.5}
+            max={5}
+            step={0.5}
             unit=":1"
             onChange={(v) => {
               s.setRrRatio(v);
@@ -195,7 +195,7 @@ export function RiskView() {
                 body: JSON.stringify({ max_open_positions: v }),
               }).catch(() => {});
             }}
-            hint="1–5 concurrent (anti-MC)"
+            hint="1-5 concurrent (cap total risk ≤4%)"
           />
         </Card>
 
@@ -216,7 +216,7 @@ export function RiskView() {
                 body: JSON.stringify({ daily_risk_limit_pct: v }),
               }).catch(() => {});
             }}
-            hint={`${fmtMoney(dailyRiskAmt)} — halt new trades if exceeded`}
+            hint={`${fmtMoney(dailyRiskAmt)} — halt + drawdown protocol`}
           />
           <SliderRow
             label="Daily Target"
@@ -233,7 +233,7 @@ export function RiskView() {
                 body: JSON.stringify({ daily_target_pct: v }),
               }).catch(() => {});
             }}
-            hint={`${fmtMoney(dailyTargetAmt)} realistic daily goal`}
+            hint={`${fmtMoney(dailyTargetAmt)} realistic daily goal (2-5%)`}
           />
           <SwitchRow
             label="Avoid high-impact news"
@@ -251,7 +251,7 @@ export function RiskView() {
               size="sm"
               className="h-8 justify-start text-xs"
               onClick={() => {
-                const preset = { risk_per_trade_pct: 1.0, stop_loss_pips: 10, rr_ratio: 1.5, max_open_positions: 3, daily_risk_limit_pct: 3.0, daily_target_pct: 2.0, avoid_high_impact_news: true };
+                const preset = { risk_per_trade_pct: 1.0, stop_loss_pips: 10, rr_ratio: 2.0, max_open_positions: 3, daily_risk_limit_pct: 3.0, daily_target_pct: 2.0, avoid_high_impact_news: true };
                 s.setRiskPerTrade(preset.risk_per_trade_pct);
                 s.setStopLossPips(preset.stop_loss_pips);
                 s.setRrRatio(preset.rr_ratio);
@@ -262,14 +262,14 @@ export function RiskView() {
                 fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Conservative preset applied — SL 10p RR 1:1.5"); }).catch(() => {});
               }}
             >
-              🛡️ Conservative — Risk 1% · SL 10p · RR 1:1.5 · Max 3 pos · Daily limit 3%
+              🛡️ Conservative — Risk 1% · SL 10p · RR 1:2.0 · Max 3 pos · Daily limit 3%
             </Button>
             <Button
               variant="outline"
               size="sm"
               className="h-8 justify-start text-xs"
               onClick={() => {
-                const preset = { risk_per_trade_pct: 2.0, stop_loss_pips: 12, rr_ratio: 2.0, max_open_positions: 5, daily_risk_limit_pct: 10.0, daily_target_pct: 4.0, avoid_high_impact_news: true };
+                const preset = { risk_per_trade_pct: 2.0, stop_loss_pips: 15, rr_ratio: 2.0, max_open_positions: 4, daily_risk_limit_pct: 5.0, daily_target_pct: 4.0, avoid_high_impact_news: true };
                 s.setRiskPerTrade(preset.risk_per_trade_pct);
                 s.setStopLossPips(preset.stop_loss_pips);
                 s.setRrRatio(preset.rr_ratio);
@@ -280,14 +280,14 @@ export function RiskView() {
                 fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Balanced preset applied — SL 12p RR 1:2.0"); }).catch(() => {});
               }}
             >
-              ⚖️ Balanced — Risk 2% · SL 12p · RR 1:2.0 · Max 5 pos · Daily limit 10%
+              ⚖️ Balanced — Risk 2% · SL 15p · RR 1:2.0 · Max 4 pos · Daily limit 5%
             </Button>
             <Button
               variant="outline"
               size="sm"
               className="h-8 justify-start text-xs"
               onClick={() => {
-                const preset = { risk_per_trade_pct: 3.0, stop_loss_pips: 15, rr_ratio: 3.0, max_open_positions: 5, daily_risk_limit_pct: 50.0, daily_target_pct: 5.0, avoid_high_impact_news: false };
+                const preset = { risk_per_trade_pct: 0.5, stop_loss_pips: 20, rr_ratio: 3.0, max_open_positions: 2, daily_risk_limit_pct: 2.0, daily_target_pct: 1.5, avoid_high_impact_news: true };
                 s.setRiskPerTrade(preset.risk_per_trade_pct);
                 s.setStopLossPips(preset.stop_loss_pips);
                 s.setRrRatio(preset.rr_ratio);
@@ -298,7 +298,7 @@ export function RiskView() {
                 fetch("/api/trading/ai/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preset) }).then(() => { toast.success("Aggressive preset applied — SL 15p RR 1:3.0"); }).catch(() => {});
               }}
             >
-              🔥 Aggressive — Risk 3% · SL 15p · RR 1:3.0 · Max 5 pos · Daily limit 50%
+              🔥 Scalper — Risk 0.5% · SL 20p · RR 1:3.0 · Max 2 pos · Daily limit 2%
             </Button>
           </div>
         </Card>
@@ -383,10 +383,10 @@ export function RiskView() {
         <Card className="p-3">
           <SectionHeader title="Risk Dashboard" icon={TrendingDown} />
           <div className="grid grid-cols-2 gap-2">
-            <StatTile label="Today Risk Used" value="0.8%" sub="of 3.0% limit" tone="up" />
-            <StatTile label="Margin Level" value="1,840%" sub="healthy" tone="up" />
-            <StatTile label="Free Margin" value={fmtMoney(equity * 0.94)} />
-            <StatTile label="Max DD (30d)" value="-4.2%" tone="down" />
+            <StatTile label="Today Risk Used" value="0.8%" sub={`of ${s.dailyRiskLimit}% limit`} tone="up" />
+            <StatTile label="Margin Level" value="1,840%" sub="healthy (>60%)" tone="up" />
+            <StatTile label="Effective Leverage" value="<5:1" sub="capped" tone="up" />
+            <StatTile label="Total Open Risk" value={`≤${(s.riskPerTrade * s.maxOpenPositions).toFixed(1)}%`} sub="aggregate cap" tone="up" />
           </div>
         </Card>
 
@@ -408,12 +408,14 @@ export function RiskView() {
           <SectionHeader title="Active Rules" icon={ShieldCheck} />
           <div className="space-y-1.5">
             {[
-              ["Risk ≤ 1% / trade", true],
-              ["Daily risk ≤ 3%", true],
-              ["Max 3 concurrent", true],
-              ["Avoid high-impact news", s.avoidNews],
+              ["Risk ≤ 2% / trade (fixed-fractional)", s.riskPerTrade <= 2],
+              ["Daily risk ≤ 3%", s.dailyRiskLimit <= 3],
+              ["RR ≥ 1:1.5 (positive asymmetry)", s.rrRatio >= 1.5],
+              ["Broker-side stops (always attached)", true],
+              ["Max concurrent positions", true],
+              ["Avoid high-impact news (gap risk)", s.avoidNews],
               ["Trailing stop ON", s.trailingEnabled],
-              ["RR ≥ 1:1.5", s.rrRatio >= 1.5],
+              ["No weekend holds (gap protection)", true],
             ].map(([label, ok]) => (
               <div key={label as string} className="flex items-center justify-between text-xs">
                 <span>{label as string}</span>

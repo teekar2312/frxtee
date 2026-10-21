@@ -165,14 +165,14 @@ export const BROKER_SPEC = {
 
 // Money management defaults aligned to the spec
 export const MONEY_MGMT_DEFAULTS = {
-  riskPerTradePct: 1.0,
-  stopLossPipsMin: 5,
-  stopLossPipsMax: 15,
-  rrRatio: 1.5,
-  maxOpenPositions: 3,
-  dailyRiskLimitPct: 3.0,
-  dailyTargetPct: 2.0,
-  avoidHighImpactNews: true,
+  riskPerTradePct: 1.0,      // Pillar 1: 1-2% standard
+  stopLossPipsMin: 5,         // Pillar 2: ATR-based structure
+  stopLossPipsMax: 30,        // Allow wider stops for structure
+  rrRatio: 2.0,               // Pillar 3: minimum 1:1.5, default 1:2.0
+  maxOpenPositions: 3,         // Pillar 5: total risk ≤4% (3 × 1% = 3%)
+  dailyRiskLimitPct: 3.0,    // Pillar 6: daily stop 2-3%
+  dailyTargetPct: 2.0,       // Realistic daily goal
+  avoidHighImpactNews: true,  // Pillar 7: gap risk protection
 } as const;
 
 // AI analysis dimensions

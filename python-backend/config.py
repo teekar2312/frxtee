@@ -55,14 +55,21 @@ class Settings(BaseSettings):
     # Auto-trade confidence threshold (higher for auto-execution)
     auto_trade_min_confidence: int = 75
 
-    # Money mgmt
-    risk_per_trade_pct: float = 1.0
-    stop_loss_pips: int = 10
-    rr_ratio: float = 1.5
-    max_open_positions: int = 3
-    daily_risk_limit_pct: float = 3.0
-    daily_target_pct: float = 2.0
-    avoid_high_impact_news: bool = True
+    # Money mgmt — aligned with 7 risk management pillars:
+    # 1. Fixed-fractional: risk % of CURRENT equity (not starting balance)
+    # 2. Stops at entry: broker-side, ATR-based structure
+    # 3. Positive asymmetry: minimum 1:1.5 RR
+    # 4. Leverage discipline: effective leverage ≤5:1, margin <30%
+    # 5. Aggregate exposure: total open risk ≤4% across all positions
+    # 6. Loss limits: daily 2-3%, weekly ~5%, drawdown ladder
+    # 7. Event & gap risk: flatten before high-impact news, no weekend holds
+    risk_per_trade_pct: float = 1.0   # Pillar 1: 1-2% standard
+    stop_loss_pips: int = 10           # Pillar 2: ATR-based structure
+    rr_ratio: float = 2.0              # Pillar 3: minimum 1:1.5, default 1:2.0
+    max_open_positions: int = 3        # Pillar 5: total risk = 3 × 1% = 3% ≤ 4% cap
+    daily_risk_limit_pct: float = 3.0 # Pillar 6: daily stop 2-3%
+    daily_target_pct: float = 2.0     # Realistic daily goal
+    avoid_high_impact_news: bool = True # Pillar 7: flatten before NFP/FOMC/CPI
 
     # Trading sessions — comma-separated active sessions
     # Options: sydney, tokyo, london, newyork
