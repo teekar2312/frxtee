@@ -70,13 +70,14 @@ export function AIEngineView() {
                 key={p.id}
                 onClick={() => {
                   store.setAiProvider(p.id);
-                  // Push provider change to backend immediately
+                  // Push ONLY the provider change — do NOT send models here.
+                  // Previously sent models: store.aiModels which could contain
+                  // stale localStorage values, overwriting .env/DB model config.
                   fetch("/api/trading/ai/config", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                       active_provider: p.id,
-                      models: store.aiModels,
                     }),
                   }).then(() => {
                     toast.success(`Switched to ${p.name} — backend updated`);
