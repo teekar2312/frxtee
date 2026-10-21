@@ -1,11 +1,36 @@
-"""Configuration loaded from environment / .env"""
+"""Configuration loaded from environment / .env
+
+.env file search order (first found wins):
+  1. python-backend/.env (when running from python-backend/ dir)
+  2. ../.env (parent directory — when running from project root)
+  3. System environment variables (always checked)
+"""
 from __future__ import annotations
+
+import os
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Find .env file — check current dir first, then parent (project root)
+_env_candidates = [
+    Path(".env"),           # python-backend/.env (when CWD = python-backend/)
+    Path("../.env"),         # project-root/.env (when CWD = python-backend/)
+]
+_env_file = None
+for _p in _env_candidates:
+    if _p.exists():
+        _env_file = str(_p)
+        break
+# Also check system env vars (always available)
+if _env_file:
+    _ENV_FILE = _env_file
+else:
+    _ENV_FILE = ".env"  # fallback — pydantic will look for it
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # MT5
     mt5_login: int = 0
