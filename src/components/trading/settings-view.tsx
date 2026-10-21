@@ -473,7 +473,8 @@ export function SettingsView() {
           </Button>
           <p className="text-[10px] text-muted-foreground mt-1">
             Click to push model + confidence changes to the Python backend instantly
-            (no restart needed). Changes also persist in backend .env on next restart.
+            (no restart needed). Changes persist to DB and survive restart.
+            To force .env values, set USE_ENV_DEFAULTS=1 in .env and restart.
           </p>
         </div>
       </Card>
