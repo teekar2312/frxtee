@@ -167,15 +167,16 @@ async def economic_calendar() -> list[dict]:
 
     Provider priority:
       1. Apify ForexFactory scraper (if APIFY_TOKEN set) — free $5/mo credit
-      2. RapidAPI Economic Events Calendar (if RAPIDAPI_KEY set) — free 100 req/mo
-      3. Finnhub /calendar/economic (if FINNHUB_API_KEY set + paid plan)
-      4. Empty list (demo mode — news filter disabled)
+      2. RapidAPI Economic Trading Calendar (if RAPIDAPI_KEY set) — free 100 req/mo
+      3. FinanceCalendar.com (FREE — no API key needed, always tried)
+      4. Finnhub /calendar/economic (if FINNHUB_API_KEY set + paid plan)
+      5. Empty list (demo mode — news filter disabled)
 
-    Apify is preferred because it scrapes ForexFactory directly. RapidAPI
-    is a good alternative with structured API responses. Finnhub free tier
-    returns 403 on calendar endpoint.
+    FinanceCalendar.com is tried THIRD (before Finnhub) because it's
+    completely free with no API key required. If it succeeds, Finnhub
+    is skipped entirely.
 
-    Cache design (fixed — was poisoned by Finnhub 403):
+    Cache design:
       - CACHE["calendar"] starts as None (not []) so the first call always
         tries providers. If any succeeds, calendar is cached for 6 hours.
       - Finnhub 403 uses a SEPARATE backoff key ("finnhub_403_until") so
@@ -221,12 +222,24 @@ async def economic_calendar() -> list[dict]:
                 CACHE["cal_403_logged"] = False
                 return cal
             log.warning("📊 Calendar: RapidAPI returned empty (check key/quota/API). "
-                        "Falling through to Finnhub as backup...")
+                        "Falling through to FinanceCalendar.com...")
         else:
             if not apify_token:
-                log.info("📊 Calendar: RAPIDAPI_KEY not set — trying Finnhub/demo")
+                log.info("📊 Calendar: RAPIDAPI_KEY not set — trying FinanceCalendar/Finnhub")
 
-        # ---- provider 3: Finnhub (needs paid plan — free = 403) ----
+        # ---- provider 3: FinanceCalendar.com (FREE — no API key needed) ----
+        log.info("📊 Calendar: trying FinanceCalendar.com (free, no key needed)")
+        cal = await _fetch_financecalendar()
+        if cal:
+            log.info("📊 Calendar: FinanceCalendar SUCCESS — %d high-impact events", len(cal))
+            CACHE["calendar"] = cal
+            CACHE["cal_ts"] = now_ts
+            CACHE["cal_403_logged"] = False
+            return cal
+        log.warning("📊 Calendar: FinanceCalendar returned empty. "
+                    "Falling through to Finnhub as backup...")
+
+        # ---- provider 4: Finnhub (needs paid plan — free = 403) ----
         # Check Finnhub 403 backoff — skip Finnhub for 1 hour after 403
         # (separate from calendar cache so Apify is NOT blocked)
         if settings.finnhub_api_key and now_ts > CACHE.get("finnhub_403_until", 0):
@@ -535,6 +548,126 @@ async def _fetch_rapidapi_calendar() -> list[dict]:
         return []
     except Exception as exc:  # noqa: BLE001
         log.warning("RapidAPI calendar fetch failed: %s", exc)
+        return []
+
+
+async def _fetch_financecalendar() -> list[dict]:
+    """Fetch economic calendar via FinanceCalendar.com (FREE, no API key needed).
+
+    FinanceCalendar.com provides a free REST API with JSON/CSV/ICS output.
+    No authentication required — just fetch the endpoint.
+
+    API pattern:
+      GET https://www.financecalendar.com/wp-json/fc/v1/calendar
+      Params: impact=high, country=US,GB,DE,JP, limit=50, from=today
+      Response: JSON array of event objects
+
+    Endpoint docs: https://www.financecalendar.com/api
+    Free for any use — commercial included.
+
+    Returns list of high-impact events in the format expected by
+    near_high_impact_news():
+      [{"event": str, "impact": "high", "time": ISO8601, "country": str}, ...]
+    """
+    from datetime import timedelta
+    today = datetime.now(timezone.utc)
+    two_days = today + timedelta(days=2)
+
+    url = "https://www.financecalendar.com/wp-json/fc/v1/calendar"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                url,
+                params={
+                    "impact": "high",
+                    "from": today.strftime("%Y-%m-%d"),
+                    "to": two_days.strftime("%Y-%m-%d"),
+                    "format": "json",
+                    "limit": "50",
+                },
+            )
+            if r.status_code == 404:
+                log.warning("📊 FinanceCalendar: 404 — endpoint may have changed. "
+                            "Check https://www.financecalendar.com/api")
+                return []
+            if r.status_code == 429:
+                log.warning("📊 FinanceCalendar: 429 — rate limited. Will retry next cycle.")
+                return []
+            r.raise_for_status()
+            data = r.json()
+
+            # Handle response — API returns array or {events: [...]}
+            items = data if isinstance(data, list) else data.get("events", data.get("data", []))
+            if not isinstance(items, list):
+                # Try /today endpoint as fallback
+                log.debug("FinanceCalendar: /calendar returned non-list, trying /today")
+                r2 = await c.get(
+                    "https://www.financecalendar.com/wp-json/fc/v1/today",
+                    params={"format": "json"},
+                )
+                if r2.status_code == 200:
+                    data2 = r2.json()
+                    items = data2.get("events", data2.get("releases", []))
+                    if not isinstance(items, list):
+                        log.warning("FinanceCalendar: unexpected response type %s", type(data2).__name__)
+                        return []
+                else:
+                    log.warning("FinanceCalendar: /today also failed (HTTP %d)", r2.status_code)
+                    return []
+
+            cal = []
+            for item in items:
+                impact_raw = str(item.get("impact", item.get("importance", ""))).lower()
+                if impact_raw not in ("high", "3", "red", "critical"):
+                    continue
+
+                # Parse time — FinanceCalendar returns ISO8601 or "YYYY-MM-DD HH:MM:SS"
+                time_str = item.get("datetime", item.get("date", item.get("time", item.get("release_time", ""))))
+                if not time_str:
+                    continue
+
+                iso_time = None
+                try:
+                    iso_time = str(time_str).replace("Z", "+00:00")
+                    from datetime import datetime as _dt
+                    _dt.fromisoformat(iso_time)
+                except Exception:
+                    try:
+                        from datetime import datetime as _dt
+                        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                                    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"]:
+                            try:
+                                parsed = _dt.strptime(str(time_str), fmt)
+                                iso_time = parsed.replace(tzinfo=timezone.utc).isoformat()
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+                if not iso_time:
+                    continue
+
+                event_name = item.get("title", item.get("event", item.get("name", "economic event")))
+                country = item.get("country", item.get("currency", ""))
+
+                cal.append({
+                    "event": str(event_name),
+                    "impact": "high",
+                    "time": iso_time,
+                    "country": str(country),
+                })
+
+            log.info("📊 FinanceCalendar: fetched %d high-impact events (free API)", len(cal))
+            return cal[:20]
+
+    except httpx.HTTPStatusError as exc:
+        log.warning("FinanceCalendar fetch failed (HTTP %d): %s",
+                    exc.response.status_code, exc)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("FinanceCalendar fetch failed: %s", exc)
         return []
 
 
