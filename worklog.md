@@ -8926,3 +8926,24 @@ NEXT ACTIONS:
 ==================================================================
 AUDIT-FINAL-V2-1 END
 ==================================================================
+
+---
+Task ID: STRATEGY-REMOVE
+Agent: Z.ai Code (main)
+Task: hapus halaman strategy (remove the Strategy Builder page)
+
+Work Log:
+- Explored src/app/page.tsx — found strategy page wired via dynamic import, NAV array, ViewId type, View switch, ViewTitle titles record, and GitBranch icon import
+- Searched for other "strategy" references across src/components/trading/* — confirmed the others (ai-engine-view, settings-view, backtest-view, trading-view) reference `trading_strategy` state field (scalping/trend selector), NOT the Strategy Builder page — safe to remove
+- Edited src/app/page.tsx (MultiEdit): removed StrategyBuilderView dynamic import, removed GitBranch from lucide imports, removed "strategy" from ViewId union, removed strategy entry from NAV array, removed strategy case from View switch, removed strategy entry from ViewTitle titles record, cleaned up leftover blank lines
+- Deleted src/components/trading/strategy-builder-view.tsx
+- Ran `bun run lint` — clean, no errors
+- Restarted dev server cleanly (previous pid 1126 was stuck at 99% CPU for 9+ min in bad state — killed, cleared .next cache, relaunched via nohup+disown daemon wrapper)
+- Verified HTTP 200 on http://localhost:3000/ (first compile 9.2s)
+- Agent Browser verification: opened /, sidebar shows Dashboard/Trading/AI Engine/Indicators/Risk Mgmt/News/Backtest/History/Alerts/Logs/Settings (no Strategy), clicked History → Trade History view loaded, no runtime errors
+
+Stage Summary:
+- Strategy Builder page fully removed from UI navigation and View router
+- strategy-builder-view.tsx file deleted
+- Dev server healthy (pid 2043), lint clean, no runtime errors
+- 11 nav items remain (was 12)
