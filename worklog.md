@@ -8977,3 +8977,32 @@ Stage Summary:
 - Legacy XGBClassifier path retained in predict() for backward compat (old bundles fail gracefully → NEUTRAL)
 - Smoke test confirms end-to-end train+predict works without sklearn
 - Dev server healthy (pid 2132), HTTP 200, lint clean, AI Engine view Retrain button works (POST /api/trading/ml/train returns 200)
+
+---
+Task ID: GIT-PUSH
+Agent: Z.ai Code (main)
+Task: Push all changes to https://github.com/teekar2312/frxtee using PAT
+
+Work Log:
+- Checked git status: 14 commits ahead of origin/main (which was at 3246ae0)
+- Fetched remote — discovered 12 commits were already pushed in a previous session; only 2 local commits needed pushing: 9d291aa (strategy page removal) and 67e4ec0 (ml_model sklearn fix)
+- Both commits had generic UUID commit messages (e3a0e97a... and 320a0424...) — not useful for repo history
+- Rewrote commit messages via git rebase -i + custom GIT_EDITOR script:
+  - HEAD~1: "fix: remove Strategy Builder page from sidebar nav and View router"
+  - HEAD: "fix: ML train sklearn ImportError — use xgboost native API"
+- The rebase editor script's elif branch didn't fire on the second commit (both got the strategy message) — fixed with a direct `git commit --amend -m` for HEAD
+- Pushed via `git -c http.extraHeader="Authorization: Basic <base64>"` — this is a one-shot config that does NOT persist the PAT in .git/config
+- First attempt with Bearer token failed (git still prompted for Username) — switched to Basic auth with x-access-token:PAT (GitHub's convention for PATs) which worked
+- Push output: `3246ae0..fff184d  main -> main` — both commits pushed
+- Verified: git fetch shows origin/main at fff184d, rev-list shows 0 behind / 0 ahead (fully synced)
+- Verified PAT NOT persisted: grep -iE 'ghp_|token|password|extraHeader' .git/config returns nothing
+- Verified remote URL clean (no embedded token): git remote -v shows https://github.com/teekar2312/frxtee.git (fetch/push)
+
+Stage Summary:
+- 2 commits pushed to https://github.com/teekar2312/frxtee:
+  - fff184d: fix: ML train sklearn ImportError — use xgboost native API
+  - 4e2843d: fix: remove Strategy Builder page from sidebar nav and View router
+- Remote and local are fully synced (0 behind, 0 ahead)
+- PAT NOT stored anywhere in the repo config (used one-shot http.extraHeader, not persisted)
+- Remote URL remains clean (no embedded credentials)
+- Repo is viewable at https://github.com/teekar2312/frxtee/commits/main
