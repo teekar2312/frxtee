@@ -155,10 +155,54 @@ def label(df: pd.DataFrame, horizon=5, threshold=0.0008) -> pd.Series:
     return pd.Series(labels, index=df.index)
 
 
+def _compute_sample_weight(y: np.ndarray) -> np.ndarray:
+    """Balanced sample weights — drop-in replacement for
+    ``sklearn.utils.class_weight.compute_sample_weight("balanced", y)``.
+
+    Formula: weight[i] = N / (n_classes * count[y[i]])
+
+    Implemented locally so the ML pipeline does NOT require scikit-learn to
+    be installed in the runtime environment (the backend container ships
+    without sklearn by default — XGBClassifier would raise
+    ``ImportError: sklearn needs to be installed`` at instantiation).
+    """
+    y = np.asarray(y)
+    n = len(y)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    classes, counts = np.unique(y, return_counts=True)
+    n_classes = len(classes)
+    weight_per_class = {c: n / (n_classes * cnt) for c, cnt in zip(classes, counts)}
+    return np.array([weight_per_class[yi] for yi in y], dtype=np.float64)
+
+
+# XGBoost training params — shared across folds. Using the native xgboost
+# API (DMatrix + xgb.train) instead of XGBClassifier so we don't depend on
+# scikit-learn being installed in the runtime environment.
+_XGB_PARAMS = {
+    "objective": "multi:softprob",  # returns full probability distribution
+    "num_class": 3,                  # labels mapped to [0, 1, 2]
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 3,
+    "reg_alpha": 1.0,        # L1 regularization (feature sparsity)
+    "reg_lambda": 3.0,       # L2 regularization (weight shrinkage)
+    "gamma": 0.1,            # min loss reduction to split
+    "eval_metric": "mlogloss",
+    "nthread": -1,
+    "verbosity": 0,
+}
+
+
 def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     """Train (or retrain) the classifier with walk-forward validation + class
     balancing. Compares new model's test_acc against the old one — refuses to
     promote a worse model (prevents regression).
+
+    Uses xgboost's native ``DMatrix`` + ``xgb.train()`` API (NOT
+    ``XGBClassifier``) so the pipeline works without scikit-learn installed.
 
     Overfitting controls:
     - Early stopping (stops when val loss stops improving — typically 50-100
@@ -172,8 +216,7 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     """
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_file = _model_path(symbol)
-    from xgboost import XGBClassifier
-    from sklearn.utils.class_weight import compute_sample_weight
+    import xgboost as xgb
     rates = candles(symbol, tf, count)
     if not rates:
         log.warning("no candles to train on")
@@ -186,7 +229,7 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         log.warning("insufficient data to train (%d rows)", len(df))
         return
 
-    # remap labels from [-1, 0, 1] to [0, 1, 2] (XGBoost requires 0-based)
+    # remap labels from [-1, 0, 1] to [0, 1, 2] (xgboost multi:softprob requires 0-based)
     label_map = {-1: 0, 0: 1, 1: 2}
     df["label"] = df["label"].map(label_map)
     log.info("label distribution: %s", df["label"].value_counts().to_dict())
@@ -209,39 +252,41 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
             (fold_size * 2, fold_size * 3, fold_size * 3, n),
         ]
 
-    best_clf = None
+    best_bst = None
     best_test_acc = 0.0
+    best_iter: int | None = None
     for train_start, train_end, test_start, test_end in folds:
         tr = df.iloc[train_start:train_end]
         te = df.iloc[test_start:test_end]
         X_tr, y_tr = tr[FEATURES].values, tr["label"].values
         X_te, y_te = te[FEATURES].values, te["label"].values
-        # class-balanced sample weights (handle imbalanced labels)
-        sw = compute_sample_weight("balanced", y_tr)
-        clf = XGBClassifier(
-            n_estimators=500,           # cap (early stopping will halt ~50-100)
-            max_depth=3,                 # was 4 — simpler trees generalize better
-            learning_rate=0.05,
-            subsample=0.7,               # was 0.8 — more randomness = less overfit
-            colsample_bytree=0.7,        # was 0.8 — same rationale
-            min_child_weight=3,          # NEW — prevents splits on tiny noisy subsets
-            reg_alpha=1.0,               # NEW — L1 regularization (feature sparsity)
-            reg_lambda=3.0,              # NEW — L2 regularization (weight shrinkage)
-            gamma=0.1,                   # NEW — min loss reduction to split
-            early_stopping_rounds=20,    # NEW — stop when val loss stalls 20 rounds
-            eval_metric="mlogloss",
-            n_jobs=-1,
+        # class-balanced sample weights (handle imbalanced labels) —
+        # computed locally without sklearn.utils.class_weight
+        sw = _compute_sample_weight(y_tr)
+        dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=sw)
+        dtest = xgb.DMatrix(X_te, label=y_te)
+        bst = xgb.train(
+            _XGB_PARAMS,
+            dtrain,
+            num_boost_round=500,           # cap (early stopping will halt ~50-100)
+            evals=[(dtest, "test")],
+            early_stopping_rounds=20,
+            verbose_eval=False,
         )
-        clf.fit(X_tr, y_tr, sample_weight=sw, eval_set=[(X_te, y_te)], verbose=False)
-        acc = clf.score(X_te, y_te)
+        # multi:softprob returns shape (n_samples, n_classes) of probabilities
+        preds = bst.predict(dtest)
+        pred_labels = np.argmax(preds, axis=1)
+        acc = float(np.mean(pred_labels == y_te))
         fold_accs.append(acc)
-        log.debug("fold %d→%d: test_acc=%.3f, best_iteration=%d",
-                  train_end, test_end, acc, getattr(clf, "best_iteration", -1) or -1)
+        bi = getattr(bst, "best_iteration", None)
+        log.debug("fold %d→%d: test_acc=%.3f, best_iteration=%s",
+                  train_end, test_end, acc, bi)
         if acc > best_test_acc:
             best_test_acc = acc
-            best_clf = clf
+            best_bst = bst
+            best_iter = bi
 
-    clf = best_clf
+    bst = best_bst
     test_acc = best_test_acc
     avg_acc = float(np.mean(fold_accs))
     log.info("Model trained on %s %s — %d rows, walk-forward folds=%s avg=%.3f",
@@ -260,17 +305,29 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
     # final train_acc on full set (for display)
     X_full = df[FEATURES].values
     y_full = df["label"].values
-    train_acc = clf.score(X_full, y_full)
-    best_iter = getattr(clf, "best_iteration", None)
+    dfull = xgb.DMatrix(X_full, label=y_full)
+    preds_full = bst.predict(dfull)
+    pred_full_labels = np.argmax(preds_full, axis=1)
+    train_acc = float(np.mean(pred_full_labels == y_full))
     log.info("Model promoted on %s %s — %d rows, train_acc=%.3f test_acc=%.3f "
              "avg_fold=%.3f best_iteration=%s",
              symbol, tf, len(df), train_acc, test_acc, avg_acc,
              best_iter if best_iter is not None else "n/a")
 
     # log feature importances for debugging (which features drive predictions?)
+    # Native Booster.get_score returns dict like {"f0": 1.23, "f1": 0.45, ...}
     try:
-        importances = clf.feature_importances_
-        fi_pairs = sorted(zip(FEATURES, importances), key=lambda x: x[1], reverse=True)
+        fi_raw = bst.get_score(importance_type="gain")
+        # map f0/f1/... back to feature names
+        fi_named: dict[str, float] = {}
+        for k, v in fi_raw.items():
+            if k.startswith("f") and k[1:].isdigit():
+                idx = int(k[1:])
+                if 0 <= idx < len(FEATURES):
+                    fi_named[FEATURES[idx]] = v
+            else:
+                fi_named[k] = v
+        fi_pairs = sorted(fi_named.items(), key=lambda x: x[1], reverse=True)
         fi_str = ", ".join(f"{f}={v:.3f}" for f, v in fi_pairs[:5])
         log.info("Feature importances (top 5): %s", fi_str)
     except Exception:  # noqa: BLE001
@@ -297,13 +354,14 @@ def train(symbol: str = "EURUSD", tf: str = "H1", count: int = 3000):
         log.info("backed up previous model → %s", backup.name)
 
     # compute training-time prediction confidence distribution (for drift detection)
-    train_proba = clf.predict_proba(X_full)
-    train_max_proba = np.max(train_proba, axis=1)
+    train_max_proba = np.max(preds_full, axis=1)
     train_conf_mean = float(train_max_proba.mean())
     train_conf_std = float(train_max_proba.std())
 
     joblib.dump({
-        "model": clf,
+        # native xgboost.Booster — no sklearn required at load time
+        "model": bst,
+        "model_type": "booster",   # tag for predict() compat dispatch
         "features": FEATURES,
         "symbol": symbol,
         "tf": tf,
@@ -387,6 +445,13 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     Loads the symbol-specific model (models/trade_classifier_{symbol}.joblib).
     Returns NEUTRAL/0.5 if no model exists for the requested symbol.
     Tracks predictions per-symbol for drift detection.
+
+    Supports both model formats:
+    - ``model_type="booster"`` (current) — native xgboost.Booster, no sklearn
+      required at predict time. ``Booster.predict(DMatrix)`` for multi:softprob
+      returns shape (n_samples, n_classes) of probabilities.
+    - legacy ``XGBClassifier`` (old bundles) — only works if scikit-learn is
+      installed in the runtime. Falls back to NEUTRAL if sklearn missing.
     """
     if symbol is None:
         symbol = "EURUSD"  # legacy default
@@ -401,12 +466,27 @@ def predict(df_recent: pd.DataFrame, symbol: str | None = None) -> dict:
     feats = build_features(df_recent).tail(1)[FEATURES].values
     if np.isnan(feats).any():
         return {"direction": "NEUTRAL", "prob": 0.5, "reason": "nan features"}
-    proba = clf.predict_proba(feats)[0]
-    classes = clf.classes_
-    idx = int(np.argmax(proba))
     # remap back from [0,1,2] to [-1,0,1] = [DOWN, NEUTRAL, UP]
     reverse_map = {0: "DOWN", 1: "NEUTRAL", 2: "UP"}
-    direction = reverse_map.get(int(classes[idx]), "NEUTRAL")
+    # Dispatch on model type — Booster (native, sklearn-free) vs
+    # XGBClassifier (legacy, requires sklearn at predict time).
+    if hasattr(clf, "predict") and not hasattr(clf, "predict_proba"):
+        # xgboost.Booster — native API. predict() returns 2D array of
+        # probabilities for multi:softprob objective.
+        import xgboost as xgb
+        dfeat = xgb.DMatrix(feats)
+        proba = clf.predict(dfeat)
+        if proba.ndim == 2:
+            proba = proba[0]
+        idx = int(np.argmax(proba))
+        direction = reverse_map.get(idx, "NEUTRAL")
+    else:
+        # Legacy XGBClassifier path — requires sklearn to be installed
+        # (otherwise joblib.load would have already failed in _load_model).
+        proba = clf.predict_proba(feats)[0]
+        classes = clf.classes_
+        idx = int(np.argmax(proba))
+        direction = reverse_map.get(int(classes[idx]), "NEUTRAL")
     max_prob = float(proba[idx])
     _track_prediction(symbol, max_prob)  # feed per-symbol drift detector
     drift = check_drift(symbol)
