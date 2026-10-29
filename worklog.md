@@ -9133,3 +9133,32 @@ Stage Summary:
 - Pushed to https://github.com/teekar2312/frxtee — commit 562daf4
 - Backend container will pick up changes on next restart (mt5_service.py + config.py)
 - Frontend changes already live (dev server hot-reloaded)
+
+---
+Task ID: LOGS-REFRESH-BUTTON
+Agent: Z.ai Code (main)
+Task: Add refresh button to Logs page to manually fetch latest log entries
+
+Work Log:
+- Reviewed src/components/trading/logs-view.tsx — found useLogs() hook already auto-refetches every 15s but had no manual refresh button
+- Reviewed src/lib/trading-hooks.ts useLogs() — returns TanStack Query object with refetch() and isFetching available but unused
+- Added RefreshCw icon import from lucide-react
+- Destructured { data, refetch, isFetching } from useLogs() (was only { data })
+- Created handleRefresh() async function: shows info toast "Refreshing logs…", awaits refetch(), shows success toast "Loaded N log entries" (or error toast if backend unreachable)
+- Wrapped both Refresh + Export buttons in a flex container (gap-1.5) inside SectionHeader right prop
+- Refresh button: variant="outline", disabled when isFetching, RefreshCw icon with animate-spin when isFetching, title="Refresh logs now (auto-refreshes every 15s)"
+- Enhanced status bar in log list header: shows "auto every 15s" with green pulse-dot when idle, switches to "fetching…" with spinning RefreshCw when isFetching (gives user visual feedback that refresh is in progress)
+- Ran bun run lint — clean, no errors
+- Dev server HTTP 200, no console errors
+- Agent Browser verification:
+  - Navigated to Logs view — Refresh button visible next to Export
+  - Clicked Refresh — toast "Refreshing logs…" appeared, then "Loaded 15 log entries" success toast
+  - Status indicator shows "auto every 15s" with green pulse-dot when idle
+  - No runtime errors
+
+Stage Summary:
+- Manual refresh button added to Logs page header
+- Calls TanStack Query refetch() — same mechanism as auto-refresh, just user-triggered
+- Visual feedback: spinning icon on button + status bar indicator switches between "auto every 15s" (green dot) and "fetching…" (spinner)
+- Toast notifications: info "Refreshing logs…" → success "Loaded N log entries" (or error on failure)
+- Button disabled during fetch to prevent duplicate requests

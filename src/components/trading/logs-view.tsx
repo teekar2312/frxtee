@@ -4,7 +4,7 @@ import * as React from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Download, ScrollText, Search, Terminal } from "lucide-react";
+import { Download, RefreshCw, ScrollText, Search, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useLogs } from "@/lib/trading-hooks";
@@ -21,7 +21,7 @@ const LEVEL_TONE: Record<string, "up" | "down" | "warn" | "neutral"> = {
 };
 
 export function LogsView() {
-  const { data } = useLogs();
+  const { data, refetch, isFetching } = useLogs();
   const logs = data?.logs ?? [];
   const [level, setLevel] = React.useState<(typeof LEVELS)[number]>("ALL");
   const [q, setQ] = React.useState("");
@@ -38,6 +38,17 @@ export function LogsView() {
     {} as Record<string, number>
   );
 
+  const handleRefresh = async () => {
+    toast.info("Refreshing logs…");
+    try {
+      const result = await refetch();
+      const n = result.data?.logs?.length ?? 0;
+      toast.success(`Loaded ${n} log entries`);
+    } catch {
+      toast.error("Failed to refresh logs — backend not reachable");
+    }
+  };
+
   return (
     <div className="space-y-3">
       <Card className="p-3">
@@ -46,33 +57,48 @@ export function LogsView() {
           desc="Real-time engine, MT5, news & trade logs"
           icon={Terminal}
           right={
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 text-xs"
-              onClick={() => {
-                if (filtered.length === 0) {
-                  toast.error("No logs to export");
-                  return;
-                }
-                const csv = [
-                  ["timestamp", "level", "source", "message"].join(","),
-                  ...filtered.map((l) =>
-                    [l.ts, l.level, l.source, `"${l.message.replace(/"/g, '""')}"`].join(",")
-                  ),
-                ].join("\n");
-                const blob = new Blob([csv], { type: "text/csv" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `zenitrade-logs-${Date.now()}.csv`;
-                a.click();
-                URL.revokeObjectURL(url);
-                toast.success(`Exported ${filtered.length} log entries`);
-              }}
-            >
-              <Download className="h-3 w-3 mr-1" /> Export
-            </Button>
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={isFetching}
+                onClick={handleRefresh}
+                title="Refresh logs now (auto-refreshes every 15s)"
+              >
+                <RefreshCw
+                  className={cn("h-3 w-3 mr-1", isFetching && "animate-spin")}
+                />
+                Refresh
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => {
+                  if (filtered.length === 0) {
+                    toast.error("No logs to export");
+                    return;
+                  }
+                  const csv = [
+                    ["timestamp", "level", "source", "message"].join(","),
+                    ...filtered.map((l) =>
+                      [l.ts, l.level, l.source, `"${l.message.replace(/"/g, '""')}"`].join(",")
+                    ),
+                  ].join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `zenitrade-logs-${Date.now()}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  toast.success(`Exported ${filtered.length} log entries`);
+                }}
+              >
+                <Download className="h-3 w-3 mr-1" /> Export
+              </Button>
+            </div>
           }
         />
         <div className="flex flex-wrap items-center gap-2">
@@ -110,6 +136,16 @@ export function LogsView() {
           <span className="text-[11px] text-muted-foreground">
             {filtered.length} entries · live tail
           </span>
+          {isFetching ? (
+            <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+              <RefreshCw className="h-3 w-3 animate-spin" /> fetching…
+            </span>
+          ) : (
+            <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+              <span className="h-1.5 w-1.5 rounded-full bg-success pulse-dot" />
+              auto every 15s
+            </span>
+          )}
         </div>
         <div className="max-h-[520px] overflow-y-auto scroll-thin font-mono text-[11px]">
           {filtered.map((l) => (
