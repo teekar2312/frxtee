@@ -25,6 +25,23 @@ except Exception as exc:  # not on Windows or not installed
     log.warning("MetaTrader5 not available (%s) — running in simulation mode", exc)
 
 
+# All 14 supported trading pairs — matches the frontend TRADING_PAIRS list in
+# src/lib/trading-data.ts exactly (kept in sync intentionally). Used as the
+# default symbol set by ticks() and any other endpoint that doesn't receive
+# an explicit ?symbols= query. The previous default of just 4 majors
+# (EURUSD, GBPUSD, USDJPY, XAUUSD) made the platform appear limited when in
+# reality every endpoint accepts any valid MT5 symbol string.
+DEFAULT_TRADE_SYMBOLS: list[str] = [
+    # Majors (7)
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "AUDUSD", "USDCAD", "NZDUSD",
+    # Crosses (5)
+    "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "EURAUD",
+    # Metals (2)
+    "XAUUSD", "XAGUSD",
+]
+
+
 @dataclass
 class MT5Status:
     connected: bool
@@ -391,7 +408,15 @@ def ticks(symbols: list[str] | None = None) -> list[dict]:
     if not _state["connected"]:
         return []
     out = []
-    for sym in (symbols or ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]):
+    # When no symbols list is provided, fetch ticks for ALL 14 supported pairs
+    # — NOT just 4 hardcoded majors. The old default
+    # ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"] made it look like the platform
+    # only supported 4 pairs (the header ticker tape + useAllTicks() in the
+    # frontend were silently masking this by passing ?symbols= explicitly).
+    # Using the full set here means any caller that omits the param (e.g. the
+    # auto-trade engine polling for signals, the dashboard status endpoint)
+    # sees realtime prices for every supported instrument.
+    for sym in (symbols or DEFAULT_TRADE_SYMBOLS):
         t = mt5.symbol_info_tick(sym)  # type: ignore
         info = _get_symbol_info(sym)  # cached — avoids 14 RPCs per tick cycle
         if not t or not info:

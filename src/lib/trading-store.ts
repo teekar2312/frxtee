@@ -148,7 +148,7 @@ export const useTradingStore = create<TradingState>()(
   density: loadDensity(),
   setDensity: (d) => set({ density: d }),
 
-  symbols: ["EURUSD", "GBPUSD"],
+  symbols: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"],
   setSymbols: (s) => set((state) => {
     if (state.autoTradeMode) {
       try {
@@ -181,7 +181,14 @@ export const useTradingStore = create<TradingState>()(
     }),
   setAutoSymbols: () =>
     set({
-      symbols: TRADING_PAIRS.slice(0, 4).map((p) => p.symbol),
+      // AI mode selects ALL 14 supported pairs — the platform supports every
+      // pair defined in TRADING_PAIRS (majors, crosses, metals). The old
+      // slice(0, 4) only picked EURUSD/GBPUSD/USDJPY/USDCHF, making it look
+      // like only 4 pairs were tradeable. The auto-trade engine will scan
+      // all of them and skip the ones that don't meet the confidence
+      // threshold, so selecting more pairs = more opportunities without
+      // extra risk (each pair is independently gated by risk % per trade).
+      symbols: TRADING_PAIRS.map((p) => p.symbol),
     }),
 
   timeframes: ["M15", "H1"],

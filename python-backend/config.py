@@ -141,7 +141,12 @@ class Settings(BaseSettings):
 
     # Auto-trade engine
     auto_trade_mode: bool = False
-    auto_trade_symbols: str = "EURUSD,GBPUSD"
+    # Default scan list covers all 14 supported pairs — was previously just
+    # "EURUSD,GBPUSD" which made auto-trade look limited to 2 pairs. Each
+    # pair is independently gated by the confidence threshold + per-trade
+    # risk %, so scanning more pairs = more opportunities without extra
+    # risk. Users can still narrow this via the Trading view pair selector.
+    auto_trade_symbols: str = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,AUDJPY,EURAUD,XAUUSD,XAGUSD"
     ai_provider: str = "groq"
 
     # Trading strategy selection
