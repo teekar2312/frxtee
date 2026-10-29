@@ -9087,3 +9087,49 @@ No code change made yet — this is audit-only. Fixes would be:
 2. trading-store.ts line 184: setAutoSymbols() should select all 14 (or a volatility-based subset)
 3. config.py line 144: auto_trade_symbols default should include more pairs
 4. trading-store.ts line 151: initial symbols could default to a more diverse set
+
+---
+Task ID: PAIR-LIMIT-FIX
+Agent: Z.ai Code (main)
+Task: Implement the 4 fixes from PAIR-LIMIT-AUDIT and push to repo
+
+Work Log:
+- Fix 1 (PRIMARY): python-backend/mt5_service.py
+  - Added DEFAULT_TRADE_SYMBOLS constant (all 14 pairs) near top of file after imports
+  - Changed ticks() fallback from ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"] to DEFAULT_TRADE_SYMBOLS
+  - This was the PRIMARY root cause — any caller omitting ?symbols= got only 4 pairs
+
+- Fix 2: src/lib/trading-store.ts (setAutoSymbols)
+  - Changed from TRADING_PAIRS.slice(0, 4) to TRADING_PAIRS.map(p => p.symbol)
+  - "AI" mode button on Pairs card now selects all 14 pairs (was 4: EURUSD/GBPUSD/USDJPY/USDCHF)
+
+- Fix 3: python-backend/config.py (auto_trade_symbols default)
+  - Expanded from "EURUSD,GBPUSD" to all 14 comma-separated pairs
+  - Auto-trade engine will now scan all 14 pairs (each independently gated by confidence + risk %)
+
+- Fix 4: src/lib/trading-store.ts (initial symbols)
+  - Expanded from ["EURUSD", "GBPUSD"] to ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+  - Matches the 4-pair set the user originally reported seeing
+
+Verification:
+- py_compile on config.py + mt5_service.py: OK
+- ESLint: clean (no errors)
+- Backend import check: settings.auto_trade_symbols returns 14 pairs, DEFAULT_TRADE_SYMBOLS returns 14 pairs
+- Dev server: restarted cleanly (previous instance was stuck at 111% CPU after file change hot-reload), HTTP 200, no console errors
+- Agent Browser: all 14 pair chips visible in Trading view. Clicked AI toggle → verified 14 active bg-primary chips (EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD, EUR/GBP, EUR/JPY, GBP/JPY, AUD/JPY, EUR/AUD, XAU/USD, XAG/USD)
+- No runtime errors
+
+Commit + Push:
+- Single commit 562daf4 with conventional message
+- Pushed via git -c http.extraHeader="Authorization: Basic <base64>" (one-shot, not persisted)
+- Push output: fff184d..562daf4 main -> main
+- Verified: origin/main at 562daf4, 0 behind / 0 ahead (synced)
+- PAT NOT in .git/config (grep returns nothing)
+- Remote URL clean (no embedded credentials)
+
+Stage Summary:
+- All 4 audit fixes implemented across 3 files (config.py, mt5_service.py, trading-store.ts)
+- 41 insertions, 4 deletions
+- Pushed to https://github.com/teekar2312/frxtee — commit 562daf4
+- Backend container will pick up changes on next restart (mt5_service.py + config.py)
+- Frontend changes already live (dev server hot-reloaded)
