@@ -9006,3 +9006,84 @@ Stage Summary:
 - PAT NOT stored anywhere in the repo config (used one-shot http.extraHeader, not persisted)
 - Remote URL remains clean (no embedded credentials)
 - Repo is viewable at https://github.com/teekar2312/frxtee/commits/main
+
+---
+Task ID: PAIR-LIMIT-AUDIT
+Agent: Z.ai Code (main)
+Task: Deep audit — why trading appears limited to 4 pairs (EURUSD, GBPUSD, USDJPY, XAUUSD)
+
+Investigation traced every layer of the stack:
+
+1. Frontend domain constants (src/lib/trading-data.ts):
+   - TRADING_PAIRS array has ALL 14 pairs defined (7 majors + 4 crosses + 2 metals + 1 more)
+   - List: EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD, EURGBP, EURJPY, GBPJPY, AUDJPY, EURAUD, XAUUSD, XAGUSD
+   - genPriceTicks() (demo fallback) generates ticks for ALL 14 pairs
+   - VERDICT: NO limitation here — full 14 pairs supported
+
+2. Frontend Zustand store (src/lib/trading-store.ts):
+   - Line 151: initial state `symbols: ["EURUSD", "GBPUSD"]` — only 2 pairs by default
+   - Line 184: `setAutoSymbols()` picks `TRADING_PAIRS.slice(0, 4)` = EURUSD, GBPUSD, USDJPY, USDCHF
+     (triggered when user clicks "AI" mode button in Trading view Pairs section)
+   - VERDICT: "AI Auto" button only selects first 4 (and USDCHF, not XAUUSD — different set
+     from user's reported 4 pairs)
+
+3. Frontend API routes (src/app/api/trading/*):
+   - /ticks route: passes through `?symbols=...` query param to backend (no filter)
+   - /candles route: passes through `?symbol=...` (single symbol, no whitelist)
+   - /order route: passes through body.symbol (no validation)
+   - VERDICT: NO limitation in proxy layer
+
+4. Frontend hooks (src/lib/trading-hooks.ts):
+   - useTicks() fetches `?symbols=${store.symbols}` — follows whatever user selected
+   - useAllTicks() fetches ALL 14 pairs for the header ticker tape (no limit)
+   - Comment at line 26-29 ACKNOWLEDGES the old bug: "Previously this called /api/trading/ticks
+     with no symbols param, so the backend only returned EURUSD/GBPUSD/USDJPY/XAUUSD"
+   - VERDICT: Frontend was patched to pass symbols, but backend default was NOT updated
+
+5. Backend config (python-backend/config.py):
+   - Line 144: `auto_trade_symbols: str = "EURUSD,GBPUSD"` — only 2 pairs by default
+   - VERDICT: Auto-trade engine defaults to 2 pairs (user must manually add more in UI)
+
+6. Backend mt5_service.py (THE PRIMARY ROOT CAUSE):
+   - Line 394: `for sym in (symbols or ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]):`
+   - When `symbols=None` (no `?symbols=` query param), defaults to EXACTLY the 4 pairs
+     the user reported: EURUSD, GBPUSD, USDJPY, XAUUSD
+   - This is the ONLY place in the entire codebase with this exact 4-pair hardcoded list
+   - VERDICT: PRIMARY ROOT CAUSE — backend ticks() function has a 4-pair fallback default
+
+7. Backend main.py API handlers:
+   - /api/trading/ticks: accepts `symbols` query param, splits by comma, passes to mt5_ticks()
+   - /api/trading/candles: accepts `symbol` (single), no whitelist
+   - /api/trading/order: OrderReq.symbol accepts ANY string (3-12 chars, no whitelist)
+   - /api/trading/analysis: accepts `symbol` (single), no whitelist
+   - /api/trading/ml/train: accepts `symbol`, no whitelist
+   - /api/trading/sweep, /orderflow: default to EURUSD but accept any symbol
+   - VERDICT: NO hard whitelist anywhere — all endpoints accept any symbol string
+
+8. Backend trading_analytics.py:
+   - Line 18: _PAIRS_BY_CURRENCY maps which pairs contain each currency (for strength meter)
+   - Lists 8 USD-containing pairs — NOT a trade restriction, just strength computation mapping
+   - VERDICT: NOT a limitation
+
+9. Backend ai_service.py:
+   - Line 378: BASE_PRICES dict has all 14 pairs (for heuristic fallback entry/SL/TP calc)
+   - VERDICT: Supports all 14 pairs
+
+10. Backend news_service.py:
+    - Line 691: CURRENCY_PAIRS map has all 14 pairs for symbol extraction from news text
+    - VERDICT: Supports all 14 pairs
+
+CONCLUSION — The "4 pair limit" is an ILLUSION caused by DEFAULTS, not a hard whitelist:
+- PRIMARY: mt5_service.py line 394 — ticks() defaults to 4 pairs when no symbols param passed
+- SECONDARY: trading-store.ts line 184 — setAutoSymbols() only picks first 4 (different 4: includes USDCHF instead of XAUUSD)
+- TERTIARY: config.py line 144 — auto_trade_symbols default is only 2 pairs
+- INITIAL: trading-store.ts line 151 — store starts with only 2 pairs
+
+The user CAN trade any of the 14 pairs by manually clicking the chips in Trading view.
+But every DEFAULT in the system points to a small subset, making it appear limited.
+
+No code change made yet — this is audit-only. Fixes would be:
+1. mt5_service.py line 394: replace hardcoded 4-pair list with all 14 TRADING_PAIRS symbols
+2. trading-store.ts line 184: setAutoSymbols() should select all 14 (or a volatility-based subset)
+3. config.py line 144: auto_trade_symbols default should include more pairs
+4. trading-store.ts line 151: initial symbols could default to a more diverse set
